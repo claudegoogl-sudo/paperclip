@@ -1,10 +1,12 @@
+import { projectGitAuthorizationService } from "./project-git-authorization.js";
+import { createLiveEventDelivery } from "../realtime/live-event-delivery.js";
+import { createLiveRunEventRedactor } from "./live-run-event-redaction.js";
 import { projectInstanceSecretService } from "./project-instance-secrets.js";
-import { pluginAgentRuntimeState } from "./plugin-agent-runtime-state.js";
+import { pluginAgentRuntimeState, pluginAgentRuntimeIdentity } from "./plugin-agent-runtime-state.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
-  agentWakeupRequests,
   agentTaskSessions as agentTaskSessionsTable,
   agents as agentsTable,
   budgetIncidents,
@@ -17,7 +19,7 @@ import {
   principalPermissionGrants,
   projects as projectsTable,
 } from "@paperclipai/db";
-import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, gte, lte } from "drizzle-orm";
+import { eq, and, like, desc, inArray, sql, isNull, isNotNull, gt, lte } from "drizzle-orm";
 import type {
   HostServices,
   Company,
@@ -28,20 +30,16 @@ import type {
   PluginWorkspace,
   IssueComment,
   PluginIssueAssigneeSummary,
-  PluginIssueAttachment,
   PluginIssueOrchestrationSummary,
   PluginExecutionWorkspaceMetadata,
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, IssueRelationIssueSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
-import {
-  pluginOperationIssueOriginKind,
-  isSuccessfulHeartbeatRunStatus,
-} from "@paperclipai/shared";
+import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
-import { attachmentBoundActivityDetails, issueService } from "./issues.js";
+import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
@@ -73,17 +71,7 @@ import {
   setStoredLocalFolder,
   writePluginLocalFolderTextAtomic,
 } from "./plugin-local-folders.js";
-import { createPluginSecretsHandler, type PluginSecretsResolveParams } from "./plugin-secrets-handler.js";
-import { createPluginArtifactsHandler } from "./plugin-artifacts-handler.js";
-import { enforcePluginConfigEgress } from "./plugin-config-egress.js";
-import { filterOverrideToTenantScope } from "./plugin-config-scope.js";
-import { normalizeIssueAttachmentMaxBytes } from "../attachment-types.js";
-import {
-  defaultPluginWakeRateLimiter,
-  type PluginWakeRateLimiter,
-} from "./plugin-wake-rate-limit.js";
-import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
-import type { StorageService } from "../storage/types.js";
+import { createPluginSecretsHandler } from "./plugin-secrets-handler.js";
 import { logActivity } from "./activity-log.js";
 import type { PluginEventBus } from "./plugin-event-bus.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
@@ -92,21 +80,7 @@ import type { IncomingMessage, RequestOptions as HttpRequestOptions } from "node
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
-import {
-  canonicalizeIp,
-  classifyEgressIp,
-  isEgressAllowed,
-  resolveCgnatMode,
-  type ClassifyOptions,
-} from "./plugin-egress-ip-classifier.js";
-import {
-  isPrivateEgressEligible,
-  loadPluginPrivateEgressOrigins,
-  normalizeStoredPrivateEgressOrigins,
-  privateEgressRequestOrigin,
-} from "./plugin-private-egress.js";
 import { logger } from "../middleware/logger.js";
-import { requireAgentActorSource, requirePluginBoardActorSource } from "./actor-source.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { accessService } from "./access.js";
 import {
@@ -118,8 +92,8 @@ import {
   type IssuePrivacyRow,
 } from "./authorization.js";
 import { redactEventPayload, sanitizeRecord } from "../redaction.js";
-import { redactSecretsDeepForLog, redactSecretsForLog } from "../secret-patterns.js";
 import type { WorkerHostCallContext } from "@paperclipai/plugin-sdk";
+import { WORKSPACE_OPERATION_FAILURE_REASONS } from "@paperclipai/plugin-sdk";
 import {
   normalizeProviderFamily,
   SANDBOX_STARTUP_SPAN_ATTRS,
@@ -133,24 +107,46 @@ import { recordProviderPluginSpan, type ParsedTraceparent } from "../instrumenta
 /** Maximum time (ms) a plugin fetch request may take before being aborted. */
 const PLUGIN_FETCH_TIMEOUT_MS = 30_000;
 
-/**
- * Opaque denial for the fork-only `config.getForServiceScope` read. Every
- * provisioning failure on that surface collapses to this single message so a
- * worker cannot distinguish "company unknown" from "company never configured
- * this plugin" (no existence oracle) — the `company_secret_bindings` posture.
- * The specific reason is logged server-side via `configGateLog`.
- */
-const SERVICE_SCOPE_CONFIG_DENIED = "config not available for this service scope";
-
-/** Value-free server-side logger for service-scope config denials. */
-const configGateLog = logger.child({ service: "plugin-host-services.config-gate" });
-
 /** Maximum time (ms) to wait for a DNS lookup before aborting. */
 const DNS_LOOKUP_TIMEOUT_MS = 5_000;
 
 /** Only these protocols are allowed for plugin HTTP requests. */
 const ALLOWED_PROTOCOLS = new Set(["http:", "https:"]);
 const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
+
+/**
+ * Check if an IP address is in a private/reserved range (RFC 1918, loopback,
+ * link-local, etc.) that plugins should never be able to reach.
+ *
+ * Handles IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1) which Node's
+ * dns.lookup may return depending on OS configuration.
+ */
+function isPrivateIP(ip: string): boolean {
+  const lower = ip.toLowerCase();
+
+  // Unwrap IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) and re-check as IPv4
+  const v4MappedMatch = lower.match(/^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/);
+  if (v4MappedMatch && v4MappedMatch[1]) return isPrivateIP(v4MappedMatch[1]);
+
+  // IPv4 patterns
+  if (ip.startsWith("10.")) return true;
+  if (ip.startsWith("172.")) {
+    const second = parseInt(ip.split(".")[1]!, 10);
+    if (second >= 16 && second <= 31) return true;
+  }
+  if (ip.startsWith("192.168.")) return true;
+  if (ip.startsWith("127.")) return true;                   // loopback
+  if (ip.startsWith("169.254.")) return true;               // link-local
+  if (ip === "0.0.0.0") return true;
+
+  // IPv6 patterns
+  if (lower === "::1") return true;                          // loopback
+  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA
+  if (lower.startsWith("fe80")) return true;                 // link-local
+  if (lower === "::") return true;
+
+  return false;
+}
 
 /**
  * Validate a URL for plugin fetch: protocol whitelist + private IP blocking.
@@ -168,7 +164,7 @@ const TELEMETRY_EVENT_NAME_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
  * @returns Request-routing metadata used to connect directly to the resolved IP
  *          while preserving the original hostname for HTTP Host and TLS SNI.
  */
-export interface ValidatedFetchTarget {
+interface ValidatedFetchTarget {
   parsedUrl: URL;
   resolvedAddress: string;
   hostHeader: string;
@@ -176,83 +172,7 @@ export interface ValidatedFetchTarget {
   useTls: boolean;
 }
 
-/** Injectable dependencies for {@link validateAndResolveFetchUrl} (tests). */
-export interface FetchUrlValidationOptions {
-  pluginId?: string;
-  dnsLookup?: (hostname: string, options: { all: true }) => Promise<Array<{ address: string; family: number }>>;
-  interfaces?: ClassifyOptions["interfaces"];
-  env?: NodeJS.ProcessEnv;
-  log?: Pick<typeof logger, "warn" | "info">;
-  /**
-   * Instance-admin private-origin opt-in for THIS plugin (see
-   * `plugin-private-egress.ts`). Consulted only when every resolved address
-   * is denied. Absent = today's behaviour, byte-identical.
-   */
-  loadPrivateEgressOrigins?: () => Promise<readonly string[]>;
-}
-
-type ClassifiedFetchAddress = {
-  entry: { address: string; family: number };
-  cls: ReturnType<typeof classifyEgressIp>;
-};
-
-/**
- * Private-origin opt-in decision. Returns the address to pin (the same
- * `ValidatedFetchTarget` path as any public target — no second resolve), or
- * null so the caller throws today's error text unchanged. Fails closed.
- */
-async function resolvePrivateEgressOptIn(
-  parsed: URL,
-  originalHostname: string,
-  classified: ClassifiedFetchAddress[],
-  options: FetchUrlValidationOptions,
-): Promise<ClassifiedFetchAddress | null> {
-  const log = options.log ?? logger;
-  // IP literals only: a hostname never matches, so DNS (rebinding or not)
-  // can never select an opted-in address. An IP literal resolves to exactly
-  // itself, so there is exactly one candidate.
-  if (isIP(originalHostname) === 0 || classified.length !== 1) return null;
-  const origin = privateEgressRequestOrigin(parsed);
-  if (!origin) return null;
-  const candidate = classified[0]!;
-  // The pinned address must be the literal itself (classifier-canonical).
-  const literal = canonicalizeIp(originalHostname);
-  if (!literal || candidate.cls.canonical === null || literal.canonical !== candidate.cls.canonical) return null;
-  let stored: readonly string[];
-  try {
-    stored = await options.loadPrivateEgressOrigins!();
-  } catch (err) {
-    log.warn(
-      { err, event: "plugin.http_fetch.private_egress", decision: "deny", reason: "lookup_failed", pluginId: options.pluginId ?? null },
-      "plugin.http_fetch.private_egress lookup failed; failing closed",
-    );
-    return null;
-  }
-  if (stored.length === 0) return null;
-  // Re-validate on read against the CURRENT host interfaces. own_host and
-  // loopback/link-local/metadata are never eligible, whatever is stored.
-  const origins = normalizeStoredPrivateEgressOrigins(stored, { interfaces: options.interfaces });
-  const matched = origins.includes(origin) && isPrivateEgressEligible(candidate.cls);
-  // Value-free: scheme/IP/port origin only, never path, query or headers.
-  log.info(
-    {
-      event: "plugin.http_fetch.private_egress",
-      decision: matched ? "allow" : "deny",
-      pluginId: options.pluginId ?? null,
-      origin,
-      matchedEntry: matched ? origin : null,
-      category: candidate.cls.category,
-    },
-    matched ? "plugin.http_fetch.private_allowed" : "plugin.http_fetch.private_denied",
-  );
-  return matched ? candidate : null;
-}
-
-export async function validateAndResolveFetchUrl(
-  urlString: string,
-  checkConfigEgress?: (urlString: string) => Promise<void>,
-  options: FetchUrlValidationOptions = {},
-): Promise<ValidatedFetchTarget> {
+async function validateAndResolveFetchUrl(urlString: string): Promise<ValidatedFetchTarget> {
   let parsed: URL;
   try {
     parsed = new URL(urlString);
@@ -266,14 +186,6 @@ export async function validateAndResolveFetchUrl(
     );
   }
 
-  // Plugin config-key egress allowlist. Runs AFTER protocol
-  // validation but BEFORE the DNS resolve/pin below — a denied destination
-  // must never be resolved or connected to. Fail-closed: a lookup error
-  // throws (see enforcePluginConfigEgress), it never silently allows.
-  if (checkConfigEgress) {
-    await checkConfigEgress(urlString);
-  }
-
   // Resolve the hostname to an IP and check for private ranges.
   // We pin the resolved IP into the URL to eliminate the TOCTOU window
   // between DNS resolution here and the second resolution fetch() would do.
@@ -282,8 +194,7 @@ export async function validateAndResolveFetchUrl(
 
   // Race the DNS lookup against a timeout to prevent indefinite hangs
   // when DNS is misconfigured or unresponsive.
-  const lookup = options.dnsLookup ?? dnsLookup;
-  const dnsPromise = lookup(originalHostname, { all: true });
+  const dnsPromise = dnsLookup(originalHostname, { all: true });
   const timeoutPromise = new Promise<never>((_, reject) => {
     setTimeout(
       () => reject(new Error(`DNS lookup timed out after ${DNS_LOOKUP_TIMEOUT_MS}ms for ${originalHostname}`)),
@@ -300,20 +211,7 @@ export async function validateAndResolveFetchUrl(
     // Filter to only non-private IPs instead of rejecting the entire request
     // when some IPs are private. This handles multi-homed hosts that resolve
     // to both private and public addresses.
-    // Parsed, deny-by-default classification (plugin-egress-ip-classifier):
-    // embedded-IPv4 IPv6 forms are unwrapped, own-host addresses are always
-    // denied, CGNAT follows the PAPERCLIP_PLUGIN_FETCH_CGNAT switch.
-    const cgnatMode = resolveCgnatMode(options.env);
-    const classified = results.map((entry) => ({
-      entry,
-      cls: classifyEgressIp(entry.address, { interfaces: options.interfaces }),
-    }));
-    const safe = classified.filter(({ cls }) => isEgressAllowed(cls, cgnatMode));
-    if (safe.length === 0 && options.loadPrivateEgressOrigins) {
-      const optedIn = await resolvePrivateEgressOptIn(parsed, originalHostname, classified, options);
-      if (optedIn) safe.push(optedIn);
-    }
-    const safeResults = safe.map(({ entry }) => entry);
+    const safeResults = results.filter((entry) => !isPrivateIP(entry.address));
     if (safeResults.length === 0) {
       throw new Error(
         `All resolved IPs for ${originalHostname} are in private/reserved ranges`,
@@ -321,20 +219,6 @@ export async function validateAndResolveFetchUrl(
     }
 
     const resolved = safeResults[0]!;
-    if (safe[0]!.cls.category === "cgnat") {
-      // Legacy CGNAT allowance must be visible. Scheme/IP/port only —
-      // never path, query or headers.
-      (options.log ?? logger).warn(
-        {
-          event: "plugin.http_fetch.cgnat_legacy_allowed",
-          pluginId: options.pluginId ?? null,
-          scheme: parsed.protocol.replace(/:$/, ""),
-          ip: resolved.address,
-          port: parsed.port ? Number(parsed.port) : parsed.protocol === "https:" ? 443 : 80,
-        },
-        "plugin.http_fetch.cgnat_legacy_allowed",
-      );
-    }
     return {
       parsedUrl: parsed,
       resolvedAddress: resolved.address,
@@ -355,42 +239,17 @@ export async function validateAndResolveFetchUrl(
   }
 }
 
-/**
- * Body shape that the worker→host RPC forwards.
- *
- * `body` is always a string on the wire (JSON-RPC). `bodyEncoding` tells us
- * how to interpret it before writing to the upstream socket:
- *   - "utf8" (default if missing) — text body, written as-is.
- *   - "base64" — binary body, decoded into a Buffer before write so byte
- *                payloads (binary blobs, multipart) round-trip exactly.
- */
-interface PluginFetchInit {
-  method?: string;
-  headers?: Record<string, string> | Headers | Array<[string, string]>;
-  body?: string;
-  bodyEncoding?: "utf8" | "base64";
-}
-
-function decodeFetchBody(init: PluginFetchInit | undefined): string | Buffer | undefined {
-  if (!init || init.body === undefined || init.body === null) return undefined;
-  if (init.bodyEncoding === "base64") {
-    if (typeof init.body !== "string") {
-      throw new Error("http.fetch: bodyEncoding='base64' requires body to be a base64 string");
-    }
-    return Buffer.from(init.body, "base64");
-  }
-  // Default / "utf8" — pass strings through. Coerce non-strings defensively
-  // (legacy callers occasionally send buffer-like objects without bodyEncoding).
-  return typeof init.body === "string" ? init.body : String(init.body);
-}
-
 function buildPinnedRequestOptions(
   target: ValidatedFetchTarget,
-  init?: PluginFetchInit,
-): { options: HttpRequestOptions & { servername?: string }; body: string | Buffer | undefined } {
-  const headers = new Headers(init?.headers as HeadersInit | undefined);
+  init?: RequestInit,
+): { options: HttpRequestOptions & { servername?: string }; body: string | undefined } {
+  const headers = new Headers(init?.headers);
   const method = init?.method ?? "GET";
-  const body = decodeFetchBody(init);
+  const body = init?.body === undefined || init?.body === null
+    ? undefined
+    : typeof init.body === "string"
+      ? init.body
+      : String(init.body);
 
   headers.set("Host", target.hostHeader);
   if (body !== undefined && !headers.has("content-length") && !headers.has("transfer-encoding")) {
@@ -421,18 +280,11 @@ function buildPinnedRequestOptions(
   };
 }
 
-export async function executePinnedHttpRequest(
+async function executePinnedHttpRequest(
   target: ValidatedFetchTarget,
-  init: PluginFetchInit | undefined,
+  init: RequestInit | undefined,
   signal: AbortSignal,
-  responseBase64: boolean,
-): Promise<{
-  status: number;
-  statusText: string;
-  headers: Record<string, string>;
-  body: string;
-  bodyEncoding?: "utf8" | "base64";
-}> {
+): Promise<{ status: number; statusText: string; headers: Record<string, string>; body: string }> {
   const { options, body } = buildPinnedRequestOptions(target, init);
 
   const response = await new Promise<IncomingMessage>((resolve, reject) => {
@@ -474,29 +326,11 @@ export async function executePinnedHttpRequest(
     }
   }
 
-  const raw = Buffer.concat(chunks);
-
-  // Opt-in callers (new SDK, which announces `acceptResponseBodyEncoding:
-  // "base64"` and decodes `result.bodyEncoding` on its end) get byte-exact
-  // base64 for text AND binary. Legacy callers keep the lossy utf8 decode
-  // (bytes >=0x80 collapse to U+FFFD) with NO `bodyEncoding` field — changing
-  // it would break old-SDK plugins that read `result.body` as a plain utf8
-  // string and ignore `bodyEncoding`.
-  if (responseBase64) {
-    return {
-      status: response.statusCode ?? 500,
-      statusText: response.statusMessage ?? "",
-      headers,
-      body: raw.toString("base64"),
-      bodyEncoding: "base64",
-    };
-  }
-
   return {
     status: response.statusCode ?? 500,
     statusText: response.statusMessage ?? "",
     headers,
-    body: raw.toString("utf8"),
+    body: Buffer.concat(chunks).toString("utf8"),
   };
 }
 
@@ -549,14 +383,6 @@ const MAX_LOG_MESSAGE_LENGTH = 10_000;
 /** Max serialised JSON size for plugin log meta objects. */
 const MAX_LOG_META_JSON_LENGTH = 50_000;
 
-/**
- * Defensive upper bound on rows returned by the reconcile reads
- * (`approvals.list` / `interactions.list`). A normal pending set is far smaller,
- * so this is a no-op in practice; it only prevents a pathological pending count
- * from ballooning a single response. When the cap is hit we emit one warn line.
- */
-const RECONCILE_LIST_LIMIT = 500;
-
 /** Max length for a metric name. */
 const MAX_METRIC_NAME_LENGTH = 500;
 
@@ -576,19 +402,8 @@ function truncStr(s: string, max: number): string {
   return s.slice(0, max) + "...[truncated]";
 }
 
-/**
- * Sanitise a plugin-supplied meta object: strip reserved pino keys,
- * pattern-redact secret-shaped string leaves, and enforce the serialised size
- * limit. Exported so the plugin worker manager can apply the SAME semantics to
- * the meta it spreads into the host pino log line — one sanitiser, every
- * surface that persists or logs plugin-authored meta.
- */
-/** Bounds for the plugin `issues.listWakeupRequests` read (issue.wakeups.read). */
-const WAKEUP_REQUESTS_MAX_ISSUE_IDS = 200;
-const WAKEUP_REQUESTS_MAX_ROWS = 1000;
-const WAKEUP_REQUESTS_DEFAULT_STATUSES = ["queued", "deferred_issue_execution"] as const;
-
-export function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
+/** Sanitise a plugin-supplied meta object: enforce size limit and strip reserved keys. */
+function sanitiseMeta(meta: Record<string, unknown> | null | undefined): Record<string, unknown> | null {
   if (meta == null) return null;
   // Strip pino reserved keys
   const cleaned: Record<string, unknown> = {};
@@ -597,54 +412,17 @@ export function sanitiseMeta(meta: Record<string, unknown> | null | undefined): 
       cleaned[k] = v;
     }
   }
-  // SECURITY: pattern-redact every string leaf BEFORE the size check, so the
-  // enforced size is the persisted size. Same shared pattern set the pino
-  // host-log path uses (secret-patterns.ts) in its log-surface posture: every
-  // credential shape is scrubbed regardless of issuer. `plugin_logs` is read
-  // back raw by `GET /api/plugins/:pluginId/logs`, so a shape-valid secret in
-  // worker-authored meta must never persist unredacted. A self-referential or
-  // otherwise non-serialisable meta fails closed to the `_sanitised` marker.
-  let redacted: Record<string, unknown>;
-  try {
-    redacted = redactSecretsDeepForLog(cleaned);
-  } catch {
-    return { _sanitised: true, _error: "meta was not JSON-serialisable" };
-  }
   // Enforce total serialised size
   let json: string;
   try {
-    json = JSON.stringify(redacted);
+    json = JSON.stringify(cleaned);
   } catch {
     return { _sanitised: true, _error: "meta was not JSON-serialisable" };
   }
   if (json.length > MAX_LOG_META_JSON_LENGTH) {
     return { _sanitised: true, _error: `meta exceeded ${MAX_LOG_META_JSON_LENGTH} chars` };
   }
-  return redacted;
-}
-
-/** Levels the persist sink accepts verbatim; anything else normalises to "info". */
-const KNOWN_PLUGIN_LOG_LEVELS: ReadonlySet<string> = new Set([
-  "debug",
-  "info",
-  "warn",
-  "error",
-  // Host-minted by `metrics.write` (§26): metrics persist to `plugin_logs` so
-  // they are queryable alongside regular logs. A worker cannot mint it — the
-  // host service hard-codes it — but the allowlist must keep it working.
-  "metric",
-]);
-
-/**
- * Normalise a plugin-controlled log level before persist: trim, lowercase,
- * known set passes through, everything else collapses to "info". The value
- * lands in `plugin_logs.level` and is used as a read filter
- * (`GET /api/plugins/:pluginId/logs?level=`), so a worker must never be able
- * to persist an unbounded string there.
- */
-function normaliseLogLevel(level: string | null | undefined): string {
-  const candidate = typeof level === "string" ? level.trim().toLowerCase() : "";
-  return KNOWN_PLUGIN_LOG_LEVELS.has(candidate) ? candidate : "info";
+  return cleaned;
 }
 
 interface BufferedLogEntry {
@@ -707,46 +485,6 @@ export async function flushPluginLogBuffer(): Promise<void> {
   }
 }
 
-/**
- * Append one plugin log entry to the shared batch buffer, applying the exact
- * persist semantics of the `logger.log` host service: secret-pattern
- * redaction and truncation of the message, level normalisation to the known
- * set, and meta sanitisation (reserved pino keys stripped, secret-pattern
- * redaction of every string leaf, serialised size cap), then a
- * size-triggered flush.
- *
- * Exported so the plugin worker manager can persist worker `ctx.logger`
- * notifications (the `log` JSON-RPC notification) on the SAME buffered path —
- * every worker logger call must land in `plugin_logs` (§26.1), and the
- * operator logs panel reads only that table. Fire-and-forget: never throws
- * into the caller's notification path.
- */
-export function bufferPluginLogEntry(entry: {
-  db: Db;
-  pluginId: string;
-  companyId: string | null;
-  level?: string;
-  message?: unknown;
-  meta?: Record<string, unknown> | null;
-}): void {
-  _logBuffer.push({
-    db: entry.db,
-    pluginId: entry.pluginId,
-    companyId: entry.companyId ?? null,
-    level: normaliseLogLevel(entry.level),
-    // SECURITY: `message` is worker-authored free text and `plugin_logs` is
-    // read back raw, so it goes through the same text redactor the pino
-    // host-log path uses (log-surface posture) after truncation.
-    message: redactSecretsForLog(truncStr(String(entry.message ?? ""), MAX_LOG_MESSAGE_LENGTH)),
-    meta: sanitiseMeta(entry.meta ?? null),
-  });
-  if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
-    flushPluginLogBuffer().catch((err) => {
-      console.error("[plugin-host-services] Triggered log flush failed:", err);
-    });
-  }
-}
-
 /** Interval handle for the periodic log flush. */
 const _logFlushInterval = setInterval(() => {
   flushPluginLogBuffer().catch((err) => {
@@ -800,6 +538,13 @@ const KNOWN_PROVIDER_SPAN_NAMES: ReadonlySet<string> = new Set([
   "postUploadCommand",
   "session.open",
   "session.close",
+  "lease.wait_for_teardown", "lease.lookup", "lease.refresh", "lease.channel_cleanup",
+  "lease.start", "lease.recover", "lease.verify", "lease.workspace", "lease.sentinel",
+  "lease.shell", "lease.create", "lease.expiry", "lease.cleanup",
+  "plugin.worker", "plugin.host.identity.read", "plugin.host.config.read", "plugin.host.progress.read", "plugin.host.progress.write",
+  "plugin.workspace.prepare", "plugin.workspace.failure", "plugin.storage.queue", "plugin.storage.execute",
+  "plugin.runtime.queue", "plugin.runtime.prepare", "plugin.runtime.reconcile", "plugin.runtime.verify",
+  "plugin.remote.request", "plugin.remote.operation", "plugin.remote.lifecycle",
 ]);
 
 /** Clamp the span name to a closed, namespaced set. A known name maps to
@@ -810,7 +555,7 @@ const KNOWN_PROVIDER_SPAN_NAMES: ReadonlySet<string> = new Set([
  * `provider` family attribute on the span instead of this literal. */
 function clampProviderSpanName(raw: unknown): string {
   const name = typeof raw === "string" && KNOWN_PROVIDER_SPAN_NAMES.has(raw) ? raw : "other";
-  return `sandbox.daytona.${name}`;
+  return name.startsWith("plugin.") ? name : `sandbox.daytona.${name}`;
 }
 
 /** The closed allowlist of attribute keys a provider span may carry. The host
@@ -823,13 +568,19 @@ const PROVIDER_SPAN_ATTR_ALLOWLIST: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
   SPAN_ATTRS.transferDirection,
+  SPAN_ATTRS.state,
+  "plugin.operation", "plugin.reused", "plugin.item_count", "plugin.bytes", "plugin.call_count", "plugin.failure_reason",
 ]);
+
+/** The closed value set for `plugin.failure_reason`: a workspace operation failure reason, or `unknown`. */
+const KNOWN_PLUGIN_FAILURE_REASONS: ReadonlySet<string> = new Set<string>([...WORKSPACE_OPERATION_FAILURE_REASONS, "unknown"]);
 
 /** The subset of allowed keys that carry a finite number. */
 const PROVIDER_SPAN_NUMERIC_ATTRS: ReadonlySet<string> = new Set<string>([
   SPAN_ATTRS.packWallMs,
   SPAN_ATTRS.transferWallMs,
   SPAN_ATTRS.transferGuardCount,
+  "plugin.item_count", "plugin.bytes", "plugin.call_count",
 ]);
 
 /** The closed value set for the `outcome` attribute. */
@@ -852,6 +603,19 @@ export function clampProviderSpanAttributes(
   if (!raw) return clamped;
   for (const [key, value] of Object.entries(raw)) {
     if (!PROVIDER_SPAN_ATTR_ALLOWLIST.has(key)) continue;
+    if (key === SPAN_ATTRS.state) {
+      if (typeof value === "string" && ["started", "stopped", "archived", "error", "other"].includes(value)) clamped[key] = value;
+      continue;
+    }
+    if (key === "plugin.operation") {
+      if (typeof value === "string" && ["request", "queue.wait", "launch.wait", "mount.refresh", "guest.setup", "process.execute", "script.workspace", "script.git", "script.settings", "script.publication", "cleanup", "process.start", "hello", "checkpoint.load"].includes(value)) clamped[key] = value;
+      continue;
+    }
+    if (key === "plugin.reused") { if (typeof value === "boolean") clamped[key] = value; continue; }
+    if (key === "plugin.failure_reason") {
+      if (typeof value === "string" && KNOWN_PLUGIN_FAILURE_REASONS.has(value)) clamped[key] = value;
+      continue;
+    }
     if (key === SPAN_ATTRS.provider) {
       clamped[key] = normalizeProviderFamily(typeof value === "string" ? value : undefined);
       continue;
@@ -865,7 +629,7 @@ export function clampProviderSpanAttributes(
       continue;
     }
     if (PROVIDER_SPAN_NUMERIC_ATTRS.has(key)) {
-      if (typeof value === "number" && Number.isFinite(value)) clamped[key] = value;
+      if (typeof value === "number" && Number.isFinite(value) && (!key.startsWith("plugin.") || value >= 0 && value <= 1e12)) clamped[key] = value;
       continue;
     }
   }
@@ -927,12 +691,14 @@ const MAX_PROVIDER_SPAN_END_SKEW_MS = 60 * 1000; // 1 minute
 function validateProviderSpanTimes(
   startTimeMs: unknown,
   endTimeMs: unknown,
+  maxDurationMs = MAX_PROVIDER_SPAN_DURATION_MS,
+  maxAgeMs = MAX_PROVIDER_SPAN_START_AGE_MS,
 ): { startTimeMs: number; endTimeMs: number } | undefined {
   if (typeof startTimeMs !== "number" || !Number.isFinite(startTimeMs)) return undefined;
   if (typeof endTimeMs !== "number" || !Number.isFinite(endTimeMs)) return undefined;
   if (startTimeMs > endTimeMs) return undefined;
-  if (endTimeMs - startTimeMs > MAX_PROVIDER_SPAN_DURATION_MS) return undefined;
-  if (Date.now() - startTimeMs > MAX_PROVIDER_SPAN_START_AGE_MS) return undefined;
+  if (endTimeMs - startTimeMs > maxDurationMs) return undefined;
+  if (Date.now() - startTimeMs > maxAgeMs) return undefined;
   if (endTimeMs - Date.now() > MAX_PROVIDER_SPAN_END_SKEW_MS) return undefined;
   return { startTimeMs, endTimeMs };
 }
@@ -954,20 +720,40 @@ export function recordWorkerProviderSpan(
     status?: { code?: unknown; message?: unknown };
     startTimeMs?: unknown;
     endTimeMs?: unknown;
+    children?: unknown;
+    relationship?: unknown;
   },
   context: WorkerHostCallContext | undefined,
 ): void {
   const parent = parseTraceparent(context?.traceparent);
   if (!parent) return; // reject a missing or malformed traceparent
-  const times = validateProviderSpanTimes(params.startTimeMs, params.endTimeMs);
-  const status = clampSpanStatus(params.status);
-  recordProviderPluginSpan({
-    name: clampProviderSpanName(params.name),
-    parent,
-    attributes: clampProviderSpanAttributes(params.attributes),
-    ...(status ? { status } : {}),
-    ...(times ? { startTimeMs: times.startTimeMs, endTimeMs: times.endTimeMs } : {}),
-  });
+  const budget = context?.providerSpanBudget ?? {remaining:256};
+  const longInvocation = params.name === "plugin.worker";
+  const invocationLimitMs = 24 * 60 * 60 * 1000;
+  const visit = (params: { name: string; attributes?: Record<string, unknown>; status?: { code?: unknown }; startTimeMs?: unknown; endTimeMs?: unknown; children?: unknown; relationship?: unknown }, parent: ParsedTraceparent, depth: number, enclosing?: { startTimeMs: number; endTimeMs: number }) => {
+    if (depth > 12 || budget.remaining-- <= 0) return;
+    const times = validateProviderSpanTimes(params.startTimeMs, params.endTimeMs,
+      depth === 0 && longInvocation ? invocationLimitMs : MAX_PROVIDER_SPAN_DURATION_MS,
+      longInvocation ? invocationLimitMs : MAX_PROVIDER_SPAN_START_AGE_MS);
+    const linked = params.relationship === "linked" && params.name === "plugin.remote.lifecycle";
+    if (params.relationship !== undefined && !linked) return;
+    if (linked && (!times || Date.now() - times.startTimeMs > MAX_PROVIDER_SPAN_DURATION_MS)) return;
+    if (enclosing && (!times || (!linked && times.startTimeMs < enclosing.startTimeMs) || times.endTimeMs > enclosing.endTimeMs)) return;
+    const status = clampSpanStatus(params.status);
+    const childParent = recordProviderPluginSpan({
+      name: clampProviderSpanName(params.name),
+      parent,
+      ...(linked ? { linked: true } : {}),
+      attributes: clampProviderSpanAttributes(params.attributes),
+      ...(status ? { status } : {}),
+      ...(times ? { startTimeMs: times.startTimeMs, endTimeMs: times.endTimeMs } : {}),
+    });
+    if (childParent && times && Array.isArray(params.children)) for (const child of params.children.slice(0, 256)) {
+      if (budget.remaining <= 0) break;
+      if (child && typeof child === "object" && typeof child.name === "string") visit(child, childParent, depth + 1, times);
+    }
+  };
+  try { visit(params, parent, 0); } catch {}
 }
 
 export function buildHostServices(
@@ -978,28 +764,14 @@ export function buildHostServices(
   notifyWorker?: (method: string, params: unknown) => void,
   options: {
     pluginWorkerManager?: PluginWorkerManager;
-    storageService?: StorageService;
-    runContextRegistry?: PluginRunContextRegistry;
     manifest?: import("@paperclipai/shared").PaperclipPluginManifestV1;
     heartbeatRuntimeEnv?: Record<string, string | undefined>;
-    wakeRateLimiter?: PluginWakeRateLimiter;
   } = {},
 ): HostServices & { dispose(): void } {
-  const wakeRateLimiter = options.wakeRateLimiter ?? defaultPluginWakeRateLimiter;
   const registry = pluginRegistryService(db);
   const stateStore = pluginStateStore(db);
   const pluginDb = pluginDatabaseService(db);
-  const secretsHandler = createPluginSecretsHandler({
-    db,
-    pluginDbId: pluginId,
-    pluginKey,
-    runContextRegistry: options.runContextRegistry,
-    // SECURITY-CRITICAL: the service/background resolve paths learn their owning company
-    // only inside the handler, so the enablement gate has to be injected rather
-    // than applied out here. Wrapped in an arrow because
-    // `requirePluginEnabledForCompany` is declared below this construction.
-    ensurePluginEnabledForCompany: (companyId) => requirePluginEnabledForCompany(companyId),
-  });
+  const secretsHandler = createPluginSecretsHandler({ db, pluginId });
   const companies = companyService(db);
   const agents = agentService(db);
   const agentsLifecycle = createAgentLifecycle(db);
@@ -1180,47 +952,6 @@ export function buildHostServices(
     return { ...relation, blockedBy: redact(relation.blockedBy), blocks: redact(relation.blocks) };
   };
 
-  // artifacts.fetch handler — only available when storage + a
-  // run-context registry are wired. When absent (e.g. legacy test harnesses)
-  // the slot stays unwired and any call throws a clear error.
-  const artifactsHandler =
-    options.storageService && options.runContextRegistry
-      ? createPluginArtifactsHandler({
-          db,
-          pluginDbId: pluginId,
-          pluginKey,
-          storage: options.storageService,
-          attachments: {
-            async getAttachmentById(id: string) {
-              const row = await issues.getAttachmentById(id);
-              if (!row) return null;
-              return {
-                id: row.id,
-                companyId: row.companyId,
-                objectKey: row.objectKey,
-                contentType: row.contentType,
-                byteSize: row.byteSize,
-                originalFilename: row.originalFilename ?? null,
-              };
-            },
-          },
-          // asset-write surface + per-company size ceiling for
-          // artifacts.create (mirrors the human upload route's ceiling).
-          assetWriter: {
-            findReusableUnattachedAsset: (companyId, sha256) =>
-              issues.findReusableUnattachedAsset(companyId, sha256),
-            createStandaloneAsset: (input) => issues.createStandaloneAsset(input),
-          },
-          async resolveCompanyMaxBytes(companyId: string) {
-            // Upstream removed the per-company attachment-limit column, so the
-            // deployment-wide ceiling is the single bound for artifact writes.
-            void companyId;
-            return normalizeIssueAttachmentMaxBytes(null);
-          },
-          runContextRegistry: options.runContextRegistry,
-        })
-      : null;
-
   // Track active session event subscriptions for cleanup
   const activeSubscriptions = new Set<{ unsubscribe: () => void; timer: ReturnType<typeof setTimeout> }>();
   let disposed = false;
@@ -1264,110 +995,16 @@ export function buildHostServices(
   /**
    * Plugins are instance-wide in the current runtime. Company IDs are still
    * required for company-scoped data access, but there is no per-company
-   * availability gate to enforce on the GENERAL surface.
-   *
-   * SECURITY-NAMING NOTE: this is deliberately NOT named like an authz gate
-   * (and not named `ensurePluginAvailableForCompany`) because it enforces
-   * NOTHING — it is upstream's structural placeholder for a per-company
-   * availability check this runtime does not have. Reading it as a security
-   * control would be the false-assurance anti-pattern. The REAL, fail-closed
-   * availability gate is `requirePluginEnabledForCompany` below, and ONLY the
-   * fork-only reconcile/background reads (`approvals.listPending`,
-   * `interactions.list`, `config.getForServiceScope`) plus the company-scoped
-   * `state.get` / `state.set` / `state.delete` handlers (via
-   * `requireStateCompanyReach`) run it.
+   * availability gate to enforce here.
    */
-  const noPluginAvailabilityGate = async (_companyId: string) => {};
-
-  /**
-   * SECURITY-CRITICAL: real, method-scoped availability gate for the fork-only
-   * reconcile/background reads (`approvals.listPending` / `interactions.list` /
-   * `config.getForServiceScope`) and for company-scoped plugin state
-   * (`state.get` / `state.set` / `state.delete` via `requireStateCompanyReach`
-   * below). Unlike the instance-wide no-op stub above, this fail-closes so a
-   * cross-tenant-sensitive enumeration can never run for a company the plugin
-   * is not genuinely provisioned for. Pre-existing handlers are NOT rewired:
-   * their per-entity `requireInCompany` cross-check stays as upstream wrote
-   * it. Added consumers: the company-scoped state handlers, and the secrets
-   * handler's service/background resolve paths — those have no per-entity
-   * company to cross-check (the owning company is derived from the binding),
-   * so this is the only gate that can enforce per-tenant disablement there.
-   *
-   * Denial order (each step throws rather than returning an empty list — a
-   * silent empty would mask a misconfig and reopen the very downtime gap this
-   * RPC closes):
-   *   (a) companyId must be a non-empty string;
-   *   (b) the company must exist;
-   *   (c) the plugin install record must exist and be in an operational state
-   *       (not `uninstalled` / `disabled`);
-   *   (d) the company must not have explicitly disabled the plugin
-   *       (`enabled !== false`; absent settings row ⇒ default-ON, matching the
-   *       instance-wide install model).
-   */
-  const requirePluginEnabledForCompany = async (companyId: string): Promise<void> => {
-    // (a)
-    if (typeof companyId !== "string" || companyId.trim().length === 0) {
-      throw new Error("companyId is required for this operation");
-    }
-    // (b)
-    const company = await companies.getById(companyId);
-    if (!company) {
-      throw new Error("Company not found");
-    }
-    // (c)
-    const plugin = await registry.getById(pluginId);
-    if (!plugin || plugin.status === "uninstalled" || plugin.status === "disabled") {
-      throw new Error("Plugin is not available for this company");
-    }
-    // (d)
-    const settings = await registry.getCompanySettings(pluginId, companyId);
-    if (settings && settings.enabled === false) {
-      throw new Error("Plugin is disabled for this company");
-    }
-  };
-
-  /**
-   * SECURITY-CRITICAL: per-company reach check for COMPANY-scoped plugin state
-   * (`scopeKind:"company"` — `scopeId` is a worker-chosen companyId).
-   * Company-scoped `state.get` / `state.set` / `state.delete` are admitted
-   * under the bare worker-lifetime `serviceScope` with no dispatch to pin a
-   * tenant, so this is the compensating server-side reach-check the SDK
-   * allowlist invariant requires (`SERVICE_SCOPE_COMPANY_METHODS` in the SDK
-   * host-client-factory). It bounds the reachable company set to the plugin's
-   * install reach — the identical gate the fork-only reconcile/background
-   * reads run — so an idle worker can neither pre-poison an unprovisioned
-   * company's state before adoption nor read/wipe partitions of companies it
-   * does not serve (`plugin_state` BOLA).
-   *
-   * Fail-closed shapes:
-   *   - `scopeKind:"company"` with a missing/empty `scopeId` is REJECTED
-   *     rather than falling through to the store's NULL-`scopeId` partition
-   *     (an unkeyed partition no legitimate company dispatch ever writes;
-   *     kept unreachable so it cannot become a bypass channel);
-   *   - unknown company / uninstalled or disabled install / company-disabled
-   *     plugin all deny via `requirePluginEnabledForCompany`.
-   *
-   * Every other `scopeKind` keys state by an entity id (`instance`, `issue`,
-   * `project`, `agent`, ...) that only the plugin itself can have written —
-   * no company reach exists to widen — so the gate is a no-op there.
-   */
-  const requireStateCompanyReach = async (
-    scopeKind: unknown,
-    scopeId: unknown,
-  ): Promise<void> => {
-    if (scopeKind !== "company") return;
-    if (typeof scopeId !== "string" || scopeId.trim().length === 0) {
-      throw new Error("scopeId is required for company-scoped plugin state");
-    }
-    await requirePluginEnabledForCompany(scopeId.trim());
-  };
+  const ensurePluginAvailableForCompany = async (_companyId: string) => {};
 
   const getLocalFolderDeclaration = (folderKey: string) =>
     requireLocalFolderDeclaration(options.manifest?.localFolders, folderKey);
 
   const getStoredLocalFolderConfig = async (companyId: string, folderKey: string) => {
     ensureCompanyId(companyId);
-    await noPluginAvailabilityGate(companyId);
+    await ensurePluginAvailableForCompany(companyId);
     const settings = await registry.getCompanySettings(pluginId, companyId);
     return getStoredLocalFolders(settings?.settingsJson)[folderKey] ?? null;
   };
@@ -1888,31 +1525,26 @@ export function buildHostServices(
     };
   };
 
-  // Actor synthesis fails closed: the caller (plugin RPC input) must pass the
-  // source it was authenticated with. "session" is never a default — an unset
-  // or type-mismatched source denies (403) instead of synthesizing the most
-  // privileged board provenance from an unvalidated actor payload.
   const pluginAssignmentActor = (actor: {
     type: "agent" | "board";
     agentId?: string | null;
     companyId?: string | null;
     userId?: string | null;
     companyIds?: string[];
-    source?: unknown;
   }): AuthorizationActor => {
     if (actor.type === "agent") {
       return {
         type: "agent",
         agentId: actor.agentId ?? null,
         companyId: actor.companyId ?? null,
-        source: requireAgentActorSource(actor.source),
+        source: "agent_key",
       };
     }
     return {
       type: "board",
       userId: actor.userId ?? null,
       companyIds: Array.isArray(actor.companyIds) ? actor.companyIds : [],
-      source: requirePluginBoardActorSource(actor.source),
+      source: "session",
     };
   };
 
@@ -1978,106 +1610,15 @@ export function buildHostServices(
     return { resourceType, resourceId, companyId, policy: null, updatedAt: company.updatedAt };
   };
 
-  // Fork-only effective plugin config: the company's `plugin_config` row
-  // shallow-merged with the tenant's `configOverrides` subtree. ONLY the
-  // fork-only background read (`config.getForServiceScope`) serves this merged
-  // view, so a background reconcile never sees a stale base value an operator
-  // has overridden for its tenant. The upstream-named general `config.get`
-  // deliberately stays base-only — upstream (v2026.824.1) returns
-  // `configRow?.configJson ?? {}` — so the public surface remains
-  // byte-compatible and a future sync never re-litigates it.
-  const getEffectiveCompanyConfig = async (
-    companyId: string,
-  ): Promise<Record<string, unknown>> => {
-    const [configRow, override] = await Promise.all([
-      registry.getConfig(pluginId, companyId),
-      registry.getCompanyConfigOverride(pluginId, companyId),
-    ]);
-    const base = (configRow?.configJson as Record<string, unknown> | undefined) ?? {};
-    if (!override) return { ...base };
-    // Merge-time scope filter (defense in depth): an override row written
-    // before the write gate existed must not shadow an operator-plane key.
-    const manifest = (await registry.getById(pluginId))?.manifestJson as
-      | { instanceConfigSchema?: { properties?: Record<string, unknown> } }
-      | undefined;
-    const { kept, dropped } = filterOverrideToTenantScope(manifest?.instanceConfigSchema, override);
-    if (dropped.length > 0) {
-      configGateLog.warn(
-        { pluginId, companyId, droppedKeys: dropped },
-        "plugin.config_override.ignored_non_tenant_keys",
-      );
-    }
-    return { ...base, ...kept };
-  };
-
-  /**
-   * SECURITY-CRITICAL: provisioning gate for the fork-only background config
-   * read (`config.getForServiceScope`). Mirrors the `company_secret_bindings`
-   * posture of the secrets handler: the named company must hold a
-   * `plugin_config` row for THIS plugin install, and every denial shape —
-   * (a) unknown company, (b) install not operational (uninstalled/disabled),
-   * (c) company-disabled plugin, (d) missing `plugin_config` row — collapses
-   * into ONE opaque error at the worker boundary. A worker can therefore not
-   * distinguish "company does not exist" from "company exists but never
-   * configured this plugin": no company- or config-existence oracle. The
-   * specific denial reason is logged server-side only (value-free reasons).
-   *
-   * Fail closed: unknown/unprovisioned → throw, never an empty config.
-   * Deliberately scoped to the config read ONLY — the reconcile enumeration
-   * reads (`approvals.listPending` / `interactions.list`) legitimately serve
-   * companies that hold no config row, so they keep the shared
-   * `requirePluginEnabledForCompany` gate with its distinct messages.
-   */
-  const requireConfigProvisionedForCompany = async (companyId: string): Promise<void> => {
-    try {
-      await requirePluginEnabledForCompany(companyId);
-    } catch (err) {
-      configGateLog.warn(
-        { pluginId, reason: err instanceof Error ? err.message : String(err) },
-        "service-scope config read denied; collapsing to opaque provisioning error",
-      );
-      throw new Error(SERVICE_SCOPE_CONFIG_DENIED);
-    }
-    // The company must hold a `plugin_config` row for THIS plugin install —
-    // the same posture as `company_secret_bindings` for secret refs. Without
-    // this, any worker of an enabled plugin could read any company's plugin
-    // config metadata (routing ids, secret REF UUIDs — never values; values
-    // stay binding-table-gated) the moment a plugin goes multi-company.
-    const configRow = await registry.getConfig(pluginId, companyId);
-    if (!configRow) {
-      configGateLog.warn(
-        { pluginId },
-        "service-scope config read denied: company holds no plugin_config row for this install",
-      );
-      throw new Error(SERVICE_SCOPE_CONFIG_DENIED);
-    }
-  };
-
-  const configService = {
-    async get(params: Parameters<HostServices["config"]["get"]>[0]) {
-      const companyId = ensureCompanyId(params.companyId);
-      await noPluginAvailabilityGate(companyId);
-      // Base-only on purpose: upstream parity for the general surface
-      // (upstream v2026.824.1 `configRow?.configJson ?? {}`). The override
-      // merge lives on the fork-only `getForServiceScope` read below.
-      const configRow = await registry.getConfig(pluginId, companyId);
-      return configRow?.configJson ?? {};
-    },
-    // Fork-only background read (serviceScope-reachable; see the SDK gate).
-    // Fail-closed provisioning with an opaque, oracle-free denial:
-    // unknown company / uninstalled / disabled plugin / company without a
-    // `plugin_config` row for this install all collapse to ONE error.
-    async getForServiceScope(
-      params: Parameters<HostServices["config"]["getForServiceScope"]>[0],
-    ): Promise<Record<string, unknown>> {
-      const companyId = ensureCompanyId(params.companyId);
-      await requireConfigProvisionedForCompany(companyId);
-      return getEffectiveCompanyConfig(companyId);
-    },
-  };
-
   return {
-    config: configService as unknown as HostServices["config"],
+    config: {
+      async get(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        const configRow = await registry.getConfig(pluginId, companyId);
+        return configRow?.configJson ?? {};
+      },
+    },
 
     localFolders: {
       async declarations() {
@@ -2086,7 +1627,7 @@ export function buildHostServices(
 
       async configure(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const declaration = getLocalFolderDeclaration(params.folderKey);
         const existing = await registry.getCompanySettings(pluginId, companyId);
         const existingConfig = getStoredLocalFolders(existing?.settingsJson)[params.folderKey] ?? null;
@@ -2164,24 +1705,14 @@ export function buildHostServices(
       },
     },
 
-    // SECURITY-CRITICAL: company-scoped plugin state is keyed by a
-    // worker-chosen companyId. Under the bare worker-lifetime `serviceScope`
-    // (idle worker, no dispatch pinning a tenant) the SDK allowlist admits
-    // these calls for ANY company, so the per-company reach check below is the
-    // compensating server-side gate between a worker and every company
-    // partition of its own plugin's state (`plugin_state` BOLA: pre-poison a
-    // company before it adopts the plugin, or wipe its partitions at will).
-    // Identical fail-closed gate to the fork-only reconcile reads.
     state: {
       async get(params) {
-        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         return stateStore.get(pluginId, params.scopeKind as any, params.stateKey, {
           scopeId: params.scopeId,
           namespace: params.namespace,
         });
       },
       async set(params) {
-        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         await stateStore.set(pluginId, {
           scopeKind: params.scopeKind as any,
           scopeId: params.scopeId,
@@ -2191,7 +1722,6 @@ export function buildHostServices(
         });
       },
       async delete(params) {
-        await requireStateCompanyReach(params.scopeKind, params.scopeId);
         await stateStore.delete(pluginId, params.scopeKind as any, params.stateKey, {
           scopeId: params.scopeId,
           namespace: params.namespace,
@@ -2229,7 +1759,7 @@ export function buildHostServices(
       },
       async emit(params) {
         if (params.companyId) {
-          await noPluginAvailabilityGate(params.companyId);
+          await ensurePluginAvailableForCompany(params.companyId);
         }
         await scopedBus.emit(params.name, params.companyId, params.payload);
       },
@@ -2239,31 +1769,11 @@ export function buildHostServices(
             notifyWorker("onEvent", { event });
           }
         };
-        const { replaced } = params.filter
-          ? scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler)
-          : scopedBus.subscribe(params.eventPattern as any, handler);
-        // Observability: a plugin worker re-runs setup() (and therefore
-        // re-issues every events.subscribe RPC) on each (re)start — e.g. a
-        // dev-watcher hot reload or crash auto-restart. If the host-side
-        // subscription ever fails to re-attach, board events silently stop
-        // reaching the worker with no error. Logging the running per-plugin
-        // subscription count on every (re)subscribe makes a detached relay
-        // observable: a healthy worker logs a rising count right after restart;
-        // a detached one logs nothing (count stuck at 0).
-        //
-        // `replaced` distinguishes a first bind from a re-bind that
-        // adopted the current notify channel, which is why `subscriptionCount`
-        // now stays flat across re-binds instead of climbing.
-        logger.info(
-          {
-            pluginId,
-            pluginKey,
-            eventPattern: params.eventPattern,
-            subscriptionCount: eventBus.subscriptionCount(pluginKey),
-            replaced,
-          },
-          "plugin event subscription registered",
-        );
+        if (params.filter) {
+          scopedBus.subscribe(params.eventPattern as any, params.filter as any, handler);
+        } else {
+          scopedBus.subscribe(params.eventPattern as any, handler);
+        }
       },
     },
 
@@ -2271,30 +1781,14 @@ export function buildHostServices(
       async fetch(params) {
         // SSRF protection: validate protocol whitelist + block private IPs.
         // Resolve once, then connect directly to that IP to prevent DNS rebinding.
-        // Gate on the plugin's own declared config-key egress
-        // allowlist before any DNS resolution happens.
-        const target = await validateAndResolveFetchUrl(params.url, (url) =>
-          enforcePluginConfigEgress(db, pluginId, url),
-          { pluginId, loadPrivateEgressOrigins: () => loadPluginPrivateEgressOrigins(db, pluginId) },
-        );
+        const target = await validateAndResolveFetchUrl(params.url);
 
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), PLUGIN_FETCH_TIMEOUT_MS);
 
         try {
-          const init = params.init as PluginFetchInit | undefined;
-          // The SDK worker opts in by sending `acceptResponseBodyEncoding:
-          // "base64"` as a top-level param (sibling of `url`/`init`). Old SDKs
-          // never send it, so they stay on the legacy utf8 path.
-          const responseBase64 =
-            (params as { acceptResponseBodyEncoding?: "utf8" | "base64" })
-              .acceptResponseBodyEncoding === "base64";
-          return await executePinnedHttpRequest(
-            target,
-            init,
-            controller.signal,
-            responseBase64,
-          );
+          const init = params.init as RequestInit | undefined;
+          return await executePinnedHttpRequest(target, init, controller.signal);
         } finally {
           clearTimeout(timeout);
         }
@@ -2304,47 +1798,15 @@ export function buildHostServices(
     secrets: {
       async resolve(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return secretsHandler.resolve({ ...params, companyId });
-      },
-      // Fork-only worker-lifetime service-context read. NO companyId is
-      // asserted here and no availability stub runs: the secrets handler
-      // derives the company from the secret binding (ambiguous cross-company
-      // bindings collapse to not_found), rate-limits per plugin, requires the
-      // host-minted service run-context, and registers the value with the
-      // run-scoped redactor. This keeps background secret reads (the messenger
-      // poll loop's bot token) alive on the upstream-strict bridge.
-      async resolveService(params: PluginSecretsResolveParams) {
-        return secretsHandler.resolve(params);
-      },
-      async mintHandle(params) {
-        return secretsHandler.mintHandle(params);
-      },
-    },
-
-    artifacts: {
-      async fetch(params) {
-        if (!artifactsHandler) {
-          throw new Error(
-            "artifacts.fetch is not available — host was built without a storage service or run-context registry",
-          );
-        }
-        return artifactsHandler.fetch(params);
-      },
-      async create(params) {
-        if (!artifactsHandler) {
-          throw new Error(
-            "artifacts.create is not available — host was built without a storage service or run-context registry",
-          );
-        }
-        return artifactsHandler.create(params);
       },
     },
 
     activity: {
       async log(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         await logActivity(db, {
           companyId,
           actorType: "plugin",
@@ -2360,23 +1822,25 @@ export function buildHostServices(
     metrics: {
       async write(params) {
         const safeName = truncStr(String(params.name ?? ""), MAX_METRIC_NAME_LENGTH);
-        logger.debug(
-          redactSecretsDeepForLog({ pluginId, name: safeName, value: params.value, tags: params.tags }),
-          "Plugin metric write",
-        );
+        logger.debug({ pluginId, name: safeName, value: params.value, tags: params.tags }, "Plugin metric write");
 
         // Persist metrics to plugin_logs via the batch buffer (same path as
         // logger.log) so they benefit from batched writes and are flushed
         // reliably on shutdown. Using level "metric" makes them queryable
         // alongside regular logs via the same API (§26).
-        bufferPluginLogEntry({
+        _logBuffer.push({
           db,
           pluginId,
           companyId: params.companyId ?? null,
           level: "metric",
           message: safeName,
-          meta: { value: params.value, tags: params.tags ?? null },
+          meta: sanitiseMeta({ value: params.value, tags: params.tags ?? null }),
         });
+        if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
+          flushPluginLogBuffer().catch((err) => {
+            console.error("[plugin-host-services] Triggered metric flush failed:", err);
+          });
+        }
       },
     },
 
@@ -2397,10 +1861,7 @@ export function buildHostServices(
     logger: {
       async log(params) {
         const { level, meta } = params;
-        // The host log line must meet the same secret-pattern bar as the
-        // persisted row; the persist side re-applies truncation + redaction
-        // on the raw value in `bufferPluginLogEntry` below.
-        const safeMessage = redactSecretsForLog(truncStr(String(params.message ?? ""), MAX_LOG_MESSAGE_LENGTH));
+        const safeMessage = truncStr(String(params.message ?? ""), MAX_LOG_MESSAGE_LENGTH);
         const safeMeta = sanitiseMeta(meta);
         const pluginLogger = logger.child({ service: "plugin-worker", pluginId });
         const logFields = {
@@ -2415,16 +1876,20 @@ export function buildHostServices(
         else pluginLogger.info(logFields, `[plugin] ${safeMessage}`);
 
         // Persist to plugin_logs table via the module-level batch buffer (§26.1).
-        // Fire-and-forget — logging should never block the worker. The shared
-        // helper applies the same truncation/sanitisation semantics as above.
-        bufferPluginLogEntry({
+        // Fire-and-forget — logging should never block the worker.
+        _logBuffer.push({
           db,
           pluginId,
           companyId: params.companyId ?? null,
-          level,
-          message: params.message,
-          meta,
+          level: level ?? "info",
+          message: safeMessage,
+          meta: safeMeta,
         });
+        if (_logBuffer.length >= LOG_BUFFER_FLUSH_SIZE) {
+          flushPluginLogBuffer().catch((err) => {
+            console.error("[plugin-host-services] Triggered log flush failed:", err);
+          });
+        }
       },
     },
 
@@ -2444,31 +1909,36 @@ export function buildHostServices(
         return applyWindow((await companies.list()) as Company[], params);
       },
       async get(params) {
-        await noPluginAvailabilityGate(params.companyId);
+        await ensurePluginAvailableForCompany(params.companyId);
         return (await companies.getById(params.companyId)) as Company;
       },
     },
 
     projects: {
+      async resolveGitCredential(params, context) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return projectGitAuthorizationService(db).resolve(params, context.invocationScope?.projectGit);
+      },
       async getInstanceSecrets(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return projectInstanceSecretService(db, pluginId).read(companyId, params.projectId);
       },
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return applyWindow((await projects.list(companyId)) as Project[], params);
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const project = await projects.getById(params.projectId);
         return (inCompany(project, companyId) ? project : null) as Project | null;
       },
       async listWorkspaces(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const project = await projects.getById(params.projectId);
         if (!inCompany(project, companyId)) return [];
         const rows = await projects.listWorkspaces(params.projectId);
@@ -2491,7 +1961,7 @@ export function buildHostServices(
       },
       async getPrimaryWorkspace(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const project = await projects.getById(params.projectId);
         if (!inCompany(project, companyId)) return null;
         const row = project.primaryWorkspace;
@@ -2513,7 +1983,7 @@ export function buildHostServices(
 
       async getWorkspaceForIssue(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = await issues.getById(params.issueId);
         if (!inCompany(issue, companyId)) return null;
         const projectId = (issue as Record<string, unknown>).projectId as string | null;
@@ -2538,7 +2008,7 @@ export function buildHostServices(
       },
       async getManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -2549,7 +2019,7 @@ export function buildHostServices(
       },
       async reconcileManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -2559,7 +2029,7 @@ export function buildHostServices(
       },
       async resetManaged(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return projects.resolveManagedProject({
           companyId,
           pluginId,
@@ -2573,7 +2043,7 @@ export function buildHostServices(
     executionWorkspaces: {
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const workspace = await executionWorkspaces.getById(params.workspaceId);
         if (inCompany(workspace, companyId)) {
           return toPluginExecutionWorkspaceMetadata(workspace);
@@ -2585,12 +2055,12 @@ export function buildHostServices(
     routines: {
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedRoutines.get(params.routineKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedRoutines.reconcile(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -2598,7 +2068,7 @@ export function buildHostServices(
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedRoutines.reset(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -2606,14 +2076,14 @@ export function buildHostServices(
       },
       async managedUpdate(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedRoutines.update(params.routineKey, companyId, {
           status: params.status,
         });
       },
       async managedRun(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedRoutines.run(params.routineKey, companyId, {
           assigneeAgentId: params.assigneeAgentId,
           projectId: params.projectId,
@@ -2624,17 +2094,17 @@ export function buildHostServices(
     skills: {
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedSkills.get(params.skillKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedSkills.reconcile(params.skillKey, companyId);
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedSkills.reset(params.skillKey, companyId);
       },
     },
@@ -2642,7 +2112,7 @@ export function buildHostServices(
     issues: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         assertReadableOriginFilter(params.originKind);
         // Push the non-member visibility predicate into the list query so private
         // issues are filtered at the SQL layer before they can reach a plugin.
@@ -2654,7 +2124,7 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = await issues.getById(params.issueId);
         if (!inCompany(issue, companyId)) return null;
         if (!(await pluginCanReadIssue(issue))) return null;
@@ -2662,7 +2132,7 @@ export function buildHostServices(
       },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const { actorAgentId, actorUserId, actorRunId, originKind, surfaceVisibility, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(
           surfaceVisibility === "plugin_operation" && !originKind
@@ -2709,7 +2179,7 @@ export function buildHostServices(
       },
       async update(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const existing = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         await requirePluginReadableIssue(params.issueId, companyId);
         const patch = { ...(params.patch as Record<string, unknown>) };
@@ -2747,7 +2217,7 @@ export function buildHostServices(
       },
       async getRelations(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         // Private root -> indistinguishable from missing; readable root ->
         // still redact any edge that points at an issue the plugin cannot read.
         await requirePluginReadableIssue(params.issueId, companyId);
@@ -2758,7 +2228,7 @@ export function buildHostServices(
       },
       async setBlockedBy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         // The echoed relation summary can name a private blocker target, so
         // redact unreadable edges before returning it to a non-member plugin.
         return pluginRedactRelationSummary(companyId, await setBlockedByWithActivity({
@@ -2773,7 +2243,7 @@ export function buildHostServices(
       },
       async addBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const previous = await issues.getRelationSummaries(params.issueId);
         const nextBlockedByIssueIds = [
@@ -2794,7 +2264,7 @@ export function buildHostServices(
       },
       async removeBlockers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const previous = await issues.getRelationSummaries(params.issueId);
         const removals = new Set(params.blockerIssueIds);
@@ -2813,7 +2283,7 @@ export function buildHostServices(
       },
       async assertCheckoutOwner(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const ownership = await issues.assertCheckoutOwner(
           params.issueId,
@@ -2845,67 +2315,9 @@ export function buildHostServices(
           adoptedFromRunId: ownership.adoptedFromRunId,
         };
       },
-      async listWakeupRequests(params) {
-        // Company scoping: identical to getSubtree — companyId is mandatory,
-        // the host only returns rows whose agent_wakeup_requests.company_id
-        // equals it (instance-scoped plugins must call once per company).
-        const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
-        const issueIds = Array.isArray(params.issueIds)
-          ? [...new Set(params.issueIds.filter((id): id is string => typeof id === "string" && id.length > 0))]
-          : null;
-        if (!issueIds) throw new Error("issueIds must be an array");
-        if (issueIds.length > WAKEUP_REQUESTS_MAX_ISSUE_IDS) {
-          throw new Error(`issueIds exceeds limit of ${WAKEUP_REQUESTS_MAX_ISSUE_IDS}`);
-        }
-        if (issueIds.length === 0) return [];
-        let since: Date | null = null;
-        if (params.since !== undefined && params.since !== null) {
-          since = new Date(params.since);
-          if (Number.isNaN(since.getTime())) throw new Error("since must be an ISO timestamp");
-        }
-        const statuses = Array.isArray(params.statuses)
-          ? params.statuses.filter((s): s is string => typeof s === "string").slice(0, 32)
-          : since ? null : [...WAKEUP_REQUESTS_DEFAULT_STATUSES];
-        if (statuses && statuses.length === 0) return [];
-        const requested = typeof params.limit === "number" && Number.isFinite(params.limit)
-          ? Math.floor(params.limit) : WAKEUP_REQUESTS_MAX_ROWS;
-        const limit = Math.min(Math.max(1, requested), WAKEUP_REQUESTS_MAX_ROWS);
-        const issueIdExpr = sql<string>`${agentWakeupRequests.payload} ->> 'issueId'`;
-        // Allow-listed columns only: payload/context snapshot, idempotency
-        // key, requester ids and error text are never selected.
-        const rows = await db
-          .select({
-            id: agentWakeupRequests.id,
-            issueId: issueIdExpr,
-            agentId: agentWakeupRequests.agentId,
-            status: agentWakeupRequests.status,
-            reason: agentWakeupRequests.reason,
-            source: agentWakeupRequests.source,
-            requestedAt: agentWakeupRequests.requestedAt,
-          })
-          .from(agentWakeupRequests)
-          .where(and(
-            eq(agentWakeupRequests.companyId, companyId),
-            inArray(issueIdExpr, issueIds),
-            statuses ? inArray(agentWakeupRequests.status, statuses) : undefined,
-            since ? gte(agentWakeupRequests.requestedAt, since) : undefined,
-          ))
-          .orderBy(desc(agentWakeupRequests.requestedAt))
-          .limit(limit);
-        return rows.map((row) => ({
-          id: row.id,
-          issueId: row.issueId,
-          agentId: row.agentId,
-          status: row.status,
-          reason: row.reason ?? null,
-          source: row.source,
-          requestedAt: row.requestedAt instanceof Date ? row.requestedAt.toISOString() : String(row.requestedAt),
-        }));
-      },
       async getSubtree(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         // A private root is invisible to a non-member plugin: report not-found
         // rather than leak its existence or any descendant metadata.
         const rootIssue = await requirePluginReadableIssue(params.issueId, companyId);
@@ -3005,7 +2417,7 @@ export function buildHostServices(
       },
       async requestWakeup(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (!issue.assigneeAgentId) {
           throw new Error("Issue has no assigned agent to wake");
@@ -3071,7 +2483,7 @@ export function buildHostServices(
       },
       async requestWakeups(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const results = [];
         for (const issueId of [...new Set(params.issueIds)]) {
           const issue = requireInCompany("Issue", await issues.getById(issueId), companyId);
@@ -3141,7 +2553,7 @@ export function buildHostServices(
       },
       async getOrchestrationSummary(params): Promise<PluginIssueOrchestrationSummary> {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         // A private root is invisible to a non-member plugin: report not-found
         // rather than leak its existence or any subtree relationship metadata.
         const rootIssue = await requirePluginReadableIssue(params.issueId, companyId);
@@ -3231,101 +2643,25 @@ export function buildHostServices(
       },
       async listComments(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = await issues.getById(params.issueId);
         if (!inCompany(issue, companyId)) return [];
         // Comment visibility follows the ACL of the issue they were posted on.
         if (!(await pluginCanReadIssue(issue))) return [];
         return (await issues.listComments(params.issueId)) as IssueComment[];
       },
-      async listAttachments(params) {
-        const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
-        const attachmentIssue = await issues.getById(params.issueId);
-        if (!inCompany(attachmentIssue, companyId)) return [];
-        // Private issues are invisible to a plugin that is not a member.
-        if (!attachmentIssue || !(await pluginCanReadIssue(attachmentIssue))) return [];
-        // Narrow the host row to the plugin-facing projection:
-        // raw storage addressing (provider, objectKey, sha256) and creator identity
-        // are deliberately withheld so a worker cannot reach the blob store directly
-        // or infer authorship — asset bytes go through artifacts.fetch(assetId).
-        const rows = await issues.listAttachments(params.issueId, companyId);
-        return rows.map((row) => ({
-          id: row.id,
-          companyId: row.companyId,
-          issueId: row.issueId,
-          issueCommentId: row.issueCommentId,
-          assetId: row.assetId,
-          contentType: row.contentType,
-          byteSize: row.byteSize,
-          originalFilename: row.originalFilename,
-          createdAt: row.createdAt,
-        })) as PluginIssueAttachment[];
-      },
       async createComment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
-        // Resolve target by identifier (e.g. an issue's public id) when no issueId is supplied.
-        // requireInCompany keeps the tenant reach-check: an identifier that resolves
-        // to a foreign company throws "Issue not found".
-        const issue = params.identifier && !params.issueId
-          ? requireInCompany("Issue", await issues.getByIdentifier(params.identifier), companyId)
-          : requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const isClosed = issue.status === "done" || issue.status === "cancelled";
-        // Secure default: on the relay/wake path, never land silently on a closed
-        // issue unless the caller explicitly opts out (refuseClosed === false).
-        const refuseClosed = params.refuseClosed ?? params.wakeAssignee === true;
-        if (refuseClosed && isClosed) {
-          throw new Error(`Issue is closed (status: ${issue.status})`);
-        }
-        // SECURITY-CRITICAL: the host must not let a plugin mint *user* authorship. A
-        // worker-supplied user id is untrusted: it would write authorType "user",
-        // indistinguishable from a real board comment, and governance leans on
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         if (params.actorUserId) {
           await requireActiveHumanMember(companyId, params.actorUserId);
         }
-        // comment authorship (send-it-back-to-me, approvals, audit). Relays are
-        // attributed to the plugin's own agent identity; operator identity, if any,
-        // belongs in the comment body/metadata, not in host-minted authorship.
-        // Bind any standalone assets created via artifacts.create onto this
-        // comment. The preflight runs BEFORE the comment row exists, so a
-        // conflicting attachmentIds list fails createComment explicitly and
-        // leaves no comment behind; the bind itself re-checks in-transaction
-        // after addComment. Binding is idempotent for the same comment and
-        // conflict-aware: an asset already bound to a different comment/issue
-        // fails the call explicitly instead of silently dropping the
-        // attachment.
-        const attachmentIds = Array.isArray(params.attachmentIds)
-          ? params.attachmentIds.filter((id): id is string => typeof id === "string" && id.length > 0)
-          : [];
-        if (attachmentIds.length > 0) {
-          await issues.validateAssetsBindableToIssue({
-            issueId: issue.id,
-            assetIds: attachmentIds,
-          });
-        }
         const comment = (await issues.addComment(
-          issue.id,
+          params.issueId,
           params.body,
           { agentId: params.actorUserId ? undefined : params.authorAgentId, userId: params.actorUserId },
         )) as IssueComment;
-        if (attachmentIds.length > 0) {
-          const bound = await issues.attachAssetsToComment({
-            issueId: issue.id,
-            issueCommentId: comment.id,
-            assetIds: attachmentIds,
-          });
-          for (const row of bound) {
-            await logPluginActivity({
-              companyId,
-              action: "issue.attachment_bound",
-              entityType: "issue",
-              entityId: issue.id,
-              actor: { actorAgentId: params.actorUserId ? null : params.authorAgentId ?? null, actorUserId: params.actorUserId ?? null },
-              details: attachmentBoundActivityDetails(row),
-            });
-          }
-        }
         await logPluginActivity({
           companyId,
           action: "issue.comment.created",
@@ -3336,9 +2672,6 @@ export function buildHostServices(
             identifier: issue.identifier,
             commentId: comment.id,
             bodySnippet: comment.body.slice(0, 120),
-            resolvedByIdentifier: Boolean(params.identifier && !params.issueId),
-            wakeAssignee: params.wakeAssignee === true,
-            attachmentCount: attachmentIds.length,
           },
         });
 
@@ -3401,60 +2734,11 @@ export function buildHostServices(
           }
         }
 
-        if (params.wakeAssignee && !isClosed) {
-          // Assignee-only wake. Body @-mentions are deliberately NOT honored as a
-          // wake primitive here: createComment bodies on the relay path are
-          // untrusted operator/Telegram text, and mention-driven wake would let
-          // inbound content fan out heartbeat runs to arbitrary same-company agents
-          // (indirect prompt-injection / DoS). Capped, rate-limited mention-wake is
-          // tracked as a follow-up.
-          const authorAgentId = params.authorAgentId ?? null;
-          const assigneeId = issue.assigneeAgentId;
-          const selfComment = Boolean(authorAgentId && authorAgentId === assigneeId);
-          // Throttle wakes per (plugin, company, assignee). A relay storm still
-          // lands every comment, but only the first `maxWakes`/window enqueue a
-          // heartbeat — the rest are dropped so untrusted inbound volume cannot
-          // spam the assignee's runs or burn budget.
-          const wakeAllowed =
-            assigneeId && !selfComment
-              ? wakeRateLimiter.consume({ pluginId, companyId, agentId: assigneeId }).allowed
-              : true;
-          if (assigneeId && !selfComment && !wakeAllowed) {
-            logger.warn(
-              { issueId: issue.id, agentId: assigneeId, companyId, pluginId, pluginKey },
-              "plugin createComment: assignee wake rate-limited; comment landed but wakeup skipped",
-            );
-          }
-          if (assigneeId && !selfComment && wakeAllowed) {
-            await heartbeat
-              .wakeup(assigneeId, {
-                source: "automation",
-                triggerDetail: "system",
-                reason: "issue_commented",
-                payload: { issueId: issue.id, commentId: comment.id, mutation: "comment", pluginId, pluginKey },
-                requestedByActorType: "system",
-                requestedByActorId: pluginId,
-                contextSnapshot: {
-                  issueId: issue.id,
-                  taskId: issue.id,
-                  commentId: comment.id,
-                  wakeCommentId: comment.id,
-                  source: "plugin.issue.comment",
-                  wakeReason: "issue_commented",
-                  pluginId,
-                  pluginKey,
-                },
-              })
-              .catch((err) =>
-                logger.warn({ err, issueId: issue.id, agentId: assigneeId }, "plugin createComment: failed to wake assignee"),
-              );
-          }
-        }
         return comment;
       },
       async createInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const interaction = await issueThreadInteractionService(db).create(issue, params.interaction as CreateIssueThreadInteraction, {
           agentId: params.authorAgentId ?? null,
@@ -3477,7 +2761,7 @@ export function buildHostServices(
       },
       async listInteractions(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = await issues.getById(params.issueId);
         if (!inCompany(issue, companyId)) return [];
         // Interaction payloads follow the ACL of the issue they belong to; a
@@ -3487,7 +2771,7 @@ export function buildHostServices(
       },
       async respondInteraction(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         // Resolving an interaction is a board-user action (the web app's
         // interaction-resolve routes are board-only). The host re-verifies the
@@ -3570,47 +2854,17 @@ export function buildHostServices(
 
         return { interaction: resolved as any, applied: true };
       },
-      // SECURITY-CRITICAL: retire (expire) a single pending interaction the plugin
-      // is relaying an operator reply to. Least-privilege authorization:
-      //  - gated by the default-deny `issue.interactions.resolve` capability
-      //    (granted only to the messenger manifest),
-      //  - `requireInCompany` binds the target issue to the plugin's own company,
-      //    and the shared service re-checks the interaction belongs to that issue
-      //    (cross-tenant interactionId -> notFound), and
-      //  - actor `userId` is ALWAYS null: the messenger acts on the operator's
-      //    behalf via free text but must NOT mint operator user authorship in the
-      //    audit trail. Terminal status is always "expired",
-      //    never "accepted", so no accept side-effect or continuation wake fires.
-      async resolveInteraction(params) {
+      async listAttachments(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
-        const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
-        const interaction = await issueThreadInteractionService(db).supersedeInteractionById(
-          issue,
-          params.interactionId,
-          { commentId: params.supersedingCommentId ?? null, reason: params.reason ?? null },
-          { agentId: null, userId: null },
-        );
-        await logPluginActivity({
-          companyId,
-          action: "issue.thread_interaction_superseded",
-          entityType: "issue",
-          entityId: issue.id,
-          actor: { actorAgentId: null },
-          details: {
-            identifier: issue.identifier,
-            interactionId: interaction.id,
-            interactionKind: interaction.kind,
-            interactionStatus: interaction.status,
-            supersededByActorType: "plugin",
-            supersedingCommentId: params.supersedingCommentId ?? null,
-          },
-        });
-        return interaction as any;
+        await ensurePluginAvailableForCompany(companyId);
+        const issue = await issues.getById(params.issueId);
+        if (!inCompany(issue, companyId)) return [];
+        if (!(await pluginCanReadIssue(issue))) return [];
+        return (await issues.listAttachments(params.issueId)) as any;
       },
       async getAttachmentContent(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const attachment = await issues.getAttachmentById(params.attachmentId);
         // Unknown and cross-company ids are deliberately indistinguishable to
         // the plugin: both return null (no existence oracle across companies).
@@ -3664,90 +2918,26 @@ export function buildHostServices(
         };
       },
     },
-    // SECURITY-CRITICAL: reconcile reads. Both run the real, fail-closed
-    // `requirePluginEnabledForCompany` gate before any query (Complete
-    // Mediation) and return a field-minimized projection (no requester/decider
-    // user ids, no decision notes, no result blobs). Default to pending when no
-    // status is supplied — the digest only cares about live blockers. A defensive
-    // `RECONCILE_LIST_LIMIT` bounds each response so a pathological pending count
-    // can't balloon a single read; a normal pending set is far below the cap, so
-    // this is a no-op in practice.
-    interactions: {
-      async list(params) {
-        const companyId = ensureCompanyId(params.companyId);
-        await requirePluginEnabledForCompany(companyId);
-        // This reconcile read is pending-only by design (the digest tracks live
-        // blockers). Reject any other status rather than returning a silent
-        // empty list, which would mask a caller misconfig.
-        const status = params.status ?? "pending";
-        if (status !== "pending") {
-          throw new Error(`interactions.list only supports status="pending" (got "${status}")`);
-        }
-        const rows = await interactions.listPendingByCompany(companyId, RECONCILE_LIST_LIMIT);
-        if (rows.length >= RECONCILE_LIST_LIMIT) {
-          logger.warn(
-            { companyId, limit: RECONCILE_LIST_LIMIT },
-            "plugin interactions.list reconcile read hit the defensive row cap; response truncated",
-          );
-        }
-        return rows.map((row) => ({
-          id: row.id,
-          issueId: row.issueId,
-          kind: row.kind,
-          status: row.status,
-          title: row.title ?? null,
-          summary: row.summary ?? null,
-          createdAt: row.createdAt.toISOString(),
-        }));
-      },
-    },
 
     approvals: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const rows = await approvalSvc.list(companyId, params.status ?? undefined);
         // Match the web app's approval read surface: payloads are redacted so
         // the chat bridge never receives secrets the web app itself hides.
         return rows.map((approval) => redactApprovalPayload(approval)) as any;
       },
-      // SECURITY-CRITICAL: fork-only reconcile read of PENDING board approvals
-      // for the messenger digest. Unlike the general `list` above (upstream's
-      // public surface), this runs the real, fail-closed
-      // `requirePluginEnabledForCompany` gate before any query (Complete
-      // Mediation), defaults to pending-only, projects a field-minimized row
-      // (no requester/decider user ids, no decision notes), and bounds the
-      // response with the defensive `RECONCILE_LIST_LIMIT`. A blocker created
-      // while the plugin was down is surfaced by the pending query itself —
-      // that is the missed-blocker seeding the digest depends on.
-      async listPending(params: { companyId: string }) {
-        const companyId = ensureCompanyId(params.companyId);
-        await requirePluginEnabledForCompany(companyId);
-        const rows = (await approvalSvc.list(companyId, "pending")).slice(0, RECONCILE_LIST_LIMIT);
-        if (rows.length >= RECONCILE_LIST_LIMIT) {
-          logger.warn(
-            { companyId, limit: RECONCILE_LIST_LIMIT, status: "pending" },
-            "plugin approvals.listPending reconcile read hit the defensive row cap; response truncated",
-          );
-        }
-        return rows.map((row) => ({
-          id: row.id,
-          type: row.type,
-          status: row.status,
-          payload: redactEventPayload(row.payload) ?? {},
-          createdAt: row.createdAt.toISOString(),
-        }));
-      },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const approval = await approvalSvc.getById(params.approvalId);
         if (!approval || approval.companyId !== companyId) return null;
         return redactApprovalPayload(approval) as any;
       },
       async decide(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const existing = await approvalSvc.getById(params.approvalId);
         if (!existing || existing.companyId !== companyId) {
           throw new Error(`Approval "${params.approvalId}" not found`);
@@ -3811,7 +3001,7 @@ export function buildHostServices(
     issueDocuments: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         // Document bodies follow the issue ACL; a private issue is not-found.
         await requirePluginReadableIssue(params.issueId, companyId);
         const rows = await documents.listIssueDocuments(params.issueId);
@@ -3819,14 +3009,14 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         await requirePluginReadableIssue(params.issueId, companyId);
         const doc = await documents.getIssueDocumentByKey(params.issueId, params.key);
         return (doc ?? null) as any;
       },
       async upsert(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         const result = await documents.upsertIssueDocument({
           issueId: params.issueId,
@@ -3852,7 +3042,7 @@ export function buildHostServices(
       },
       async delete(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
         await documents.deleteIssueDocument(params.issueId, params.key);
         await logPluginActivity({
@@ -3869,14 +3059,19 @@ export function buildHostServices(
     },
 
     agents: {
+      async getRuntimeIdentity(params) {
+        const companyId = ensureCompanyId(params.companyId);
+        await ensurePluginAvailableForCompany(companyId);
+        return pluginAgentRuntimeIdentity(db, pluginId, companyId, params.agentId);
+      },
       async getRuntime(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
-        return pluginAgentRuntimeState(db, pluginId, companyId, params.agentId);
+        await ensurePluginAvailableForCompany(companyId);
+        return pluginAgentRuntimeState(db, pluginId, companyId, params.agentId, params.environmentId, params.installEnvironmentSkills);
       },
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const rows = await agents.list(companyId);
         return applyWindow(
           rows.filter((agent) => !params.status || agent.status === params.status) as Agent[],
@@ -3885,27 +3080,27 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         return (inCompany(agent, companyId) ? agent : null) as Agent | null;
       },
       async pause(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         return (await agentsLifecycle.pauseAgent(params.agentId)) as Agent;
       },
       async resume(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         return (await agentsLifecycle.resumeAgent(params.agentId)) as Agent;
       },
       async invoke(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         const run = await heartbeat.wakeup(params.agentId, {
@@ -3929,17 +3124,17 @@ export function buildHostServices(
       },
       async managedGet(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedAgents.get(params.agentKey, companyId);
       },
       async managedReconcile(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedAgents.reconcile(params.agentKey, companyId);
       },
       async managedReset(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return managedAgents.reset(params.agentKey, companyId);
       },
     },
@@ -3947,7 +3142,7 @@ export function buildHostServices(
     goals: {
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const rows = await goals.list(companyId);
         return applyWindow(
           rows.filter((goal) =>
@@ -3959,13 +3154,13 @@ export function buildHostServices(
       },
       async get(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const goal = await goals.getById(params.goalId);
         return (inCompany(goal, companyId) ? goal : null) as Goal | null;
       },
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return (await goals.create(companyId, {
           title: params.title,
           description: params.description,
@@ -3977,7 +3172,7 @@ export function buildHostServices(
       },
       async update(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         requireInCompany("Goal", await goals.getById(params.goalId), companyId);
         return (await goals.update(params.goalId, params.patch as any)) as Goal;
       },
@@ -3986,7 +3181,7 @@ export function buildHostServices(
     access: {
       async listMembers(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const rows = await access.listMembers(companyId);
         const visibleRows = params.includeArchived ? rows : rows.filter((row) => row.status !== "archived");
         const grants = await db
@@ -4009,12 +3204,12 @@ export function buildHostServices(
       },
       async getMember(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return loadPluginMember(companyId, params.memberId);
       },
       async updateMember(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const updated = await access.updateMember(companyId, params.memberId, params.patch);
         if (!updated) throw new Error("Member not found");
         await logPluginActivity({
@@ -4030,7 +3225,7 @@ export function buildHostServices(
       },
       async listInvites(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const limit = Math.min(Math.max(Number(params.limit ?? 20), 1), 100);
         const offset = Math.max(Number(params.offset ?? 0), 0);
         const stateClause = inviteStateWhereClause(params.state);
@@ -4049,7 +3244,7 @@ export function buildHostServices(
       },
       async createInvite(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const normalizedAgentMessage = typeof params.agentMessage === "string"
           ? params.agentMessage.trim() || null
           : null;
@@ -4098,7 +3293,7 @@ export function buildHostServices(
       },
       async revokeInvite(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const invite = await db
           .select()
           .from(invites)
@@ -4126,7 +3321,7 @@ export function buildHostServices(
     authorization: {
       async listGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const conditions = [
           eq(principalPermissionGrants.companyId, companyId),
           params.principalType ? eq(principalPermissionGrants.principalType, params.principalType) : undefined,
@@ -4141,7 +3336,7 @@ export function buildHostServices(
       },
       async setGrants(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         if (params.principalType !== "agent" && params.principalType !== "user") {
           throw new Error("principalType must be 'agent' or 'user'");
         }
@@ -4174,7 +3369,7 @@ export function buildHostServices(
       },
       async policySummary(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const [members, grants] = await Promise.all([
           access.listMembers(companyId),
           db
@@ -4193,12 +3388,12 @@ export function buildHostServices(
       },
       async getPolicy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return readAuthorizationPolicy(companyId, params.resourceType, params.resourceId);
       },
       async updatePolicy(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const policy = params.policy ? sanitizeRecord(params.policy) : null;
         if (params.resourceType === "agent") {
           const agent = requireInCompany("Agent", await agents.getById(params.resourceId), companyId);
@@ -4251,7 +3446,7 @@ export function buildHostServices(
       },
       async previewAssignment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return authorization.decide({
           actor: pluginAssignmentActor(params.actor),
           action: "tasks:assign",
@@ -4267,7 +3462,7 @@ export function buildHostServices(
       },
       async explainAssignment(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         return authorization.decide({
           actor: pluginAssignmentActor(params.actor),
           action: "tasks:assign",
@@ -4283,7 +3478,7 @@ export function buildHostServices(
       },
       async searchAudit(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const limit = Math.min(Math.max(Number(params.limit ?? 50), 1), 100);
         const offset = Math.max(Number(params.offset ?? 0), 0);
         const decisionFilter = typeof params.decision === "string" && params.decision.trim()
@@ -4317,7 +3512,7 @@ export function buildHostServices(
     agentSessions: {
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
         const taskKey = params.taskKey ?? `plugin:${pluginKey}:session:${randomUUID()}`;
@@ -4348,7 +3543,7 @@ export function buildHostServices(
 
       async list(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const rows = await db
           .select()
           .from(agentTaskSessionsTable)
@@ -4376,7 +3571,7 @@ export function buildHostServices(
         }
 
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
 
         // Verify session exists and belongs to this plugin
         const session = await db
@@ -4420,54 +3615,82 @@ export function buildHostServices(
         if (notifyWorker) {
           const TERMINAL_STATUSES = new Set(["succeeded", "interrupted", "failed", "cancelled", "timed_out"]);
 
+          let active = true;
           const cleanup = () => {
-            unsubscribe();
+            stopDelivery();
             clearTimeout(timeoutTimer);
             activeSubscriptions.delete(entry);
           };
-
-          const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {
-            const payload = event.payload as Record<string, unknown> | undefined;
-            if (!payload || payload.runId !== run.id) return;
-
-            if (event.type === "heartbeat.run.log" || event.type === "heartbeat.run.event") {
-              notifyWorker("agents.sessions.event", {
-                sessionId: params.sessionId,
-                runId: run.id,
-                seq: (payload.seq as number) ?? 0,
-                eventType: "chunk",
-                stream: (payload.stream as string) ?? null,
-                message: (payload.chunk as string) ?? (payload.message as string) ?? null,
-                payload: payload,
-              });
-            } else if (event.type === "heartbeat.run.status") {
-              const status = payload.status as string;
-              if (TERMINAL_STATUSES.has(status)) {
-                notifyWorker("agents.sessions.event", {
-                  sessionId: params.sessionId,
-                  runId: run.id,
-                  seq: 0,
-                  eventType: isSuccessfulHeartbeatRunStatus(status) ? "done" : "error",
-                  stream: "system",
-                  message: status === "succeeded"
-                    ? (typeof payload.finalText === "string" ? payload.finalText : null)
-                    : `Run ${status}`,
-                  payload: payload,
-                });
-                cleanup();
-              } else {
-                notifyWorker("agents.sessions.event", {
-                  sessionId: params.sessionId,
-                  runId: run.id,
-                  seq: 0,
-                  eventType: "status",
-                  stream: "system",
-                  message: `Run status: ${status}`,
-                  payload: payload,
-                });
-              }
+          const failDelivery = () => {
+            if (!active) return;
+            cleanup();
+            try {
+              notifyWorker("agents.sessions.event", { sessionId: params.sessionId, runId: run.id,
+                seq: 0, eventType: "error", stream: "system", message: "Run event delivery unavailable",
+                payload: { reason: "delivery_unavailable" } });
+            } catch (err) {
+              logger.warn({ err, pluginId, runId: run.id }, "plugin session delivery unavailable");
             }
+          };
+          const delivery = createLiveEventDelivery({
+            socket: {
+              get readyState() { return active ? 1 : 3; },
+              send(encoded, callback) {
+                const event = JSON.parse(encoded) as import("@paperclipai/shared").LiveEvent;
+                const payload = event.payload;
+                if (event.type === "heartbeat.run.log" || event.type === "heartbeat.run.event") {
+                  notifyWorker("agents.sessions.event", {
+                    sessionId: params.sessionId,
+                    runId: run.id,
+                    seq: (payload.seq as number) ?? 0,
+                    eventType: "chunk",
+                    stream: (payload.stream as string) ?? null,
+                    message: (payload.chunk as string) ?? (payload.message as string) ?? null,
+                    payload: payload,
+                  });
+                } else if (event.type === "heartbeat.run.status") {
+                  const status = payload.status as string;
+                  if (TERMINAL_STATUSES.has(status)) {
+                    notifyWorker("agents.sessions.event", {
+                      sessionId: params.sessionId,
+                      runId: run.id,
+                      seq: 0,
+                      eventType: status === "succeeded" ? "done" : "error",
+                      stream: "system",
+                      message: status === "succeeded"
+                        ? (typeof payload.finalText === "string" ? payload.finalText : null)
+                        : `Run ${status}`,
+                      payload: payload,
+                    });
+                    cleanup();
+                  } else {
+                    notifyWorker("agents.sessions.event", {
+                      sessionId: params.sessionId,
+                      runId: run.id,
+                      seq: 0,
+                      eventType: "status",
+                      stream: "system",
+                      message: `Run status: ${status}`,
+                      payload: payload,
+                    });
+                  }
+                }
+                callback?.();
+              },
+              close: failDelivery,
+            },
+            authorize: createLiveRunEventRedactor(db),
+            decorate: async event => event,
+            onError: err => {
+              logger.warn({ err, pluginId, runId: run.id }, "plugin session event redaction failed");
+              failDelivery();
+            },
           });
+          const unsubscribe = subscribeCompanyLiveEvents(companyId, event => {
+            if (event.payload.runId === run.id &&
+                ["heartbeat.run.log", "heartbeat.run.event", "heartbeat.run.status"].includes(event.type)) delivery.enqueue(event);
+          });
+          const stopDelivery = () => { active = false; delivery.dispose(); unsubscribe(); };
 
           // Safety-net timeout: if the run never reaches a terminal status,
           // force-cleanup the subscription to prevent unbounded leaks.
@@ -4476,10 +3699,10 @@ export function buildHostServices(
               { pluginId, pluginKey, runId: run.id },
               "session event subscription timed out — forcing cleanup",
             );
-            cleanup();
+            failDelivery();
           }, SESSION_EVENT_SUBSCRIPTION_TIMEOUT_MS);
 
-          const entry = { unsubscribe, timer: timeoutTimer };
+          const entry = { unsubscribe: stopDelivery, timer: timeoutTimer };
           activeSubscriptions.add(entry);
         }
 
@@ -4488,7 +3711,7 @@ export function buildHostServices(
 
       async close(params) {
         const companyId = ensureCompanyId(params.companyId);
-        await noPluginAvailabilityGate(companyId);
+        await ensurePluginAvailableForCompany(companyId);
         const deleted = await db
           .delete(agentTaskSessionsTable)
           .where(

@@ -1,4 +1,8 @@
+import { validateManagedCloudBootstrapPrerequisites, validateManagedCloudPrerequisites } from "./managed-cloud-prerequisites.js";
 import { readConfigFile, resolveDeploymentMode } from "./config-file.js";
+import { isCloudManagedInstance } from "./services/cloud-instance.js";
+import { StartupRefusalError } from "./startup-refusals.js";
+import type { PaperclipConfig } from "@paperclipai/shared";
 import { parseChatWebhookPublicBaseUrl } from "./chat-webhook-public-url.js";
 import { execFileSync } from "node:child_process";
 import { existsSync, realpathSync } from "node:fs";
@@ -13,13 +17,11 @@ import {
   BIND_MODES,
   DEPLOYMENT_EXPOSURES,
   SECRET_PROVIDERS,
-  STORAGE_PROVIDERS,
   type BindMode,
   type AuthBaseUrlMode,
   type DeploymentExposure,
   type DeploymentMode,
   type SecretProvider,
-  type StorageProvider,
   inferBindModeFromHost,
   resolveRuntimeBind,
   validateConfiguredBindMode,
@@ -28,37 +30,39 @@ import {
   resolveDefaultBackupDir,
   resolveDefaultEmbeddedPostgresDir,
   resolveDefaultSecretsKeyFilePath,
-  resolveDefaultStorageDir,
   resolveHomeAwarePath,
 } from "./home-paths.js";
+import { loadStorageConfig, type StorageConfig } from "./storage/config.js";
 
-const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
-if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
-  loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
-}
+if (!isCloudManagedInstance()) {
+  const PAPERCLIP_ENV_FILE_PATH = resolvePaperclipEnvPath();
+  if (existsSync(PAPERCLIP_ENV_FILE_PATH)) {
+    loadDotenv({ path: PAPERCLIP_ENV_FILE_PATH, override: false, quiet: true });
+  }
 
-const CWD_ENV_PATH = resolve(process.cwd(), ".env");
-const cwdEnvExists = existsSync(CWD_ENV_PATH);
-const isSameFile = cwdEnvExists && existsSync(PAPERCLIP_ENV_FILE_PATH)
-  ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
-  : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
-if (shouldLoadWorkingDirectoryEnv({
-  cwdEnvExists,
-  isPaperclipEnvFile: isSameFile,
-})) {
-  loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
-}
+  const CWD_ENV_PATH = resolve(process.cwd(), ".env");
+  const cwdEnvExists = existsSync(CWD_ENV_PATH);
+  const isSameFile = cwdEnvExists && existsSync(PAPERCLIP_ENV_FILE_PATH)
+    ? realpathSync(CWD_ENV_PATH) === realpathSync(PAPERCLIP_ENV_FILE_PATH)
+    : CWD_ENV_PATH === PAPERCLIP_ENV_FILE_PATH;
+  if (shouldLoadWorkingDirectoryEnv({
+    cwdEnvExists,
+    isPaperclipEnvFile: isSameFile,
+  })) {
+    loadDotenv({ path: CWD_ENV_PATH, override: false, quiet: true });
+  }
 
-if (basename(dirname(PAPERCLIP_ENV_FILE_PATH)) === ".paperclip") {
-  applyEmptyWorktreeSigningSecrets(dirname(dirname(PAPERCLIP_ENV_FILE_PATH)));
+  if (basename(dirname(PAPERCLIP_ENV_FILE_PATH)) === ".paperclip") {
+    applyEmptyWorktreeSigningSecrets(dirname(dirname(PAPERCLIP_ENV_FILE_PATH)));
+  }
+  maybeRepairLegacyWorktreeConfigAndEnvFiles();
 }
-maybeRepairLegacyWorktreeConfigAndEnvFiles();
 
 const TAILSCALE_DETECT_TIMEOUT_MS = 3000;
 
 type DatabaseMode = "embedded-postgres" | "postgres";
 
-export interface Config {
+export interface Config extends StorageConfig {
   deploymentMode: DeploymentMode;
   deploymentExposure: DeploymentExposure;
   bind: BindMode;
@@ -73,28 +77,19 @@ export interface Config {
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
-  allowEmbeddedPostgresPublic: boolean;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
-  runHistoryRetentionEnabled: boolean;
-  runHistoryRetentionDays: number;
-  runHistoryRetentionIntervalMinutes: number;
-  pluginWebhookDeliveryRetentionEnabled: boolean;
-  pluginWebhookDeliverySuccessRetentionDays: number;
-  pluginWebhookDeliveryFailedRetentionDays: number;
-  pluginWebhookDeliveryMaxRows: number;
-  pluginWebhookDeliveryRetentionIntervalMinutes: number;
-  boardApiKeyAuthEventRetentionEnabled: boolean;
-  boardApiKeyAuthEventRetentionDays: number;
-  boardApiKeyAuthEventMaxRows: number;
-  boardApiKeyAuthEventRetentionIntervalMinutes: number;
   gitCacheExpirationEnabled: boolean;
   gitBaseExpirationEnabled: boolean;
   gitCacheExpirationDryRun: boolean;
+  isolatedSourceRehomeEnabled: boolean;
+  isolatedSourceRehomeDryRun: boolean;
+  nestedCloneMigrationEnabled: boolean;
+  nestedCloneMigrationDryRun: boolean;
   workspaceReaperCooldownDays: number;
   workspaceCompactionDelayHours: number | null;
   skillVersionRetentionEnabled: boolean;
@@ -104,22 +99,22 @@ export interface Config {
   nativeHarnessBackupExpirationEnabled: boolean;
   nativeHarnessBackupExpirationDryRun: boolean;
   nativeHarnessBackupExpirationDays: number;
+  nativeRunnerEvidenceRetentionDays: number;
+  nativeWorkspaceSyncRetentionEnabled: boolean;
+  nativeWorkspaceSyncRetentionDryRun: boolean;
+  nativeWorkspaceSyncRetentionDays: number;
   gitRestorePointRetentionDays: number;
   gitRestorePointsEnabled: boolean;
   gitRestorePointTerminalDelayDays: number;
   gitRestorePointIdleDays: number;
+  taskDirectoryRetentionEnabled: boolean;
+  taskDirectoryRetentionDryRun: boolean;
+  taskDirectoryOrphanGraceDays: number;
   serveUi: boolean;
   uiDevMiddleware: boolean;
   secretsProvider: SecretProvider;
   secretsStrictMode: boolean;
   secretsMasterKeyFilePath: string;
-  storageProvider: StorageProvider;
-  storageLocalDiskBaseDir: string;
-  storageS3Bucket: string;
-  storageS3Region: string;
-  storageS3Endpoint: string | undefined;
-  storageS3Prefix: string;
-  storageS3ForcePathStyle: boolean;
   feedbackExportBackendUrl: string | undefined;
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
@@ -149,18 +144,19 @@ function detectTailnetBindHost(): string | undefined {
   }
 }
 
-export function loadConfig(): Config {
-  const fileConfig = readConfigFile();
+export function loadConfig(override?: PaperclipConfig | null): Config {
+  const configFile = override === undefined ? readConfigFile({ includeProvenance: true })
+    : override ? { config: override, explicitStorageS3Bucket: true } : null;
+  const fileConfig = configFile?.config ?? null;
   const fileDatabaseMode =
-    (fileConfig?.database.mode === "postgres" ? "postgres" : "embedded-postgres") as DatabaseMode;
+    (isCloudManagedInstance() || fileConfig?.database.mode === "postgres" ? "postgres" : "embedded-postgres") as DatabaseMode;
 
   const fileDbUrl =
-    fileDatabaseMode === "postgres"
+    !isCloudManagedInstance() && fileDatabaseMode === "postgres"
       ? fileConfig?.database.connectionString
       : undefined;
   const fileDatabaseBackup = fileConfig?.database.backup;
   const fileSecrets = fileConfig?.secrets;
-  const fileStorage = fileConfig?.storage;
 
   const providerFromEnvRaw = process.env.PAPERCLIP_SECRETS_PROVIDER;
   const providerFromEnv =
@@ -170,25 +166,12 @@ export function loadConfig(): Config {
   const providerFromFile = fileSecrets?.provider;
   const secretsProvider: SecretProvider = providerFromEnv ?? providerFromFile ?? "local_encrypted";
 
-  const storageProviderFromEnvRaw = process.env.PAPERCLIP_STORAGE_PROVIDER;
-  const storageProviderFromEnv =
-    storageProviderFromEnvRaw && STORAGE_PROVIDERS.includes(storageProviderFromEnvRaw as StorageProvider)
-      ? (storageProviderFromEnvRaw as StorageProvider)
-      : null;
-  const storageProvider: StorageProvider = storageProviderFromEnv ?? fileStorage?.provider ?? "local_disk";
-  const storageLocalDiskBaseDir = resolveHomeAwarePath(
-    process.env.PAPERCLIP_STORAGE_LOCAL_DIR ??
-      fileStorage?.localDisk?.baseDir ??
-      resolveDefaultStorageDir(),
-  );
-  const storageS3Bucket = process.env.PAPERCLIP_STORAGE_S3_BUCKET ?? fileStorage?.s3?.bucket ?? "paperclip";
-  const storageS3Region = process.env.PAPERCLIP_STORAGE_S3_REGION ?? fileStorage?.s3?.region ?? "us-east-1";
-  const storageS3Endpoint = process.env.PAPERCLIP_STORAGE_S3_ENDPOINT ?? fileStorage?.s3?.endpoint ?? undefined;
-  const storageS3Prefix = process.env.PAPERCLIP_STORAGE_S3_PREFIX ?? fileStorage?.s3?.prefix ?? "";
-  const storageS3ForcePathStyle =
-    process.env.PAPERCLIP_STORAGE_S3_FORCE_PATH_STYLE !== undefined
-      ? process.env.PAPERCLIP_STORAGE_S3_FORCE_PATH_STYLE === "true"
-      : (fileStorage?.s3?.forcePathStyle ?? false);
+  const storage = loadStorageConfig(fileConfig);
+  validateManagedCloudPrerequisites({ ...storage,
+    storageS3Bucket: process.env.PAPERCLIP_STORAGE_S3_BUCKET
+      ?? (configFile?.explicitStorageS3Bucket ? fileConfig?.storage.s3.bucket : undefined),
+    databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
+  }, process.env);
   const feedbackExportBackendUrl =
     process.env.PAPERCLIP_FEEDBACK_EXPORT_BACKEND_URL?.trim() ||
     process.env.PAPERCLIP_TELEMETRY_BACKEND_URL?.trim() ||
@@ -305,45 +288,6 @@ export function loadConfig(): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
-  const runHistoryRetentionEnabled = process.env.PAPERCLIP_RUN_HISTORY_RETENTION_ENABLED !== "false";
-  // 14 days keeps roughly two weeks of run history -- long enough to debug any
-  // incident that is still being worked, short enough that the tables stop
-  // growing without bound.
-  const runHistoryRetentionDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_DAYS) || 14,
-  );
-  const runHistoryRetentionIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_INTERVAL_MINUTES) || 60,
-  );
-  const pluginWebhookDeliveryRetentionEnabled =
-    process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_ENABLED !== "false";
-  // Success rows: 3 days. A success row only proves the delivery reached the
-  // worker; once observed it has no diagnostic value. Three days covers a long
-  // weekend's "did we get it?" check without accumulating high-volume noise.
-  const pluginWebhookDeliverySuccessRetentionDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_SUCCESS_RETENTION_DAYS) || 3,
-  );
-  // Failed rows: 30 days. Failed deliveries are the incident audit trail
-  // for delivery / signature / dispatch investigations. 30 days outlives the
-  // typical on-call rotation.
-  const pluginWebhookDeliveryFailedRetentionDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_FAILED_RETENTION_DAYS) || 30,
-  );
-  // Max-rows cap. This is the load-bearing bound: age alone permits
-  // ~169 GB/day at the documented ingestion ceiling. 1,000,000 rows
-  // is roughly 1 GB on disk for the typical ~1 KB JSONB row.
-  const pluginWebhookDeliveryMaxRows = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_MAX_ROWS) || 1_000_000,
-  );
-  const pluginWebhookDeliveryRetentionIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_INTERVAL_MINUTES) || 60,
-  );
   // The terminal-workspace reaper waits this many days after an issue tree
   // becomes terminal before it archives the workspace. A person can reopen the
   // work inside this window. A value of 0 disables the cooldown and restores
@@ -393,29 +337,12 @@ export function loadConfig(): Config {
   const skillVersionRetentionKeepNewest = nonNegativeIntegerEnv("PAPERCLIP_SKILL_VERSION_RETENTION_KEEP", 0);
   const skillVersionRetentionGraceMinutes = nonNegativeIntegerEnv("PAPERCLIP_SKILL_VERSION_RETENTION_GRACE_MINUTES", 60);
   const nativeHarnessBackupExpirationDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DAYS", 7));
+  const nativeRunnerEvidenceRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_NATIVE_RUNNER_EVIDENCE_RETENTION_DAYS", 7));
+  const nativeWorkspaceSyncRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_NATIVE_WORKSPACE_SYNC_RETENTION_DAYS", 7));
   const gitRestorePointRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS", 90));
   const gitRestorePointTerminalDelayDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS", 3);
   const gitRestorePointIdleDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS", 7);
-  const boardApiKeyAuthEventRetentionEnabled =
-    process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
-  // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
-  // motivated the log (the credential-abuse investigation that drove it needed
-  // ~3 months of history) without letting the table drift toward activity_log's
-  // scale.
-  const boardApiKeyAuthEventRetentionDays = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_DAYS) || 90,
-  );
-  // Load-bearing size bound: one row per source-minute under a sustained
-  // distributed attempt still has to stop somewhere. 500k rows is tens of MB.
-  const boardApiKeyAuthEventMaxRows = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_MAX_ROWS) || 500_000,
-  );
-  const boardApiKeyAuthEventRetentionIntervalMinutes = Math.max(
-    1,
-    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_INTERVAL_MINUTES) || 60,
-  );
+  const taskDirectoryOrphanGraceDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_TASK_DIRECTORY_ORPHAN_GRACE_DAYS", 7));
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -436,14 +363,6 @@ export function loadConfig(): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
-  // Emit a warning when sign-up is open on an authenticated deployment
-  if (deploymentMode === "authenticated" && authDisableSignUp === false) {
-    console.warn(
-      "[paperclip] Open sign-up is enabled on an authenticated deployment. " +
-        "Set PAPERCLIP_AUTH_DISABLE_SIGN_UP=true to close sign-up and restrict access to invited users only."
-    );
-  }
-
   return {
     deploymentMode,
     deploymentExposure,
@@ -461,11 +380,6 @@ export function loadConfig(): Config {
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
-    // Permissive by default: authenticated+public deployments on embedded
-    // PostgreSQL warn-and-continue (preserves the live host's posture). Only an
-    // explicit PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false opts into the
-    // strict refuse-to-boot contract.
-    allowEmbeddedPostgresPublic: process.env.PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC !== "false",
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
@@ -474,21 +388,13 @@ export function loadConfig(): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
-    runHistoryRetentionEnabled,
-    runHistoryRetentionDays,
-    runHistoryRetentionIntervalMinutes,
-    pluginWebhookDeliveryRetentionEnabled,
-    pluginWebhookDeliverySuccessRetentionDays,
-    pluginWebhookDeliveryFailedRetentionDays,
-    pluginWebhookDeliveryMaxRows,
-    pluginWebhookDeliveryRetentionIntervalMinutes,
-    boardApiKeyAuthEventRetentionEnabled,
-    boardApiKeyAuthEventRetentionDays,
-    boardApiKeyAuthEventMaxRows,
-    boardApiKeyAuthEventRetentionIntervalMinutes,
     gitCacheExpirationEnabled: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_ENABLED === "true",
     gitBaseExpirationEnabled: process.env.PAPERCLIP_GIT_BASE_EXPIRATION_ENABLED === "true",
     gitCacheExpirationDryRun: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_DRY_RUN !== "false",
+    isolatedSourceRehomeEnabled: process.env.PAPERCLIP_ISOLATED_SOURCE_REHOME_ENABLED === "true",
+    isolatedSourceRehomeDryRun: process.env.PAPERCLIP_ISOLATED_SOURCE_REHOME_DRY_RUN === "true",
+    nestedCloneMigrationEnabled: process.env.PAPERCLIP_NESTED_CLONE_MIGRATION_ENABLED === "true",
+    nestedCloneMigrationDryRun: process.env.PAPERCLIP_NESTED_CLONE_MIGRATION_DRY_RUN === "true",
     workspaceReaperCooldownDays,
     workspaceCompactionDelayHours,
     skillVersionRetentionEnabled: process.env.PAPERCLIP_SKILL_VERSION_RETENTION_ENABLED !== "false",
@@ -498,10 +404,17 @@ export function loadConfig(): Config {
     nativeHarnessBackupExpirationEnabled: process.env.PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_ENABLED !== "false",
     nativeHarnessBackupExpirationDryRun: process.env.PAPERCLIP_NATIVE_HARNESS_BACKUP_EXPIRATION_DRY_RUN === "true",
     nativeHarnessBackupExpirationDays,
+    nativeRunnerEvidenceRetentionDays,
+    nativeWorkspaceSyncRetentionEnabled: process.env.PAPERCLIP_NATIVE_WORKSPACE_SYNC_RETENTION_ENABLED !== "false",
+    nativeWorkspaceSyncRetentionDryRun: process.env.PAPERCLIP_NATIVE_WORKSPACE_SYNC_RETENTION_DRY_RUN === "true",
+    nativeWorkspaceSyncRetentionDays,
     gitRestorePointRetentionDays,
     gitRestorePointsEnabled: process.env.PAPERCLIP_GIT_RESTORE_POINTS_ENABLED === "true",
     gitRestorePointTerminalDelayDays,
     gitRestorePointIdleDays,
+    taskDirectoryRetentionEnabled: process.env.PAPERCLIP_TASK_DIRECTORY_RETENTION_ENABLED === "true",
+    taskDirectoryRetentionDryRun: process.env.PAPERCLIP_TASK_DIRECTORY_RETENTION_DRY_RUN !== "false",
+    taskDirectoryOrphanGraceDays,
     serveUi:
       process.env.SERVE_UI !== undefined
         ? process.env.SERVE_UI === "true"
@@ -515,13 +428,7 @@ export function loadConfig(): Config {
           fileSecrets?.localEncrypted.keyFilePath ??
           resolveDefaultSecretsKeyFilePath(),
       ),
-    storageProvider,
-    storageLocalDiskBaseDir,
-    storageS3Bucket,
-    storageS3Region,
-    storageS3Endpoint,
-    storageS3Prefix,
-    storageS3ForcePathStyle,
+    ...storage,
     feedbackExportBackendUrl,
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
@@ -531,4 +438,25 @@ export function loadConfig(): Config {
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",
     announcementsFeedUrl: process.env.PAPERCLIP_ANNOUNCEMENTS_FEED_URL?.trim() || "https://pages.paperclip.ing/announcements/v1/current.json",
   };
+}
+
+export type CloudBootstrapConfig = {
+  databaseMode: "postgres";
+  databaseUrl: string;
+  databaseMigrationUrl: string | undefined;
+};
+
+export function loadCloudBootstrapConfig(): CloudBootstrapConfig {
+  if (!isCloudManagedInstance()) throw new Error("Cloud bootstrap configuration requires a managed instance");
+  const url = process.env.DATABASE_URL?.trim();
+  if (!url) throw new StartupRefusalError("database-contract-unmet", "Cloud bootstrap requires DATABASE_URL from the environment");
+  const migrationUrl = process.env.DATABASE_MIGRATION_URL?.trim() || undefined;
+  for (const [name, value] of [["DATABASE_URL", url], ["DATABASE_MIGRATION_URL", migrationUrl]]) {
+    if (!value) continue;
+    let parsed: URL;
+    try { parsed = new URL(value); } catch { throw new Error(`Cloud bootstrap ${name} must use PostgreSQL`); }
+    if (!["postgres:", "postgresql:"].includes(parsed.protocol)) throw new Error(`Cloud bootstrap ${name} must use PostgreSQL`);
+  }
+  validateManagedCloudBootstrapPrerequisites({ databaseUrl: url }, process.env);
+  return { databaseMode: "postgres", databaseUrl: url, databaseMigrationUrl: migrationUrl };
 }

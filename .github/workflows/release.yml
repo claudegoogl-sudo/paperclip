@@ -94,11 +94,11 @@ jobs:
     # falls back to GitHub-hosted runners, including raced merge dispatches.
     name: Check preview artifacts
     if: github.ref == 'refs/heads/master' && github.event_name == 'workflow_dispatch' && (inputs.channel == 'preview' || inputs.channel == 'cloud-migrator') && !inputs.dry_run
-    runs-on: ${{ vars.AWS_POST_MERGE_CI_ENABLED == 'true' && github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event_name == 'workflow_dispatch' && inputs.channel == 'cloud-migrator' && github.sha != '' && inputs.source_ref == github.sha && 'runs-on/fleet=paperclip-post-merge-x64/env=public-ci' || 'ubuntu-latest' }}
+    runs-on: ${{ vars.AWS_POST_MERGE_CI_ENABLED == 'true' && github.run_attempt == 1 && github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event_name == 'workflow_dispatch' && inputs.channel == 'cloud-migrator' && github.sha != '' && inputs.source_ref == github.sha && 'runs-on/fleet=paperclip-post-merge-x64/env=public-ci' || 'ubuntu-latest' }}
     permissions:
       contents: read
     # Preserve the previous hosted default; only AWS needs the Fleet limit.
-    timeout-minutes: ${{ vars.AWS_POST_MERGE_CI_ENABLED == 'true' && github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event_name == 'workflow_dispatch' && inputs.channel == 'cloud-migrator' && github.sha != '' && inputs.source_ref == github.sha && 10 || 360 }}
+    timeout-minutes: ${{ vars.AWS_POST_MERGE_CI_ENABLED == 'true' && github.run_attempt == 1 && github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event_name == 'workflow_dispatch' && inputs.channel == 'cloud-migrator' && github.sha != '' && inputs.source_ref == github.sha && 10 || 360 }}
     outputs:
       image: ${{ steps.plan.outputs.image }}
       packages: ${{ steps.plan.outputs.packages }}
@@ -122,7 +122,7 @@ jobs:
     name: Build preview migrator
     needs: plan_preview
     if: needs.plan_preview.outputs.packages == 'true'
-    runs-on: ${{ vars.AWS_POST_MERGE_CI_ENABLED == 'true' && github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event_name == 'workflow_dispatch' && inputs.channel == 'cloud-migrator' && github.sha != '' && inputs.source_ref == github.sha && 'runs-on/fleet=paperclip-post-merge-x64/env=public-ci' || 'ubuntu-latest' }}
+    runs-on: ${{ vars.AWS_POST_MERGE_CI_ENABLED == 'true' && github.run_attempt == 1 && github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.event_name == 'workflow_dispatch' && inputs.channel == 'cloud-migrator' && github.sha != '' && inputs.source_ref == github.sha && 'runs-on/fleet=paperclip-post-merge-x64/env=public-ci' || 'ubuntu-latest' }}
     timeout-minutes: 30
     permissions:
       contents: read
@@ -318,25 +318,27 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # FORK DELTA (claudegoogl-sudo/paperclip) — keep in sync with
-  # .github/workflows/fork-master-verify-guard.yml.
-  #
-  # Upstream's verify_canary (#13233) gates on github.repository ==
-  # 'paperclipai/paperclip' and delegates to scripts/cloud-source-verification.mjs,
-  # which only has a verdict on the canonical repo. Merging that form into the
-  # fork leaves every push-to-master Release run with all jobs skipped, so a fork
-  # master push never gets a conclusive master verification.
-  #
-  # On the fork, verify_canary must run the real release test matrix for the push
-  # SHA via the reusable release-verify workflow (GitHub-hosted runners), and the
-  # repository gate moves back onto publish_canary so the fork never publishes an
-  # npm canary. The guard workflow fails any PR/push that drops this delta.
   verify_canary:
-    name: Verify master push
-    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
-    uses: ./.github/workflows/release-verify.yml
-    with:
-      ref: ${{ github.sha }}
+    name: Reuse exact-source verification
+    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    permissions:
+      contents: read
+      actions: write # restart only an exact-source push deferred before admission
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+      - name: Require successful source checks for this exact master push
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: node scripts/cloud-source-verification.mjs "$SOURCE_SHA"
 
   release_runner_source:
     needs: [verify_canary, select_nightly, select_beta, preflight_stable]
@@ -382,8 +384,8 @@ jobs:
       runner_binaries_only: true
 
   publish_canary:
-    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
-    needs: verify_canary
+    if: ${{ !cancelled() && github.event_name == 'push' && needs.verify_canary.result == 'success' && needs.release_runner_source.result == 'success' && (needs.release_runner_source.outputs.required == 'false' || needs.release_runner_binaries.result == 'success') }}
+    needs: [verify_canary, release_runner_source, release_runner_binaries]
     runs-on: ubuntu-latest
     timeout-minutes: 150
     environment: npm-canary
@@ -397,7 +399,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
@@ -608,7 +610,7 @@ jobs:
       canary_version: ${{ steps.select.outputs.canary_version }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: master
           fetch-depth: 0
@@ -723,7 +725,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.select_nightly.outputs.sha }}
           fetch-depth: 0
@@ -860,7 +862,7 @@ jobs:
       mode: ${{ steps.select.outputs.mode }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: master
           fetch-depth: 0
@@ -1012,7 +1014,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: ${{ needs.select_beta.outputs.sha }}
           fetch-depth: 0
@@ -1152,7 +1154,7 @@ jobs:
       pull-requests: read
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: master
           fetch-depth: 0
@@ -1244,7 +1246,7 @@ jobs:
       notes_ref: ${{ steps.notes.outputs.notes_ref }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: master
           fetch-depth: 0
@@ -1403,7 +1405,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ needs.preflight_stable.outputs.sha }}
@@ -1471,7 +1473,7 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
           ref: ${{ needs.preflight_stable.outputs.sha }}
@@ -1636,7 +1638,7 @@ jobs:
       contents: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        uses: actions/checkout@v7
         with:
           ref: master
           fetch-depth: 0

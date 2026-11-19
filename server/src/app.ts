@@ -1,3 +1,12 @@
+import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
+import { startMcpClientMirrorSync } from "./services/public-mcp/client-mirror-sync.js";
+import { registerIdleMcpOwners } from "./services/public-mcp/idle-sleep-proof.js";
+import { startMcpRevocationIndexSync } from "./services/public-mcp/revocation-index-sync.js";
+import { startMcpIngressHandoffExpiry } from "./services/public-mcp/ingress-handoff-expiry.js";
+import { nativeRunMcpRoutes } from "./routes/native-run-mcp.js";
+import { connectionEventWakeRoutes } from "./routes/connection-event-wake.js";
+import { registerGitHubReviewProjectionWork } from "./services/chat-channels/github/review-projection-work.js";
+import { finishServiceShutdown } from "./shutdown.js";
 import { promptInjectionPreventionRoutes } from "./routes/prompt-injection-prevention.js";
 import { voiceSessionRoutes, voiceWebhookRoutes } from "./routes/voice-sessions.js";
 import { eq } from "drizzle-orm";
@@ -9,7 +18,11 @@ import { DELIVERY_QUEUES } from "./services/delivery-work-notifications.js";
 import { createLifecycleDriver } from "./services/agent-lifecycle-driver.js";
 import { startAgentLifecycle } from "./services/agent-lifecycle.js";
 import { idleAdmissionMiddleware, trackIdleRequestHandlers } from "./middleware/idle-admission.js";
+import { databaseOperationMiddleware } from "./middleware/database-operation.js";
 import { staticUiFiles } from "./middleware/static-ui.js";
+import { retainedUiAssets } from "./retained-ui-assets.js";
+import { createStorageProviderFromConfig } from "./storage/provider-registry.js";
+import { loadStorageConfig } from "./storage/config.js";
 import { isIdleTaskDrainActive, trackIdleWork } from "./services/task-admission.js";
 import { customerSuccessRoutes } from "./routes/customer-success.js";
 import { cloudWarmStandbyMiddleware } from "./middleware/cloud-warm-standby.js";
@@ -21,6 +34,7 @@ import { registerBrowserUseCleanup } from "./services/browser-use-work.js";
 import { browserUseService } from "./services/browser-use.js";
 import { slackToolRoutes } from "./routes/slack-tools.js";
 import { createPublicMcpOAuth, publicMcpConfig } from "./services/public-mcp/oauth.js";
+import { createDotPrincipalHttp } from "./modules/external-agents/index.js";
 import { createDotRunnerMcpTools, dotRunnerBroker } from "./services/dot-runner-broker.js";
 import { agentProfileAvatarRoutes } from "./routes/agent-profile-avatar.js";
 import { museTransportRoutes, museBoardRoutes } from "./routes/muse.js";
@@ -40,7 +54,6 @@ import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { taskWorkspaceRoutes } from "./routes/task-workspaces.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
-import { createSingleFlight } from "./services/single-flight.js";
 import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
 import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
 import { registerAssignedMcpGateway } from "./services/native-runtime/assigned-mcp-tools.js";
@@ -60,9 +73,9 @@ import {
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
-import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
-import { actorMiddleware, registerActorContext } from "./middleware/auth.js";
+import { httpLogger, errorHandler } from "./middleware/index.js";
 import { skillAccessRequestContext } from "./services/skill-access.js";
+import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -73,12 +86,12 @@ import {
   parseTrustProxyEnv,
 } from "./middleware/trust-proxy.js";
 import {
-  IMPORT_TRANSFER_SPOOL_SWEEP_INTERVAL_MS,
   resolveDefaultImportTransferSpoolRoot,
-  sweepAbandonedImportTransferSpools,
 } from "./services/company-import-transfers.js";
+import { registerImportSpoolCleanupWork } from "./services/import-spool-cleanup-work.js";
 import { companyTransferRunService } from "./services/company-transfer-runs.js";
 import { healthRoutes } from "./routes/health.js";
+import { readinessRoutes } from "./routes/ready.js";
 import { livenessRoutes } from "./routes/liveness.js";
 import { cloudRuntimeIdentityMiddleware } from "./middleware/cloud-runtime-identity.js";
 import { cloudControlMiddleware } from "./middleware/cloud-control.js";
@@ -111,6 +124,8 @@ import { caseRoutes } from "./routes/cases.js";
 import { caseHandoffRoutes } from "./routes/case-handoffs.js";
 import { workflowRoutes } from "./routes/workflows.js";
 import { fileResourceRoutes } from "./routes/file-resources.js";
+import { createRemoteWorkspaceFiles } from "./services/remote-workspace-files.js";
+import { createSavedWorkspaceLoader } from "./services/remote-workspaces.js";
 import { routineRoutes } from "./routes/routines.js";
 import { environmentRoutes } from "./routes/environments.js";
 import { executionWorkspaceRoutes } from "./routes/execution-workspaces.js";
@@ -125,10 +140,9 @@ import {
   chatWebhookRoutes,
 } from "./routes/chat-channels.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
-import { pluginConfigEgressRoutes } from "./routes/plugin-config-egress.js";
-import { pluginPrivateEgressRoutes } from "./routes/plugin-private-egress.js";
 import { costRoutes } from "./routes/costs.js";
 import { agentCommentaryRoutes } from "./routes/agent-commentary.js";
+import { agentChatMessageRoutes } from "./routes/agent-chat-messages.js";
 import { activityRoutes } from "./routes/activity.js";
 import { dashboardRoutes } from "./routes/dashboard.js";
 import { attentionRoutes } from "./routes/attention.js";
@@ -141,10 +155,12 @@ import { sidebarBadgeRoutes } from "./routes/sidebar-badges.js";
 import { sidebarPreferenceRoutes } from "./routes/sidebar-preferences.js";
 import { announcementRoutes } from "./routes/announcements.js";
 import { serverVersion } from "./version.js";
+import { workspacePreferenceRoutes } from "./routes/workspace-preferences.js";
 import { primaryAgentRoutes } from "./routes/primary-agent.js";
 import { resourceMembershipRoutes } from "./routes/resource-memberships.js";
 import { inboxDismissalRoutes } from "./routes/inbox-dismissals.js";
 import { instanceSettingsRoutes } from "./routes/instance-settings.js";
+import { ephemeralEnrollmentRoutes } from "./routes/ephemeral-enrollment.js";
 import { instanceSettingsService } from "./services/instance-settings.js";
 import { openApiRoutes } from "./routes/openapi.js";
 import {
@@ -173,7 +189,6 @@ import { staticUiCacheControl } from "./static-ui-cache.js";
 import { staticUiCompression } from "./middleware/static-ui-compression.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
-import { logActivity } from "./services/activity-log.js";
 import {
   DEFAULT_LOCAL_PLUGIN_DIR,
   pluginLoader,
@@ -185,68 +200,53 @@ import {
   ensureBundledPlugins,
   resolveBundledCatalogRoot,
   resolveBundledPluginInstalls,
+  resolveManagedBundledPluginKeys,
 } from "./services/bundled-plugins.js";
-import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
+import { createBundledPluginPackageResolver } from "./services/bundled-plugin-package.js";
 import { readDistributionPluginCatalog, distributionPluginActivationGuard } from "./services/distribution-plugin-catalog.js";
 import {
-  createPluginStreamBus,
-  publishWorkerStreamNotification,
-  type PluginStreamBus,
-} from "./services/plugin-stream-bus.js";
+  createPluginWorkerManager,
+  type PluginWorkerManager,
+} from "./services/plugin-worker-manager.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
 import { createToolGatewayService } from "./services/tool-gateway.js";
-import {
-  createPluginRunContextRegistry,
-  type PluginRunContextRegistry,
-} from "./services/plugin-run-context-registry.js";
 import { toolAccessService } from "./services/tool-access.js";
 import { chatChannelService } from "./services/chat-channels.js";
+import type { BudgetResumeDelivery } from "./services/budget-resume-continuation.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
-import { enqueueChatRunMilestones } from "./services/chat-run-publications.js";
-import {
-  createCoalescedAsyncTrigger,
-  isChatPublicationCommitSignal,
-} from "./services/chat-publication-reconciliation.js";
-import { subscribeAllCompanyLiveEvents } from "./services/live-events.js";
+import { nativeChatProgressWork } from "./services/chat-native-progress-work.js";
+import { chatInboundWakeNoticeWork } from "./services/chat-inbound-wake-notice-work.js";
+import { chatFailedRetryNoticeWork } from "./services/chat-failed-retry-notice-work.js";
+import { chatRunMilestoneWork } from "./services/chat-run-milestone-work.js";
 import { heartbeatService } from "./services/heartbeat.js";
 import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { registerPluginLifecycleDelivery } from "./services/plugin-lifecycle-delivery.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import {
-  bufferPluginLogEntry,
   buildHostServices,
   flushPluginLogBuffer,
 } from "./services/plugin-host-services.js";
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
-import { createPluginDevWatcher, isPluginDevWatchEnabled } from "./services/plugin-dev-watcher.js";
+import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
-import { createEventRelayProbe } from "./services/plugin-event-relay-probe.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
-import { approvalService } from "./services/approvals.js";
-import {
-  createApprovalsCapabilityEscalationGateway,
-  registerCapabilityEscalationResolver,
-} from "./services/plugin-capability-escalation.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
 import {
   DEFAULT_JSON_BODY_LIMIT,
   PORTABLE_JSON_BODY_LIMIT,
-  WEBHOOK_JSON_BODY_LIMIT,
 } from "./http/body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
-import { PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN } from "./routes/plugin-webhook-paths.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
-const CHAT_PUBLICATION_FLUSH_INTERVAL_MS = 1_000;
 const VITE_DEV_ASSET_PREFIXES = [
   "/@fs/",
   "/@id/",
@@ -265,15 +265,6 @@ const VITE_DEV_STATIC_PATHS = new Set([
   "/site.webmanifest",
   "/sw.js",
 ]);
-
-/**
- * Parse the operator allowlist of plugin keys that may use
- * `companies.cross-read`. Comma/whitespace separated; empty or absent = none.
- */
-export function parsePluginCrossCompanyReadAllowlist(raw: string | undefined): string[] {
-  if (!raw) return [];
-  return [...new Set(raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean))];
-}
 
 export function isDatabaseConnectionUnavailableError(err: unknown): boolean {
   const error = err as { code?: unknown; message?: unknown; cause?: unknown };
@@ -345,97 +336,6 @@ export function shouldEnablePrivateHostnameGuard(opts: {
     (opts.deploymentMode === "local_trusted" ||
       opts.deploymentMode === "authenticated")
   );
-}
-
-type ChatReconciliationLane =
-  | "provider runtimes"
-  | "deliveries"
-  | "GitHub webhook recovery"
-  | "run milestones"
-  | "publications"
-  | "Slack file receipts"
-  | "Slack session status";
-
-/**
- * Provider recovery can wait on slow external I/O. Keep each existing durable
- * lane single-flight without making an optional provider effect suppress the
- * next publication sweep for every endpoint.
- */
-export function createChatReconciliationCoordinator(input: {
-  reconcileProviderRuntimes: () => Promise<unknown>;
-  processPendingDeliveries: () => Promise<unknown>;
-  processFailedGitHubWebhookDeliveries?: () => Promise<unknown>;
-  projectRunMilestones: () => Promise<number>;
-  flushPublications: () => Promise<unknown>;
-  processPendingSlackFileUploadReceipts?: () => Promise<unknown>;
-  processPendingSlackSessionSyncs?: () => Promise<unknown>;
-  onError: (lane: ChatReconciliationLane, error: unknown) => void;
-}) {
-  let stopped = false;
-  const inFlight = new Map<ChatReconciliationLane, Promise<void>>();
-  const publicationReconciliation = createCoalescedAsyncTrigger({
-    run: input.flushPublications,
-    onError: (error) => input.onError("publications", error),
-  });
-  const milestoneReconciliation = createCoalescedAsyncTrigger({
-    run: async () => {
-      const inserted = await input.projectRunMilestones();
-      // Existing final/question publications never wait on this optional
-      // projection. Newly committed milestones get a bounded dispatch wake;
-      // an empty/contended pass does not create a self-sustaining loop.
-      if (inserted > 0) publicationReconciliation.notify();
-    },
-    onError: (error) => input.onError("run milestones", error),
-  });
-  const start = (
-    lane: ChatReconciliationLane,
-    task: () => Promise<unknown>,
-  ) => {
-    if (stopped || inFlight.has(lane)) return;
-    const pending = Promise.resolve()
-      .then(task)
-      .then(() => undefined)
-      .catch((error) => input.onError(lane, error))
-      .finally(() => {
-        if (inFlight.get(lane) === pending) inFlight.delete(lane);
-      });
-    inFlight.set(lane, pending);
-  };
-  return {
-    reconcile() {
-      if (stopped) return;
-      start("provider runtimes", input.reconcileProviderRuntimes);
-      start("deliveries", input.processPendingDeliveries);
-      if (input.processFailedGitHubWebhookDeliveries) {
-        start(
-          "GitHub webhook recovery",
-          input.processFailedGitHubWebhookDeliveries,
-        );
-      }
-      milestoneReconciliation.poll();
-      publicationReconciliation.poll();
-      if (input.processPendingSlackFileUploadReceipts) start("Slack file receipts", input.processPendingSlackFileUploadReceipts);
-      if (input.processPendingSlackSessionSyncs) start("Slack session status", input.processPendingSlackSessionSyncs);
-    },
-    notifyPublications() {
-      milestoneReconciliation.notify();
-      publicationReconciliation.notify();
-    },
-    stop() {
-      stopped = true;
-      milestoneReconciliation.stop();
-      publicationReconciliation.stop();
-    },
-    async drain() {
-      await Promise.allSettled([
-        ...inFlight.values(),
-        milestoneReconciliation.drain(),
-      ]);
-      // Projecting the final batch can notify dispatch after an earlier drain
-      // would have returned. Join dispatch only after its producer has drained.
-      await publicationReconciliation.drain();
-    },
-  };
 }
 
 export function createManagedBundledPluginWorkerRecovery(input: {
@@ -548,6 +448,9 @@ export async function createApp(
     };
     databaseBackupService?: InstanceDatabaseBackupService;
     prepareIdleDatabaseBackup?: () => Promise<boolean>;
+    idleDeadlineOwners?: IdleDeadlineOwners;
+    /** Filled with the chat service's Retry callback for background budget-resume delivery. */
+    budgetResumeDelivery?: BudgetResumeDelivery;
     databaseBackupHealth?: InspectDatabaseBackupHealthOptions;
     deploymentMode: DeploymentMode;
     deploymentExposure: DeploymentExposure;
@@ -562,28 +465,8 @@ export async function createApp(
     hostVersion?: string;
     localPluginDir?: string;
     pluginMigrationDb?: Db;
-    /**
-     * Company the host files plugin capability-escalation board approvals
-     * against. A plugin capability escalation is instance-wide but
-     * approvals are company-scoped, so the host files against this single
-     * configured "platform" company. When omitted, no escalation gateway is
-     * wired and the loader keeps failing closed on a cap-escalating upgrade —
-     * preserving the pre-existing production default.
-     */
-    escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
-    // Stream bus wired to the SAME worker manager instance passed above: the
-    // manager publishes verified worker stream notifications here and the
-    // plugin SSE bridge subscribes on it. When app builds its own manager it
-    // also builds the bus and wires the two; an injected manager must come
-    // with its bus (index.ts wires both) or the SSE bridge has no publisher.
-    pluginStreamBus?: PluginStreamBus;
     decisionServiceOptions: DecisionServiceOptions;
-    // The run-context registry the injected pluginWorkerManager was
-    // built with. MUST be the same instance, so a worker's host-minted service
-    // run-context (registered by the manager on worker start) is visible to the
-    // secrets host-handler's Gate 1 lookup. When omitted, app creates its own.
-    pluginRunContextRegistry?: PluginRunContextRegistry;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (
       req: ExpressRequest,
@@ -595,17 +478,12 @@ export async function createApp(
      * bundled catalog fail-to-start (see services/bundled-plugins.ts).
      */
     managedPluginAutoInstall?: readonly string[] | null;
-    /**
-     * Plugin keys the operator allows to use `companies.cross-read`. Default
-     * (absent) reads `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST`
-     * (comma-separated plugin keys); empty = no plugin may cross-read.
-     */
-    pluginCrossCompanyReadAllowlist?: readonly string[] | null;
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
   },
 ) {
   const app = express();
+  app.use(databaseOperationMiddleware);
   app.use(idleAdmissionMiddleware);
   const staticUi = express.Router();
   app.locals.paperclipDb = db;
@@ -638,17 +516,6 @@ export async function createApp(
       verify: captureRawBody,
     }),
   );
-  // Ahead of the generic parser so the anonymous plugin webhook ingestion
-  // route gets a tighter ceiling. `verify: captureRawBody` is mandatory here:
-  // the route reads `req.rawBody` to HMAC-verify the exact bytes the provider
-  // signed.
-  app.use(
-    PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN,
-    express.json({
-      limit: WEBHOOK_JSON_BODY_LIMIT,
-      verify: captureRawBody,
-    }),
-  );
   // Chat providers sign the exact request bytes. Capture every webhook media
   // type before the global JSON parser so JSON events and form-encoded action
   // callbacks are verified against the provider's original body.
@@ -657,15 +524,14 @@ export async function createApp(
     createChatWebhookDiagnostics(),
     chatWebhookBodyParser,
   );
+  let dotPrincipalOAuth: ReturnType<typeof createPublicMcpOAuth> | null = null;
+  const dotPrincipalHttp = createDotPrincipalHttp(() => dotPrincipalOAuth);
+  app.use(dotPrincipalHttp.bodyParser);
   const jsonBodyParser = express.json({ limit: DEFAULT_JSON_BODY_LIMIT, verify: captureRawBody });
   // File tickets authenticate before parsing bytes; JSON attachments must remain bytes too.
-  app.use((req, res, next) => ["/mcp/files/upload", "/mcp/runner/files/upload"].includes(req.path) ? next() : jsonBodyParser(req, res, next));
+  app.use((req, res, next) => (dotPrincipalHttp.matchesPost(req) || ["/mcp/files/upload", "/mcp/runner/files/upload"].includes(req.path)) ? next() : jsonBodyParser(req, res, next));
   app.use("/api", apiCompression());
   app.use(httpLogger);
-  // Ahead of every DB-touching middleware (actor resolution included) so a
-  // client that hangs up releases the whole request's queries, not just the
-  // route handler's.
-  app.use(requestQueryCancellation);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
@@ -686,56 +552,28 @@ export async function createApp(
   catch { logger.warn("Assistant connections require an HTTPS public URL (HTTP loopback is allowed for development)."); }
   const publicMcpOAuth = mcpConfig ? createPublicMcpOAuth(db, mcpConfig) : null;
   const publicMcpIngress = Router();
+  publicMcpIngress.use(dotPrincipalHttp.router);
 
   app.use(cloudRuntimeIdentityMiddleware(db));
   // Routine probes stop before session/actor resolution, even after claim.
   // Keep hostname validation and the signed-bootstrap endpoint guard above.
   app.use("/api/liveness", livenessRoutes());
+  app.use("/api/ready", readinessRoutes());
   // A signed claim above commits identity before any normal request can seed
   // company data. Unclaimed probes bypass session resolution as well as SQL.
   app.use(cloudWarmStandbyMiddleware(isWarmStandby, health, staticUi));
-  app.use("/api/customer-success/v1", customerSuccessRoutes(db, opts.storageService));
+  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
+  app.use("/api/customer-success/v1", customerSuccessRoutes(db, opts.storageService, {
+    pluginWorkerManager: workerManager,
+  }));
   app.use(museTransportRoutes(db, opts.authPublicBaseUrl));
   app.use(publicMcpIngress);
   // Connection-intent tools carry their own short-lived, run-bound bearer and
   // must be reachable by remote adapters that intentionally do not receive an
   // agent API key. Every request revalidates the active heartbeat row.
   app.use(runtimeConnectionIntentRoutes(db));
+  app.use(nativeRunMcpRoutes());
   const hostServicesDisposers = new Map<string, () => void>();
-  // pluginId -> pluginKey, populated as each plugin's host handlers are
-  // built. Lets the event-relay probe resolve the bus key (which is the plugin
-  // key) for the running workers reported by the worker manager.
-  // Shared run-context registry tying the dispatching agent's
-  // identity to (pluginDbId, runId) for the duration of each tool call, so the
-  // worker's `artifacts.fetch`/`secrets.resolve` callbacks can be authorized
-  // server-side. Also holds each worker's worker-lifetime service
-  // run-context (system actor) for background secret resolution — created
-  // before the worker manager so the manager can register on worker start.
-  // When the caller injects a pre-built pluginWorkerManager (index.ts
-  // does, so it can also drive heartbeat/routine services), it MUST inject the
-  // registry that manager was built with. Otherwise app would create a second,
-  // disjoint registry: the manager's registerService would write to its own
-  // registry while the secrets host-handler reads this one, so service/setup()
-  // run-contexts would never be found (Gate 1 → runcontext_invalid).
-  const pluginRunContextRegistry =
-    opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
-  // The SSE bridge needs BOTH halves wired to the same manager — a
-  // publisher (manager onStreamNotification → bus) and the bus itself
-  // (bridgeDeps.streamBus). Build the bus here and wire the internal-manager
-  // path; an injected manager must pair with the bus it publishes to.
-  const pluginStreamBus = opts.pluginStreamBus ?? createPluginStreamBus();
-  const workerManager =
-    opts.pluginWorkerManager ??
-    createPluginWorkerManager({
-      runContextRegistry: pluginRunContextRegistry,
-      // Worker ctx.logger notifications persist to plugin_logs on the same
-      // buffered path as the logger.log host service (§26.1), so the operator
-      // logs panel can show plugin errors.
-      workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
-      onStreamNotification: ({ pluginId, method, params }) => {
-        publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
-      },
-    });
   let lifecyclePluginsReady = false;
   const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
   const connectionIntentHeartbeat = heartbeatService(db, {
@@ -755,6 +593,7 @@ export async function createApp(
       deliverNativeQuestionResponse(db, interaction),
     storage: opts.storageService,
   });
+  if (opts.budgetResumeDelivery) opts.budgetResumeDelivery.prepareChatRetry = chatChannels.prepareFailedChatRunRetry;
   // Voice capabilities are verified by the signed callback route, not by
   // board/agent bearer authentication. Mount before actorMiddleware so its
   // per-session Bearer cannot be mistaken for an agent API key.
@@ -769,30 +608,7 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
-  // The dedicated proxy IP or CIDR allowlist for requests that arrive through
-  // a TLS-terminating proxy. The global `TRUST_PROXY` setting never satisfies
-  // anything that reads this list; an operator sets it to the real
-  // TLS-terminating proxy addresses. An empty value keeps the confidential
-  // setup-token login responses on direct TLS (or a `local_trusted` loopback
-  // peer) only, and keeps board-key auth-event rows pinned to the immediate
-  // socket peer. Declared here, before both consumers (the actor middleware
-  // and the setup-token login transport).
-  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-  // Resolve the acting credential (req.actor) and bind its provenance into
-  // AsyncLocalStorage so logActivity records it centrally. The provenance
-  // regression test drives the same registerActorContext, so removing the
-  // provenance registration turns that test red instead of silently logging NULL.
-  registerActorContext(app, db, {
-    deploymentMode: opts.deploymentMode,
-    resolveSession: opts.resolveSession,
-    // Same dedicated operator allowlist the confidential-transport guard uses
-    // (SR-7); the board-key auth-event log reads it only to derive
-    // source_ip. Never derived from the global TRUST_PROXY setting.
-    authEventTrustedProxies: setupTokenLoginProxyAllowlist,
-  });
+  app.use(connectionEventWakeRoutes(db));
   app.use(skillAccessRequestContext);
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
@@ -800,9 +616,6 @@ export async function createApp(
   }
   app.use(llmRoutes(db));
 
-  // pluginId -> pluginKey, populated as each plugin's host handlers are
-  // built; lets the event-relay probe resolve the bus key.
-  const pluginKeyById = new Map<string, string>();
   // Provider-authenticated ingress is intentionally outside the board
   // mutation guard. The Chat SDK adapter verifies the provider signature
   // before Paperclip persists or acts on any event.
@@ -833,28 +646,18 @@ export async function createApp(
   app.get("/api/chat-github/manifest/callback", async (req, res) => {
     res.set("Cache-Control", "no-store");
     res.set("Referrer-Policy", "no-referrer");
-    const redirect = await chatChannels.githubWizard.directCallback(String(req.query.state ?? ""), String(req.query.code ?? ""));
+    const redirect = await chatChannels.githubWizard.directCallback(String(req.query.state ?? ""), String(req.query.code ?? ""), req.actor);
     res.redirect(303, redirect);
   });
   app.get("/api/chat-github/cloud/callback", async (req, res) => {
     res.set("Cache-Control", "no-store"); res.set("Referrer-Policy", "no-referrer");
-    res.redirect(303, await chatChannels.githubWizard.cloudCallback(String(req.query.state ?? ""), String(req.query.registration ?? ""), typeof req.query.claim === "string" ? req.query.claim : undefined));
+    res.redirect(303, await chatChannels.githubWizard.cloudCallback(String(req.query.state ?? ""), String(req.query.registration ?? ""), typeof req.query.claim === "string" ? req.query.claim : undefined, req.actor));
   });
   app.get("/api/chat-github/identity/callback", async (req, res) => {
     res.set("Cache-Control", "no-store"); res.set("Referrer-Policy", "no-referrer");
-    res.redirect(303, await chatChannels.githubWizard.identityCallback(String(req.query.state ?? ""), String(req.query.code ?? "")));
+    res.redirect(303, await chatChannels.githubWizard.identityCallback(String(req.query.state ?? ""), String(req.query.code ?? ""), req.actor));
   });
-  const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
-  const crossCompanyReadAllowlist = new Set(
-    opts.pluginCrossCompanyReadAllowlist ??
-      parsePluginCrossCompanyReadAllowlist(process.env.PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST),
-  );
-  if (crossCompanyReadAllowlist.size > 0) {
-    logger.warn(
-      { pluginKeys: [...crossCompanyReadAllowlist] },
-      "plugin cross-company read allowlist is active",
-    );
-  }
+  const managedAutoInstallKeys = resolveManagedBundledPluginKeys(opts.managedPluginAutoInstall);
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
@@ -867,6 +670,7 @@ export async function createApp(
       distributionPlugins,
     },
   );
+  const bundledPackageResolver = managedAutoInstallKeys === null ? undefined : createBundledPluginPackageResolver(bundledPluginInstalls);
   const managedBundledPluginKeys =
     managedAutoInstallKeys !== null
       ? bundledPluginInstalls.map((install) => install.pluginKey)
@@ -896,10 +700,11 @@ export async function createApp(
   api.use("/companies", companyRoutes(db, opts.storageService));
   api.use(llmRoutes(db));
   api.use(folderRoutes(db));
-  api.use(companySkillRoutes(db));
+  api.use(companySkillRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(companySkillPolicyRoutes(db));
   api.use(inboxAgentPolicyRoutes(db));
   api.use(agentCommentaryRoutes(db));
+  api.use(agentChatMessageRoutes(db));
   api.use(builtInAgentRoutes(db));
   api.use(summarySlotRoutes(db));
   api.use(statusCardRoutes(db));
@@ -908,6 +713,17 @@ export async function createApp(
   // back through the callback below, so the shutdown hook can cancel every live
   // session (SR-4).
   let setupTokenLoginService: SetupTokenSessionService | null = null;
+  // The dedicated proxy IP or CIDR allowlist for the confidential setup-token
+  // login responses (SR-7). The global `TRUST_PROXY` setting does not satisfy
+  // the guard; an operator sets this allowlist to the real TLS-terminating
+  // proxy addresses. An empty value keeps the confidential responses on direct
+  // TLS (or a `local_trusted` loopback peer) only.
+  const setupTokenLoginProxyAllowlist = (
+    process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? ""
+  )
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
   // The explicit operator declaration that a platform edge terminates TLS for
   // every client request (SR-7). This complements the allowlist for managed
   // platforms (Railway, Render, Fly, and the like) where the app socket is
@@ -985,11 +801,15 @@ export async function createApp(
   api.use(caseHandoffRoutes(db));
   api.use(workflowRoutes(db));
   api.use(issueTreeControlRoutes(db, { pluginWorkerManager: workerManager }));
-  api.use(fileResourceRoutes(db));
+  api.use(fileResourceRoutes(db, { remoteFiles: createRemoteWorkspaceFiles(db, {
+    environmentRuntime: environmentRuntimeService(db, { pluginWorkerManager: workerManager }),
+    loadSavedWorkspace: createSavedWorkspaceLoader(db, opts.storageService),
+  }) }));
   api.use(routineRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(
     environmentRoutes(db, {
       pluginWorkerManager: workerManager,
+      retryPendingEnvironmentCleanup: input => connectionIntentHeartbeat.sweepPendingCleanupLeases({ environmentRetry: input }),
       recoverMissingPluginWorker: recoverManagedBundledPluginWorker
         ? {
             pluginKeys: managedBundledPluginKeys,
@@ -1017,11 +837,9 @@ export async function createApp(
     }),
   );
   const trustedLocalStdioRuntimeHost =
-    process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
-    ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
-    ?? null;
-  api.use(pluginConfigEgressRoutes(db));
-  api.use(pluginPrivateEgressRoutes(db));
+    process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST ??
+    process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST ??
+    null;
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
@@ -1035,16 +853,19 @@ export async function createApp(
   api.use(announcementRoutes(db, { ...opts.announcements, version: opts.hostVersion ?? serverVersion }));
   api.use(resourceMembershipRoutes(db));
   api.use(primaryAgentRoutes(db));
+  api.use(workspacePreferenceRoutes(db));
   api.use(inboxDismissalRoutes(db));
-  api.use(instanceSettingsRoutes(db, workerManager, opts.prepareIdleDatabaseBackup));
+  api.use(instanceSettingsRoutes(db, workerManager, opts.prepareIdleDatabaseBackup, opts.idleDeadlineOwners,
+    input => resourceLifecycleDelivery.prepareForIdleSleep(input)));
+  api.use(ephemeralEnrollmentRoutes(db));
   if (opts.databaseBackupService) {
-    api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService, db));
+    api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
   }
   const pluginRegistry = pluginRegistryService(db);
   const eventBus = createPluginEventBus();
   setPluginEventBus(eventBus);
   const jobStore = pluginJobStore(db);
-  const lifecycle = pluginLifecycleManager(db, { workerManager, eventBus });
+  const lifecycle = pluginLifecycleManager(db, { workerManager });
   const scheduler = createPluginJobScheduler({
     isBackgroundWorkEnabled: () => !isWarmStandby() && !isIdleTaskDrainActive(),
     db,
@@ -1055,7 +876,6 @@ export async function createApp(
     workerManager,
     lifecycleManager: lifecycle,
     db,
-    runContextRegistry: pluginRunContextRegistry,
   });
   const gatewayOAuthAccess = toolAccessService(db, {
     deploymentMode: opts.deploymentMode,
@@ -1098,9 +918,6 @@ export async function createApp(
       deploymentExposure: opts.deploymentExposure,
       authPublicBaseUrl: opts.authPublicBaseUrl,
       trustedLocalStdioRuntimeHost,
-      // Plugin-backed connections report health via the plugin tool runtime
-      // instead of requiring a config.url their records never carry.
-      pluginToolRuntimeProbe: ({ pluginKey }) => toolDispatcher.toolCount(pluginKey),
       toolGateway,
       connectionIntentHeartbeat,
     }),
@@ -1126,27 +943,16 @@ export async function createApp(
     null;
   let viteDevServer: { close(): Promise<void> } | null = null;
   let viteHmrServer: HttpServer | null = null;
-  // Wire the capability-escalation gateway when a platform company is
-  // configured. Absent it, the loader receives no gateway and keeps failing
-  // closed on cap-escalating upgrades (pre-existing production default).
-  const escalationGateway = opts.escalationApprovalCompanyId
-    ? createApprovalsCapabilityEscalationGateway({
-        approvals: approvalService(db),
-        companyId: opts.escalationApprovalCompanyId,
-      })
-    : undefined;
   const loader = pluginLoader(
     db,
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
-      escalationGateway,
-      assertPackageActivation: distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
-      // Capabilities a fresh install may declare without a board approval.
-      // Default empty: any capability parks a fresh install (gateway set only).
-      installCapabilityAllowlist: parsePluginCrossCompanyReadAllowlist(
-        process.env.PAPERCLIP_PLUGIN_INSTALL_CAPABILITY_ALLOWLIST,
-      ),
+      assertPackageActivation: bundledPackageResolver?.assertActivation ?? distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
+      resolvePackageRoot: bundledPackageResolver?.resolve,
+      prebuiltOnly: managedAutoInstallKeys !== null,
+      enableLocalFilesystem: managedAutoInstallKeys === null,
+      enableNpmDiscovery: managedAutoInstallKeys === null,
     },
     {
       workerManager,
@@ -1174,46 +980,14 @@ export async function createApp(
           notifyWorker,
           {
             pluginWorkerManager: workerManager,
-            storageService: opts.storageService,
-            runContextRegistry: pluginRunContextRegistry,
             manifest,
           },
         );
         hostServicesDisposers.set(pluginId, () => services.dispose());
-        pluginKeyById.set(pluginId, manifest.id);
         return createHostClientHandlers({
           pluginId,
           capabilities: manifest.capabilities,
           services,
-          crossCompanyReadAllowed: crossCompanyReadAllowlist.has(manifest.id),
-          onCrossCompanyRead: (event) => {
-            logger.info(
-              { ...event, pluginKey: manifest.id },
-              "plugin.cross_company_read",
-            );
-            // Unfiltered companies.list ("*") is recorded on the caller's company.
-            const auditCompanyId =
-              event.targetCompanyId === "*" ? event.invocationCompanyId : event.targetCompanyId;
-            if (!auditCompanyId) return;
-            void logActivity(db, {
-              companyId: auditCompanyId,
-              actorType: "plugin",
-              actorId: pluginId,
-              action: "plugin.cross_company_read",
-              entityType: "company",
-              entityId: event.targetCompanyId,
-              agentId: event.agentId,
-              runId: event.runId,
-              details: {
-                pluginKey: manifest.id,
-                method: event.method,
-                targetCompanyId: event.targetCompanyId,
-                callerCompanyId: event.invocationCompanyId,
-              },
-            }).catch((err) => {
-              logger.warn({ err, pluginKey: manifest.id }, "cross-company read audit write failed");
-            });
-          },
         });
       },
     },
@@ -1224,49 +998,6 @@ export async function createApp(
     (session, run) => toolGateway.browserUseSessionAuthorized({ ...session, runId: run.heartbeatRunId, invocationId: run.invocationId }));
   api.use(browserUseRoutes(db, browserUse));
   api.use(toolGatewayRoutes(db, toolGateway));
-  // A lifecycle bound to the runtime-services + gateway loader, used
-  // only to apply board decisions to parked upgrades (complete/revert + worker
-  // re-activation). The approvals service dispatches resolved escalation
-  // approvals to this resolver via the module-level registry, breaking the
-  // approvals -> loader import cycle.
-  const upgradeLifecycle = pluginLifecycleManager(db, { loader, workerManager });
-  registerCapabilityEscalationResolver(async ({ payload, outcome }) => {
-    if (outcome === "approved") {
-      await upgradeLifecycle.completeUpgradeApproved(payload.pluginId);
-    } else {
-      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId, { origin: payload.origin });
-    }
-  });
-  // Create the dev-watcher before the plugin routes so the routes can
-  // reconcile the local-plugin file watcher after each lifecycle mutation. The
-  // routes run against a route-local lifecycle instance whose domain events
-  // never reach this watcher's app-level subscription, so an explicit reconcile
-  // is the reliable re-arm/disarm path on install/enable/disable/uninstall.
-  // Resolve the watch target for a plugin: its local packagePath, but only
-  // while the plugin is active ('ready'). Gating on status means reconcile()
-  // disarms the watcher on disable/uninstall (status leaves 'ready') even
-  // though disable keeps packagePath in the DB.
-  // File-change restarts go through a lifecycle bound to the runtime-services
-  // loader so they take the full deactivate + activateReadyPlugin path
-  // (manifest re-read, migrations, fresh host handlers, startup config
-  // delivery). The shared `lifecycle` above is built without a loader (the
-  // loader needs it as a runtime service), so its restartWorker() would fall
-  // back to a bare process bounce. Lifecycle-event subscriptions stay on the
-  // shared `lifecycle`, which is where the loader emits them.
-  const devWatcherRestartLifecycle = pluginLifecycleManager(db, { loader, workerManager, eventBus });
-  // Defense in depth: hot reload re-activates plugins from on-disk code, so
-  // it is opt-in (PAPERCLIP_PLUGIN_DEV_WATCH=1) and off by default.
-  const devWatchEnabled = isPluginDevWatchEnabled(process.env);
-  logger.info({ devWatchEnabled }, "plugin dev watcher configuration");
-  const devWatcher = devWatchEnabled ? createPluginDevWatcher(
-    lifecycle,
-    async (pluginId) => {
-      const plugin = await pluginRegistry.getById(pluginId);
-      return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
-    },
-    undefined,
-    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId), unwatchedRoots: [bundledCatalogRoot] },
-  ) : null;
   api.use(
     pluginRoutes(
       db,
@@ -1274,9 +1005,8 @@ export async function createApp(
       { scheduler, jobStore },
       { workerManager },
       { toolDispatcher },
-      { workerManager, streamBus: pluginStreamBus },
+      { workerManager },
       { toolGateway },
-      devWatcher ? { reconciler: devWatcher } : undefined,
     ),
   );
   api.use(
@@ -1312,6 +1042,7 @@ export async function createApp(
     publicMcpIngress.use(transfers.router);
     publicMcpIngress.use(publicMcpIngressRoutes(publicMcpOAuth, createPublicMcpExecutor(db, publicMcpOAuth, dispatch, transfers), publicMcpEvents));
     const dotOAuth = createPublicMcpOAuth(db, { ...publicMcpOAuth.config, resource: publicMcpOAuth.config.origin + "/mcp/runner" });
+    dotPrincipalOAuth = dotOAuth;
     dotMcpEvents = createPublicMcpEvents(db, dotOAuth, dispatch, { enableDotRunner: true, isBackgroundWorkEnabled: () => !isWarmStandby() && !isIdleTaskDrainActive() });
     const grokTransfers = createPublicMcpTransfers(db, dotOAuth, dispatch, opts.storageService, { pathPrefix: "/mcp/runner/files",
       agentSession: { authorize: (principal, sessionId, taskId, write, database) => dotRunnerBroker(database ?? db).authorizeFileSession(principal, sessionId, taskId, write) } });
@@ -1320,7 +1051,6 @@ export async function createApp(
     api.use(publicMcpManagementRoutes(publicMcpOAuth, dotOAuth));
     api.use(dotRunnerRoutes(db, publicMcpOAuth.config.origin + "/mcp/runner"));
     api.use(grokBotRoutes(db, publicMcpOAuth.config.origin + "/mcp/runner"));
-    grokDispatcher.start();
   }
 
   api.use(museBoardRoutes(db, opts.authPublicBaseUrl));
@@ -1332,6 +1062,7 @@ export async function createApp(
   app.use(
     pluginUiStaticRoutes(db, {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
+      resolvePackageRoot: bundledPackageResolver?.resolve,
     }),
   );
 
@@ -1356,6 +1087,11 @@ export async function createApp(
           immutable: true,
         }),
       );
+      if (process.env.PAPERCLIP_SHARED_UI_ASSETS === "true") {
+        const retained = retainedUiAssets(createStorageProviderFromConfig(loadStorageConfig()));
+        await retained.publish(path.join(uiDist, "assets"));
+        staticUi.use("/assets", retained.serve);
+      }
       // Serve root/index through the same runtime HTML transform as SPA routes.
       staticUi.get(["/", "/index.html"], (_req, res) => {
         res.type("html").set("Cache-Control", "no-cache").send(readBrandedStaticIndexHtml(uiDist));
@@ -1494,7 +1230,6 @@ export async function createApp(
   app.use(errorHandler);
 
   jobCoordinator.start();
-  scheduler.start();
   const deliveryWork = createDeliveryWorkCoordinator({
     owner: db,
     canRun: () => !isWarmStandby() && !isIdleTaskDrainActive(),
@@ -1502,6 +1237,7 @@ export async function createApp(
     onError: (err, queue) => logger.error({ err, queue }, "Delivery reconciliation failed"),
   });
   app.locals.deliveryWork = deliveryWork;
+  await scheduler.start(deliveryWork);
   const agentLifecycleDelivery = deliveryWork.register(DELIVERY_QUEUES.agentLifecycle, {
     retryMs: 1_000,
     run: () => agentLifecycle.sweep(),
@@ -1509,9 +1245,17 @@ export async function createApp(
     nextRunAt: () => agentLifecycle.nextRunAt(),
   });
   agentLifecycle.setWake(agentLifecycleDelivery.wake);
+  const clientMirror = startMcpClientMirrorSync(db, deliveryWork, mcpConfig?.origin,{authorizationOrigin:mcpConfig?.authorizationOrigin});
+  const unregisterMcpOwners = registerIdleMcpOwners(db, { config: mcpConfig, personal: publicMcpEvents, dot: dotMcpEvents, clientMirrorInstanceId:clientMirror.instanceId });
+  startMcpRevocationIndexSync(db, deliveryWork);
+  startMcpIngressHandoffExpiry(db, deliveryWork);
   publicMcpEvents?.start(deliveryWork);
   dotMcpEvents?.start(deliveryWork);
-  const stopMuseMaintenance = startMuseMaintenance(db, deliveryWork);
+  if (publicMcpOAuth) grokDispatcher.start(deliveryWork);
+  const stopMuseMaintenance = startMuseMaintenance(db, deliveryWork, async () => {
+    const state = await connectionIntentHeartbeat.resolveSchedulingSuppression(true);
+    return !state.suppressed || state.reason === "task_drain";
+  });
   const resourceLifecycleDelivery = registerPluginLifecycleDelivery(deliveryWork, db, workerManager, lifecycle);
   await resourceLifecycleDelivery.ready;
   if (opts.feedbackExportService) {
@@ -1523,77 +1267,34 @@ export async function createApp(
   }
   registerChatDeliveryWork(deliveryWork, chatChannels, () => !isIdleTaskDrainActive());
   registerChatActionWork(deliveryWork, chatChannels, () => !isIdleTaskDrainActive());
+  chatChannels.voice.registerReportWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.voice.registerRecoveryWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.voice.registerReplyWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.voice.inbound.registerCleanupWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.voice.inbound.registerRetentionWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerReceiverWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerTeamsConsentExpiryWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerTeamsAttemptRecoveryWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerInteractionContinuationWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  registerGitHubReviewProjectionWork(db, deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerGitHubReviewCheckWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerGitHubTerminalResponseWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerGitHubAcknowledgementWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerTerminalConfirmationWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatChannels.registerCommandWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  nativeChatProgressWork(db).register(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatInboundWakeNoticeWork(chatChannels).register(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatFailedRetryNoticeWork(chatChannels).register(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  chatRunMilestoneWork(db, opts.authPublicBaseUrl).register(
+    deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive(),
+  );
   emailChannels.start();
-  const reconcileChatPublicationMaintenance = async () => {
-    await chatChannels.processPublicationMaintenance();
-  };
-  const chatReconciliation = createChatReconciliationCoordinator({
-    reconcileProviderRuntimes: async () => {
-      await chatChannels.reconcileProviderRuntimes();
-      await chatChannels.voice.reconcile();
-    },
-    // Chat delivery, action, and Telegram discovery workers now own these
-    // duties. Keep the coordinator's other maintenance lanes independent.
-    processPendingDeliveries: async () => undefined,
-    processFailedGitHubWebhookDeliveries: () =>
-      chatChannels.processFailedGitHubWebhookDeliveries(),
-    projectRunMilestones: () =>
-      enqueueChatRunMilestones(db, {
-        publicBaseUrl: opts.authPublicBaseUrl,
-      }),
-    flushPublications: () => reconcileChatPublicationMaintenance(),
-    onError: (lane, err) => {
-      logger.error({ err, lane }, `Failed to reconcile chat ${lane}`);
-    },
-  });
-  const unsubscribeChatPublicationSignals = subscribeAllCompanyLiveEvents(
-    (event) => {
-      if (!isWarmStandby() && !isIdleTaskDrainActive() && isChatPublicationCommitSignal(event))
-        chatReconciliation.notifyPublications();
-    },
-  );
-  // Provider/action maintenance and milestone projection still use this cadence.
-  // Inbox, outbox, and file receipt queues have independent commit/deadline wakes.
-  let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
-    () => {
-      if (!isWarmStandby() && !isIdleTaskDrainActive()) chatReconciliation.reconcile();
-    },
-    CHAT_PUBLICATION_FLUSH_INTERVAL_MS,
-  );
-  chatPublicationTimer.unref?.();
-  if (!isWarmStandby() && !isIdleTaskDrainActive()) chatReconciliation.reconcile();
-  // Abandoned chunked-import spool sweep: hourly (plus once at startup),
-  // deleting spool dirs whose transfer saw no activity for 24h and cancelling
-  // their still-open ledger runs. Same setInterval + unref + shutdown-clear
-  // shape as the feedback export flush above.
-  const importTransferSpoolRoot = resolveDefaultImportTransferSpoolRoot();
-  const sweepImportTransferSpools = () => {
-    if (isWarmStandby() || isIdleTaskDrainActive()) return;
-    sweepAbandonedImportTransferSpools(db, importTransferSpoolRoot)
-      .then((result) => {
-        if (result.swept > 0) {
-          logger.info(result, "swept abandoned company import transfer spools");
-        }
-      })
-      .catch((err) => {
-        logger.error(
-          { err },
-          "abandoned company import transfer spool sweep failed",
-        );
-      });
-  };
+  chatChannels.registerGitHubWebhookRecoveryWork(deliveryWork, () => !isWarmStandby() && !isIdleTaskDrainActive());
+  const importSpoolCleanup = registerImportSpoolCleanupWork(db, deliveryWork,
+    resolveDefaultImportTransferSpoolRoot(), () => !isWarmStandby() && !isIdleTaskDrainActive());
   registerBrowserUseCleanup(deliveryWork, browserUse, () => !isIdleTaskDrainActive());
-  let importTransferSweepTimer: ReturnType<typeof setInterval> | null =
-    setInterval(
-      sweepImportTransferSpools,
-      IMPORT_TRANSFER_SPOOL_SWEEP_INTERVAL_MS,
-    );
-  importTransferSweepTimer.unref?.();
-  // Startup only (never on the hourly interval — that would kill live
-  // applies): apply jobs are in-memory in this single process, so any run
-  // still "applying" now was interrupted by the previous shutdown and would
-  // otherwise 409 every retry forever. Fail those stranded runs — their
-  // spooled parts stay reusable — then run the normal sweep once.
+
+
   void companyTransferRunService
     .recoverStrandedApplyingRuns(db)
     .then((recovered) => {
@@ -1606,13 +1307,17 @@ export async function createApp(
     })
     .catch((err) => {
       logger.error({ err }, "stranded company transfer apply recovery failed");
-    })
-    .finally(() => {
-      sweepImportTransferSpools();
     });
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
+  const devWatcher = managedAutoInstallKeys !== null ? null : createPluginDevWatcher(
+    lifecycle,
+    async (pluginId) =>
+      (await pluginRegistry.getById(pluginId))?.packagePath ?? null,
+    undefined,
+    { unwatchedRoots: [bundledCatalogRoot] },
+  );
   // Auto-provision bundled plugins so their providers are registered for
   // agent runs. Bundles are excluded from the pnpm
   // workspace and built standalone into the image (see Dockerfile), then
@@ -1652,7 +1357,7 @@ export async function createApp(
     // owns provisioning); self-hosted leaves an operator's uninstall alone.
     // Disabled plugins never start automatically. Added distribution permissions
     // still enter upgrade_pending so enabling them requires an operator decision.
-    { reinstallUninstalled: managedAutoInstallKeys !== null },
+    { reinstallUninstalled: managedAutoInstallKeys !== null, preservePackagePath: managedAutoInstallKeys !== null },
   )
     .then(() => loader.loadAll())
     .then((result) => {
@@ -1666,25 +1371,10 @@ export async function createApp(
     .catch((err) => {
       logger.error({ err }, "Failed to load ready plugins on startup");
     });
-
-  // Liveness probe that warns if a running plugin's board-event relay
-  // detaches (worker up, zero event-bus subscriptions). Belt-and-suspenders to
-  // the per-restart subscription-count log in plugin-lifecycle.
-  const eventRelayProbe = createEventRelayProbe({
-    listRunningPlugins: () =>
-      workerManager
-        .diagnostics()
-        .filter((d) => d.status === "running")
-        .map((d) => ({ pluginId: d.pluginId, pluginKey: pluginKeyById.get(d.pluginId) }))
-        .filter((p): p is { pluginId: string; pluginKey: string } => Boolean(p.pluginKey)),
-    subscriptionCount: (pluginKey) => eventBus.subscriptionCount(pluginKey),
-    log: {
-      warn: (obj, msg) => logger.warn({ service: "plugin-event-relay-probe", ...obj }, msg),
-      info: (obj, msg) => logger.info({ service: "plugin-event-relay-probe", ...obj }, msg),
-    },
-  });
-  eventRelayProbe.start();
   app.locals.bundledPluginsStartup = trackIdleWork(bundledPluginsStartup);
+  // Manifest ids the managed auto-install list resolves to; the managed
+  // environments bootstrap checks plugin entries against them.
+  app.locals.managedBundledPluginKeys = managedBundledPluginKeys;
   void bundledPluginsStartup.then(() => { lifecyclePluginsReady = true; resourceLifecycleDelivery.wake(); agentLifecycleDelivery.wake(); }).catch(() => logger.warn("Agent lifecycle recovery failed; retrying."));
   // The shutdown hook runs at most once. It caches the in-flight promise, so a
   // second caller (for example the `exit` handler) awaits the same completion
@@ -1692,47 +1382,34 @@ export async function createApp(
   let appServicesShutdown: Promise<void> | null = null;
   const shutdownAppServices = (): Promise<void> => {
     if (appServicesShutdown) return appServicesShutdown;
-    appServicesShutdown = (async () => {
-      // The scheduler tick queries the database. Stop it here, inside the
-      // awaited teardown, so no tick runs after the caller ends the pool.
-      scheduler.stop();
+    appServicesShutdown = finishServiceShutdown(() => scheduler.stop(), async () => {
       await agentLifecycle.stop();
+      unregisterMcpOwners();
       await publicMcpEvents?.stop();
-      await dotMcpEvents?.stop(); grokDispatcher.stop();
+      await dotMcpEvents?.stop();
       jobCoordinator.stop();
-      resourceLifecycleDelivery.dispose();
-      await deliveryWork.stop();
-      eventRelayProbe.stop();
-      unsubscribeChatPublicationSignals();
-      chatReconciliation.stop();
-      if (chatPublicationTimer) {
-        clearInterval(chatPublicationTimer);
-        chatPublicationTimer = null;
-      }
-      await chatReconciliation.drain();
-      if (importTransferSweepTimer) {
-        clearInterval(importTransferSweepTimer);
-        importTransferSweepTimer = null;
-      }
-      devWatcher?.close();
-      viteHtmlRenderer?.dispose();
-      void viteDevServer?.close().catch(() => undefined);
-      viteHmrServer?.close();
-      hostServiceCleanup.disposeAll();
-      hostServiceCleanup.teardown();
-      pluginRunContextRegistry.dispose();
-      await stopMuseMaintenance();
-      await emailChannels.shutdown();
-      await chatChannels.shutdown();
-      // End the avatar worker pool, if a request ever started one, so no
-      // render outlives the HTTP teardown.
-      await agentAvatars.close();
-      // Cancel every live setup-token login session and AWAIT the cancellation,
-      // so each direct child stops and the server releases each lease before the
-      // caller stops the database and the provider. A lease release that
-      // fails stays a durable record for the startup reaper.
-      await setupTokenLoginService?.shutdown();
-    })();
+      await finishServiceShutdown(() => resourceLifecycleDelivery.dispose(), async () => {
+        importSpoolCleanup.unsubscribe();
+        await deliveryWork.stop();
+        devWatcher?.close();
+        viteHtmlRenderer?.dispose();
+        void viteDevServer?.close().catch(() => undefined);
+        viteHmrServer?.close();
+        hostServiceCleanup.disposeAll();
+        hostServiceCleanup.teardown();
+        await stopMuseMaintenance();
+        await emailChannels.shutdown();
+        await chatChannels.shutdown();
+        // End the avatar worker pool, if a request ever started one, so no
+        // render outlives the HTTP teardown.
+        await agentAvatars.close();
+        // Cancel every live setup-token login session and AWAIT the cancellation,
+        // so each direct child stops and the server releases each lease before the
+        // caller stops the database and the provider. A lease release that
+        // fails stays a durable record for the startup reaper.
+        await setupTokenLoginService?.shutdown();
+      });
+    });
     return appServicesShutdown;
   };
   app.locals.paperclipShutdown = shutdownAppServices;
@@ -1748,6 +1425,5 @@ export async function createApp(
   });
 
   trackIdleRequestHandlers(app);
-  // Exposed so the standalone tool-health sweep (index.ts) can probe plugin-backed connection health.
-  return { app, pluginToolDispatcher: toolDispatcher };
+  return app;
 }

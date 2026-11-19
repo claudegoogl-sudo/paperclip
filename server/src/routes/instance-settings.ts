@@ -1,3 +1,5 @@
+import type { IdleDeadlineOwners } from "../services/idle-deadline-types.js";
+import { verifiedIdleCapabilities } from "../middleware/cloud-control.js";
 import { trackIdleWork } from "../services/task-admission.js";
 import { Router, type Request } from "express";
 import { companies, type Db } from "@paperclipai/db";
@@ -7,7 +9,8 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { badRequest, conflict, forbidden } from "../errors.js";
+import { conflict, forbidden } from "../errors.js";
+import { assertAgentsReadyForEnvironmentChange } from "../services/plugin-environment-driver.js";
 import {
   cloudTenantPrimaryCompanyId,
   getCloudStackContext,
@@ -29,7 +32,7 @@ import {
 } from "../services/index.js";
 import { environmentService } from "../services/environments.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
-import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
+import { assertBoard, assertBoardOrgAccess, getActorInfo } from "./authz.js";
 
 function sameJsonValue(a: unknown, b: unknown): boolean {
   if (a === b) return true;
@@ -87,9 +90,7 @@ function publishActivitiesBestEffort(publications: ActivityPublication[], action
 }
 
 function assertCanManageInstanceSettings(req: Request) {
-  if (req.actor.type !== "board") {
-    throw forbidden("Board access required");
-  }
+  assertBoard(req);
   if (req.actor.source === "local_implicit" || req.actor.isInstanceAdmin) {
     return;
   }
@@ -132,115 +133,17 @@ function withTaskDrainTransition<T>(run: () => Promise<T>): Promise<T> {
   return turn;
 }
 
-export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManager, prepareIdleDatabaseBackup?: () => Promise<boolean>) {
+export function instanceSettingsRoutes(
+  db: Db,
+  pluginWorkers?: PluginWorkerManager,
+  prepareIdleDatabaseBackup?: () => Promise<boolean>,
+  deadlineOwners?: IdleDeadlineOwners,
+  prepareIdlePluginLifecycle?: (input: { canRetire: () => boolean }) => Promise<"none" | "present" | "unknown">,
+) {
   const router = Router();
   const svc = instanceSettingsService(db);
   const environments = environmentService(db);
-  const heartbeat = heartbeatService(db);
-
-  // Operator admission hold — admission-only instance gate used by the core
-  // installer to drain running work before a service stop. While held, queued
-  // runs stay queued and running runs finish; the hold self-expires (capped
-  // server-side at now + 60 min). Instance-admin board actors only.
-  async function logAdmissionHoldActivity(req: Request, action: string, details: Record<string, unknown>) {
-    const actor = getActorInfo(req);
-    const companyIds = await svc.listCompanyIds();
-    await Promise.all(
-      companyIds.map((companyId) =>
-        logActivity(db, {
-          companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action,
-          entityType: "instance_admission_hold",
-          entityId: "default",
-          details,
-        }),
-      ),
-    );
-  }
-
-  router.get("/instance/admission-hold", async (req, res) => {
-    assertCanManageInstanceSettings(req);
-    res.json(await heartbeat.getInstanceAdmissionHoldState());
-  });
-
-  router.put("/instance/admission-hold", async (req, res) => {
-    assertCanManageInstanceSettings(req);
-    const body = (req.body ?? {}) as Record<string, unknown>;
-    const holdUntilRaw = body.holdUntil;
-    const holdUntil = typeof holdUntilRaw === "string" ? new Date(holdUntilRaw) : null;
-    if (!holdUntil || Number.isNaN(holdUntil.getTime())) {
-      throw badRequest("holdUntil must be an ISO-8601 timestamp");
-    }
-    if (holdUntil.getTime() <= Date.now()) {
-      throw badRequest("holdUntil must be in the future");
-    }
-    const reason = typeof body.reason === "string" ? body.reason.trim() : "";
-    if (reason.length === 0 || reason.length > 500) {
-      throw badRequest("reason is required (1-500 characters)");
-    }
-    const actor = getActorInfo(req);
-    const state = await heartbeat.setInstanceAdmissionHold({
-      holdUntil,
-      reason,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-    });
-    await logAdmissionHoldActivity(req, "instance.admission_hold.set", {
-      holdUntil: state.holdUntil?.toISOString() ?? null,
-      requestedHoldUntil: holdUntil.toISOString(),
-      reason,
-    });
-    res.json(state);
-  });
-
-  router.delete("/instance/admission-hold", async (req, res) => {
-    assertCanManageInstanceSettings(req);
-    const actor = getActorInfo(req);
-    const before = await heartbeat.getInstanceAdmissionHoldState();
-    const state = await heartbeat.clearInstanceAdmissionHold({ actorType: actor.actorType, actorId: actor.actorId });
-    await logAdmissionHoldActivity(req, "instance.admission_hold.cleared", { wasHeld: before.held });
-    res.json(state);
-  });
-
-  // Operator escape hatch for the instance-wide usage-limit park. Without it a
-  // mis-dated park can only be lifted by editing the DB. POST and DELETE are
-  // aliases; both clear the park, log one activity entry per company with the
-  // actor, and resume queued runs. Instance-admin board actors only.
-  async function clearUsageLimitPark(req: Request, res: import("express").Response) {
-    assertCanManageInstanceSettings(req);
-    const actor = getActorInfo(req);
-    const before = await heartbeat.getUsageLimitParkState();
-    const state = await heartbeat.clearUsageLimitPark({ actorType: actor.actorType });
-    const companyIds = await svc.listCompanyIds();
-    await Promise.all(
-      companyIds.map((companyId) =>
-        logActivity(db, {
-          companyId,
-          actorType: actor.actorType,
-          actorId: actor.actorId,
-          agentId: actor.agentId,
-          runId: actor.runId,
-          agentApiKeyId: actor.agentApiKeyId,
-          action: "instance.usage_limit_park.cleared",
-          entityType: "instance_usage_limit_park",
-          entityId: "default",
-          details: {
-            wasParked: before.parked,
-            previousParkedUntil: before.parkedUntil ? new Date(before.parkedUntil).toISOString() : null,
-            previousReason: before.reason,
-          },
-        }),
-      ),
-    );
-    res.json(state);
-  }
-  router.post("/instance/usage-limit-park", clearUsageLimitPark);
-  router.delete("/instance/usage-limit-park", clearUsageLimitPark);
+  const heartbeat = heartbeatService(db, { pluginWorkerManager: pluginWorkers });
 
   router.get("/instance/settings", async (req, res) => {
     assertBoardOrgAccess(req);
@@ -258,27 +161,15 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
           "instance",
           typeof req.body.defaultEnvironmentId === "string" ? req.body.defaultEnvironmentId : null,
         );
+        const previousId = (await svc.get()).defaultEnvironmentId;
+        const environmentById = async (id: unknown) => typeof id === "string" ? environments.getById(id) : null;
+        await assertAgentsReadyForEnvironmentChange(db, await environmentById(previousId), await environmentById(req.body.defaultEnvironmentId),
+          { inheritsDefault: true });
       }
-      // An explicit tenant write of the instance default reclassifies its
-      // attribution: whatever the default becomes — including a deliberate
-      // re-selection of the managed sandbox row — it is tenant-chosen, so
-      // the reconciliation stamp marker must not survive to let a later
-      // managed-sandbox-only mode-off pass mistake the tenant's choice for a
-      // stamp and revert it. The marker clear and the settings write commit
-      // in ONE transaction, so no partial failure can desync attribution
-      // from the default (neither a stale stamp on a tenant choice, nor a
-      // reconciliation default that lost its marker and can never revert).
-      const writesDefault = Object.prototype.hasOwnProperty.call(req.body, "defaultEnvironmentId");
-      const managedSandbox = writesDefault
-        ? await environments.findManagedSandboxEnvironment(undefined, { includeArchived: true })
-        : null;
-      const updated = await db.transaction(async (tx) => {
-        if (managedSandbox?.metadata?.managedDefaultStamped === true) {
-          const { managedDefaultStamped: _cleared, ...remainingMetadata } = managedSandbox.metadata;
-          await environments.update(managedSandbox.id, { metadata: remainingMetadata }, { db: tx });
-        }
-        return svc.update(req.body, { db: tx });
-      });
+      // An explicit default write is an ordinary set value: boot only fills an
+      // unset, local or dangling default (`fillUnsetInstanceDefault`), and the
+      // lock it takes on this row means it never overwrites a concurrent write.
+      const updated = await svc.update(req.body);
       const actor = getActorInfo(req);
       const companyIds = await svc.listCompanyIds();
       await Promise.all(
@@ -413,11 +304,22 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
 
   router.get("/instance/task-drain", async (req, res) => {
     assertBoardOrgAccess(req);
+    if (req.query.upgradeReadiness === "1") {
+      // This covers all companies and must not expose instance-wide work to a member.
+      assertCanManageInstanceSettings(req);
+      res.json({ ...heartbeat.getTaskDrainStatus(), upgradeReadiness: await heartbeat.readUpgradeReadiness() });
+      return;
+    }
     if (req.query.idleSleepSafety === "1") {
       // The report covers every company in this process. Ordinary company
       // members may read process counters, but not instance-wide work state.
       assertCanManageInstanceSettings(req);
-      const scheduledIssueMonitors = req.query.scheduledWake === "2";
+      const domainDeadlines = req.query.scheduledWake === "domain-deadlines-v1";
+      const capabilities = verifiedIdleCapabilities(req);
+      if (domainDeadlines && capabilities?.deadlineCatalog !== "domain_deadlines_v1") {
+        throw forbidden("Domain deadline reports require the signed Cloud deadline catalog");
+      }
+      const scheduledIssueMonitors = req.query.scheduledWake === "2" || domainDeadlines;
       const scheduledRoutines = req.query.scheduledWake === "1" || scheduledIssueMonitors;
       if (scheduledRoutines && req.actor.source !== "cloud_control") {
         throw forbidden("Scheduled wake reports require Cloud control authority");
@@ -432,8 +334,16 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
       }
       const idleSleepSafety = await readIdleSleepSafety(db, () => heartbeat.getTaskDrainStatus(), Date.now,
         typeof req.query.ownerId === "string" ? req.query.ownerId : undefined,
-        () => readIdleLocalWork({ backupCheckpoint: Boolean(prepareIdleDatabaseBackup) }),
-        pluginWorkers?.inspectIdleSleep?.bind(pluginWorkers), prepareIdleDatabaseBackup, scheduledRoutines, scheduledIssueMonitors);
+        diagnostic => readIdleLocalWork({ backupCheckpoint: Boolean(prepareIdleDatabaseBackup), diagnostic,
+          deadlineCapability: domainDeadlines ? capabilities : undefined }),
+        pluginWorkers?.inspectIdleSleep?.bind(pluginWorkers), prepareIdleDatabaseBackup, scheduledRoutines, scheduledIssueMonitors,
+        { deadlineOwners, incomingWake: capabilities, deadlineCapability: domainDeadlines ? capabilities : undefined,
+          prepareLocalWork: async ({ canPrepare }) => {
+            const result = await heartbeat.prepareIdleWarmNativeSessionsForSleep({ canRetire: canPrepare });
+            if (result.busy || result.failed) return "present";
+            return prepareIdlePluginLifecycle ? prepareIdlePluginLifecycle({ canRetire: canPrepare }) : "none";
+          },
+          ...(req.query.idleSleepDiagnostics === "1" ? { collectDiagnostics: true } : {}) });
       res.json({ ...heartbeat.getTaskDrainStatus(), idleSleepSafety });
       return;
     }
@@ -556,6 +466,11 @@ export function instanceSettingsRoutes(db: Db, pluginWorkers?: PluginWorkerManag
       publishActivitiesBestEffort(postCommitActivityPublications, "instance.task_drain.stopped");
       return wasActive;
     });
+    if (wasActive) {
+      void heartbeat.resumeQueuedRunsAfterDrain().catch(err => {
+        logger.error({ err }, "failed to resume queued work after task drain; durable work remains queued");
+      });
+    }
     res.json({ wasActive });
   });
 

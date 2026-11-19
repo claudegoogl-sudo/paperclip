@@ -145,9 +145,6 @@ async function runReleaseDrain(
     return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
   }
 
-  const drainIssueDeferredWakes = async (
-    drainIssue: IssueSnapshot,
-  ): Promise<ReleaseTransactionResult | null> => {
   // Each `continue` path either excludes a pending handoff receipt from
   // this drain or leaves the wake row off the
   // `deferred_issue_execution` status, so the next queue read cannot
@@ -159,7 +156,7 @@ async function runReleaseDrain(
 
   while (true) {
     const candidate = await ports.transaction.findNextDeferredWake({
-      companyId: run.companyId, issueId: drainIssue.id,
+      companyId: run.companyId, issueId: issue.id,
       ...(preservedWakeIds.length ? { excludedWakeIds: preservedWakeIds } : {}),
     });
     if (!candidate) break;
@@ -167,25 +164,30 @@ async function runReleaseDrain(
       throw new WakeQueueApplicationError(
         "deferred_wake_not_advanced",
         "Deferred wake queue read the same wake id twice; the row did not leave the deferred status",
-        { companyId: run.companyId, issueId: drainIssue.id, wakeId: candidate.id },
+        { companyId: run.companyId, issueId: issue.id, wakeId: candidate.id },
       );
     }
     processedWakeIds.add(candidate.id);
+
+    if (locked.handoffAssigneeAgentId && candidate.agentId !== locked.handoffAssigneeAgentId) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
 
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
     // comment ID so coalesced human or unrelated input is never hidden.
     if (
-      drainIssue.status === "done" &&
-      run.agentId === drainIssue.assigneeAgentId &&
-      run.contextSnapshot?.issueId === drainIssue.id &&
+      issue.status === "done" &&
+      run.agentId === issue.assigneeAgentId &&
+      run.contextSnapshot?.issueId === issue.id &&
       !candidate.authorizedFailedChatRetry &&
       !candidate.preservesIndependentContinuation &&
       candidate.payload.mutation !== "interaction" &&
       (candidate.wakeReason ?? candidate.reason) === "issue_comment_mentioned" &&
       await ports.transaction.isCompletedDelegationMention({
         companyId: run.companyId,
-        issueId: drainIssue.id,
+        issueId: issue.id,
         finishingRunId: run.id,
         wakeAgentId: candidate.agentId,
         commentIds: [...new Set([...candidate.queuedCommentIds, ...candidate.deferredCommentIds])],
@@ -194,6 +196,7 @@ async function runReleaseDrain(
       await ports.transaction.cancelDeferredWake({
         companyId: run.companyId,
         wakeId: candidate.id,
+        agentId: candidate.agentId,
         reason: "Delegation closing note refers to completed child work",
         now: input.now,
       });
@@ -203,8 +206,8 @@ async function runReleaseDrain(
     const ordinaryTaskComment = !candidate.authorizedFailedChatRetry && candidate.payload.mutation !== "interaction" &&
       !candidate.preservesIndependentContinuation && candidate.queuedCommentIds.length > 0 &&
       ["issue_commented", "issue_reopened_via_comment"].includes(candidate.wakeReason ?? candidate.reason ?? "");
-    if (ordinaryTaskComment && candidate.agentId !== drainIssue.assigneeAgentId) {
-      if (input.resumeStrandedQueue || run.agentId !== drainIssue.assigneeAgentId) {
+    if (ordinaryTaskComment && candidate.agentId !== issue.assigneeAgentId) {
+      if (input.resumeStrandedQueue || run.agentId !== issue.assigneeAgentId) {
         // The old owner can release before assignment admission adopts these
         // exact IDs. Leave its receipt intact, skip it for this drain, and let
         // a current-assignee wake behind it proceed.
@@ -215,6 +218,7 @@ async function runReleaseDrain(
         await ports.transaction.cancelDeferredWake({
           companyId: run.companyId,
           wakeId: candidate.id,
+          agentId: candidate.agentId,
           reason: "Deferred task messages now belong to the current assignee",
           now: input.now,
         });
@@ -222,14 +226,15 @@ async function runReleaseDrain(
       continue;
     }
 
-    let liveness = { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
+    let liveness: { liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean; deliveredCommentIds?: string[] } =
+      { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
     if (
       !candidate.authorizedFailedChatRetry &&
       candidate.queuedCommentIds.length > 0
     ) {
       liveness = await ports.transaction.getQueuedCommentLiveness({
         companyId: run.companyId,
-        issueId: drainIssue.id,
+        issueId: issue.id,
         wakeAgentId: candidate.agentId,
         finishingRunId: run.id,
         finishingRunAgentId: run.agentId,
@@ -242,7 +247,7 @@ async function runReleaseDrain(
     const deferredAgent = await ports.transaction.findInvokableAgent({ companyId: run.companyId, agentId: candidate.agentId });
     const pauseHold = await ports.transaction.getPauseHoldFacts({
       companyId: run.companyId,
-      issueId: drainIssue.id,
+      issueId: issue.id,
       wakeAgentId: candidate.agentId,
       deferredContextSeed: candidate.deferredContextSeed,
       requestedByActorType: candidate.requestedByActorType,
@@ -263,9 +268,12 @@ async function runReleaseDrain(
       await ports.transaction.cancelDeferredWake({
         companyId: run.companyId,
         wakeId: candidate.id,
+        agentId: candidate.agentId,
         reason: commentAction.selfAuthored
           ? "Deferred wake contained only comments authored by the finishing run"
-          : "Queued messages were discarded before promotion",
+          : liveness.deliveredCommentIds?.length
+            ? "Queued messages were already delivered to a completed run"
+            : "Queued messages were discarded before promotion",
         now: input.now,
       });
       continue;
@@ -291,7 +299,7 @@ async function runReleaseDrain(
     });
 
     if (wakeOutcome.kind === "fail_not_invokable") {
-      await ports.transaction.failDeferredWake({ companyId: run.companyId, wakeId: workingCandidate.id, now: input.now });
+      await ports.transaction.failDeferredWake({ companyId: run.companyId, wakeId: workingCandidate.id, agentId: workingCandidate.agentId, now: input.now });
       continue;
     }
 
@@ -303,7 +311,7 @@ async function runReleaseDrain(
     if (wakeOutcome.kind === "cancel_pause_hold") {
       await ports.transaction.cancelDeferredWake({
         companyId: run.companyId,
-        wakeId: workingCandidate.id,
+        wakeId: workingCandidate.id, agentId: workingCandidate.agentId,
         reason: "Deferred wake suppressed by active subtree pause hold",
         now: input.now,
       });
@@ -313,24 +321,15 @@ async function runReleaseDrain(
     // Unreachable: decideWakeOutcome only returns "promote" when agentFound and invokable are both true.
     if (!deferredAgent) throw new Error("wake-queue: promoted a deferred wake with no invokable agent");
 
-    const promoted = await promoteDeferredWake(ports, run, drainIssue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input);
+    const promoted = await promoteDeferredWake(ports, run, issue, workingCandidate, deferredAgent, pauseHold, postCommitEffects, input);
     if (!promoted) continue;
     return promoted;
   }
 
-  return null;
-  };
+  // A stopped run never plans recovery for itself, including after a handoff.
+  if (locked.handoffAssigneeAgentId) return { outcome: { kind: "released" }, postCommitEffects };
 
-  const primaryResult = await drainIssueDeferredWakes(issue);
-  // Fork sibling promotion: every issue whose execution lock this run held was
-  // cleared in this same transaction, so drain their deferred wakes here too —
-  // at most one promotion per issue, exactly like the primary. Their effects
-  // land in the same postCommitEffects array the primary result returns.
-  for (const sibling of locked.siblingIssues ?? []) {
-    await drainIssueDeferredWakes(sibling);
-  }
-
-  return primaryResult ?? runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
+  return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 
 /**
@@ -389,7 +388,7 @@ async function promoteDeferredWake(
   ) {
     await ports.transaction.cancelDeferredWake({
       companyId: run.companyId,
-      wakeId: workingCandidate.id,
+      wakeId: workingCandidate.id, agentId: workingCandidate.agentId,
       reason: "Deferred execution wake no longer applies to a terminal task",
       now: input.now,
     });
@@ -882,6 +881,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       const run = await deps.writer.coalesceIntoActiveExecutionRun(scope, {
         companyId: input.companyId,
         activeExecutionRunId: target.id,
+        activeExecutionRunStatus: target.status,
         mergedContextSnapshot,
         ...(input.durableReceipt
           ? { durableReceipt: input.durableReceipt }
@@ -894,12 +894,9 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         requestedByActorId: input.requestedByActorId,
         idempotencyKey: input.idempotencyKey,
       });
-      return { kind: "coalesced", run };
+      if (run) return { kind: "coalesced", run };
     }
 
-    // decision.kind === "defer": only now does the module read for an
-    // existing deferred wake, so the coalesce path (the common path) never
-    // pays for this query.
     const existingDeferred =
       (interactionReceipt || input.allowRunCoalescing === false)
         ? null
@@ -938,7 +935,8 @@ export function createAdmitWakeBehindIssueExecution(deps: {
         mergedPayload,
         nextCoalescedCount: (existingDeferred.coalescedCount ?? 0) + 1,
         ...(manualUserWakeActorId ? { manualUserWakeActorId } : {}),
-        ...(input.durableReceipt
+        ...(input.durableReceipt || (input.requestedByActorType === "user" &&
+            readNonEmptyString(input.requestedByActorId) && readNonEmptyString(input.wakeCommentId))
           ? {
               coalescedReceipt: {
                 ...input.durableReceipt,
@@ -948,6 +946,7 @@ export function createAdmitWakeBehindIssueExecution(deps: {
                 reason: input.reason ?? null,
                 payload: {
                   ...(input.payload ?? {}),
+                  issueId: input.issueId,
                   coalescedIntoWakeupRequestId: existingDeferred.id,
                 },
                 requestedByActorType: input.requestedByActorType,

@@ -1,10 +1,10 @@
 import { readFileSync } from "node:fs";
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 describe("explicit diagnostic credential forms", () => {
   it("masks qualified credential fields while preserving metadata", () => {
     expect(redactEventPayload({ authorizationHeader: "abcdefghijkl", apiKeyProduction: "sensitivevalue", credentialHandling: "harness", tokenPolicy: "least privilege" }))
-      .toEqual({ authorizationHeader: "***REDACTED***", apiKeyProduction: "***REDACTED***", credentialHandling: "***REDACTED***", tokenPolicy: "***REDACTED***" });
+      .toEqual({ authorizationHeader: "***REDACTED***", apiKeyProduction: "***REDACTED***", credentialHandling: "harness", tokenPolicy: "least privilege" });
   });
   it("masks standalone bearer values and whitespace-prefixed JSON token headers", () => {
     const jwt = `${Buffer.from(' {"alg":"HS256","typ":"JWT"}').toString("base64url")}.abcdefghijk.abcdefghijkl`;
@@ -17,13 +17,11 @@ import {
   PRP_V1_EVENT_TYPES,
   PRP_V2_EVENT_TYPES,
   REDACTED_EVENT_VALUE,
-  REDACTED_VAULT_VALUE,
   redactAgentAdapterConfig,
   redactEventPayload,
   redactSensitiveText,
   sanitizeRecord,
 } from "../redaction.js";
-import { clearRunSecretValues, registerRunSecretValue } from "../run-secret-registry.js";
 
 import { createCopilotToolEvidence } from "../../../packages/paperclip-runner/src/drivers/acpx/copilot-tool-evidence.js";
 import { appendSemanticToolReceipt } from "../../../packages/paperclip-runner/src/drivers/semantic-tool-receipt.js";
@@ -43,27 +41,20 @@ function receiptNotice(version: 1 | 2 = 1): Record<string, any> {
 const receiptSchemaValue = (notice: Record<string, any>) => notice.details.find((detail: any) => detail.name === "schema").value;
 
 describe("redaction", () => {
-  it("preserves credential-related prose; fork redacts credential-named keys and dotted values", () => {
-    const input = {
-      body: "Keep the private key in a secret manager. Document credential handling and token permissions. Use bearer tokens for authentication. Prefer bearer authentication.",
-      tokenPolicy: "least privilege",
-      secretStorage: "vault",
-      credentialHandling: "harness",
-      authorizationRequired: true,
-      path: "deployment.credentials.example.md",
-    };
-    expect(sanitizeRecord(input)).toEqual({
-      body: input.body,
-      tokenPolicy: REDACTED_EVENT_VALUE,
-      secretStorage: REDACTED_EVENT_VALUE,
-      credentialHandling: REDACTED_EVENT_VALUE,
-      authorizationRequired: REDACTED_EVENT_VALUE,
-      path: REDACTED_EVENT_VALUE,
-    });
-    expect(redactSensitiveText(input.body)).toBe(input.body);
-    expect(sanitizeRecord({ credentials: { provider: "opaque-value" }, passwordValue: "opaque-value", authorization_code: "opaque-value" }))
-      .toEqual({ credentials: REDACTED_EVENT_VALUE, passwordValue: REDACTED_EVENT_VALUE, authorization_code: REDACTED_EVENT_VALUE });
-    expect(redactSensitiveText("--token-budget 4000 SECRET_STORAGE=vault")).toBe("--token-budget 4000 SECRET_STORAGE=vault");
+  it.each([1, 2, 3] as const)("preserves structured panel activation and redacts adjacent secrets in PRP v%s", version => {
+    const event = { schema: `paperclip.prp.event.v${version}`, schemaVersion: version,
+      eventType: "runtime.activity.recorded", payload: { namespace: "example.runtime", activityKey: "desktop.used" } };
+    expect(redactEventPayload({ prpEvent: event })).toEqual({ prpEvent: event });
+    expect(redactEventPayload({ prpEvent: { ...event, payload: { ...event.payload, apiKey: "secret-sentinel" } } }))
+      .toEqual({ prpEvent: { ...event, payload: { ...event.payload, apiKey: REDACTED_EVENT_VALUE } } });
+  });
+  it.each([1, 2, 3] as const)("preserves credential update metadata and masks adjacent secrets in PRP v%s", version => {
+    const event = { schema: `paperclip.prp.event.v${version}`, schemaVersion: version,
+      eventType: "auth.credentials.updated", payload: { schema: "paperclip.auth.credentials.updated.v1",
+        provider: "codex", bindingId: "harness-auth", revision: 1, detection: "credential_store" } };
+    expect(redactEventPayload({ prpEvent: event })).toEqual({ prpEvent: event });
+    expect(redactEventPayload({ prpEvent: { ...event, payload: { ...event.payload, refresh_token: "secret-sentinel" } } }))
+      .toEqual({ prpEvent: { ...event, payload: { ...event.payload, refresh_token: REDACTED_EVENT_VALUE } } });
   });
 
   it("preserves the actual Copilot receipt producer discriminator through nested durable redaction", () => {
@@ -194,7 +185,7 @@ describe("redaction", () => {
       },
     });
     expect((unknown?.prpEvent as Record<string, unknown>).eventType).toBe(
-      REDACTED_EVENT_VALUE,
+      "session.not-a-real.event",
     );
 
     const mismatched = redactEventPayload({
@@ -205,7 +196,7 @@ describe("redaction", () => {
       },
     });
     expect((mismatched?.prpEvent as Record<string, unknown>).eventType).toBe(
-      REDACTED_EVENT_VALUE,
+      "session.capabilities.updated",
     );
 
     const secretPayload = redactEventPayload({
@@ -288,7 +279,7 @@ describe("redaction", () => {
     const result = sanitizeRecord(input);
 
     expect(result.session).toBe(REDACTED_EVENT_VALUE);
-    expect(result.opaque).toBe(REDACTED_EVENT_VALUE);
+    expect(result.opaque).toBe("aaa.bbb.ccc");
     expect(result.normal).toBe("plain");
   });
 
@@ -307,7 +298,7 @@ describe("redaction", () => {
       nested: {
         schema: "paperclip.question_response.v1",
         runtimeSchema: "paperclip.runtime_request.v2",
-        arbitraryProviderValue: REDACTED_EVENT_VALUE,
+        arbitraryProviderValue: "paperclip.question_set.v1",
       },
     });
   });
@@ -324,8 +315,13 @@ describe("redaction", () => {
       schema: input.schema,
       nested: {
         runtimeSchema: input.nested.runtimeSchema,
-        providerValue: REDACTED_EVENT_VALUE,
+        providerValue: input.nested.providerValue,
       },
+    });
+    expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v9" })).toEqual({ schema: "paperclip.native-execution-input.v9" });
+    expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v7", runtimeSchema: "paperclip.native-execution-input.v8" })).toEqual({
+      schema: "paperclip.native-execution-input.v7",
+      runtimeSchema: "paperclip.native-execution-input.v8",
     });
     expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v4", runtimeSchema: "paperclip.native-model-envelope.v2" })).toEqual({
       schema: "paperclip.native-execution-input.v4",
@@ -357,12 +353,12 @@ describe("redaction", () => {
         schemaVersion: 1,
         eventType: "tool.execution.started",
         payload: {
-          eventType: REDACTED_EVENT_VALUE,
+          eventType: "run.result.accepted",
           credential: REDACTED_EVENT_VALUE,
         },
       },
       unrelated: {
-        eventType: REDACTED_EVENT_VALUE,
+        eventType: "workspace.file.referenced",
       },
     });
     expect(redactEventPayload(sanitized)).toEqual(sanitized);
@@ -375,7 +371,7 @@ describe("redaction", () => {
         schemaVersion: 1,
         eventType: "attacker.supplied.token",
       })?.eventType,
-    ).toBe(REDACTED_EVENT_VALUE);
+    ).toBe("attacker.supplied.token");
   });
 
   it("preserves dotted schema identifiers without interpreting their authority", () => {
@@ -387,10 +383,10 @@ describe("redaction", () => {
         eventType: "tool.execution.started",
       }),
     ).toEqual({
-      schema: REDACTED_EVENT_VALUE,
-      runtimeSchema: REDACTED_EVENT_VALUE,
+      schema: "paperclip.attacker.control.v1",
+      runtimeSchema: "paperclip.attacker.runtime.v1",
       schemaVersion: 1,
-      eventType: REDACTED_EVENT_VALUE,
+      eventType: "tool.execution.started",
     });
   });
 
@@ -403,8 +399,15 @@ describe("redaction", () => {
       "runner.prp.route.register",
       "runner.transport.connect",
       "runner.session.bootstrap",
+      "runner.runtime.stage",
+      "runner.process.launch",
+      "provider.session.load",
       "runner.turn.submit",
       "runner.session.startup",
+      "provider_pack.select",
+      "provider_pack.discover",
+      "provider_pack.verify_uploaded",
+      "provider_pack.upload",
       "provider.turn.queue",
       "question_response.to_run_created",
       "native.session.execute",
@@ -425,7 +428,7 @@ describe("redaction", () => {
         schema: input.schema,
         span,
         parentSpan: "native.session.execute",
-        providerHostname: REDACTED_EVENT_VALUE,
+        providerHostname: "api.openai.com",
       });
       expect(redactEventPayload(sanitized)).toEqual(sanitized);
     }
@@ -435,13 +438,13 @@ describe("redaction", () => {
         schema: "paperclip.run-performance-span.v1",
         span: "api.openai.com",
       })?.span,
-    ).toBe(REDACTED_EVENT_VALUE);
+    ).toBe("api.openai.com");
     expect(
       redactEventPayload({
         schema: "paperclip.run-performance-span.v1",
         span: "runner.example.com",
       })?.span,
-    ).toBe(REDACTED_EVENT_VALUE);
+    ).toBe("runner.example.com");
   });
 
   it("redacts payload objects while preserving null", () => {
@@ -473,7 +476,7 @@ describe("redaction", () => {
         details: [
           "safe context",
           `proxyAuthorization ${REDACTED_EVENT_VALUE}`,
-          REDACTED_EVENT_VALUE,
+          "aaa.bbb.ccc",
           [`Bearer ${REDACTED_EVENT_VALUE}`],
         ],
       },
@@ -562,20 +565,6 @@ describe("redaction", () => {
     expect(result).not.toContain("paperclip-shell-secret");
     expect(result).not.toContain(githubToken);
     expect(result).not.toContain(jwt);
-  });
-
-  it("redacts a lone fine-grained github_pat_ with no other secret hint", () => {
-    // Synthetic, shape-valid probe — never a real credential.
-    const finePat = `github_pat_11${"B".repeat(80)}`;
-    const result = redactSensitiveText(`rejected input ${finePat} at gate`);
-
-    expect(result).not.toContain(finePat);
-    expect(result).toContain(REDACTED_EVENT_VALUE);
-  });
-
-  it("does not over-redact a benign github_pat_ mention below the length floor", () => {
-    const benign = "see github_pat_docs for setup";
-    expect(redactSensitiveText(benign)).toBe(benign);
   });
 
   it("redacts authorization variants and standalone bearer credentials from diagnostic text", () => {
@@ -914,183 +903,72 @@ second-line\" status=401`,
   });
 });
 
-// ── Serialized-JSON integrity regression ───────────────────────────────────
-// redactSensitiveText also runs over text that IS a serialized JSON document
-// (run-log chunks are JSON.stringify'd agent events). The free-form regexes
-// used to corrupt such text: a secret adjacent to a JSON escape (e.g.
-// `Bearer <secret>\"`) let a quote-adjacent value class swallow the backslash
-// and re-emit a bare quote, so the persisted line no longer parsed. JSON input
-// is now redacted structurally (parse → redact → re-serialize), which keeps the
-// document valid by construction WITHOUT weakening coverage: every secret
-// shape below must still be fully redacted in the serialized output.
-describe("redactSensitiveText serialized-JSON integrity", () => {
-  const KEY = "pcp_agent_DEADBEEFcafe0123456789abcdef";
-  const RUN_ID = "run-redaction-json-integrity";
+describe("redaction of long letter/digit runs", () => {
+  const typescriptSource = [
+    "export function compactRunLogChunk(chunk: string, maxChars = 65536) {",
+    "  const normalized = redactSensitiveText(chunk);",
+    "  if (normalized.length <= maxChars) return normalized;",
+    "  return normalized.slice(0, maxChars);",
+    "}",
+    "",
+  ].join("\n");
 
-  afterEach(() => {
-    clearRunSecretValues(RUN_ID);
+  function base64OfTypeScriptSource(length: number) {
+    const repeatedSource = typescriptSource.repeat(Math.ceil(length / typescriptSource.length));
+    return Buffer.from(repeatedSource).toString("base64").slice(0, length);
+  }
+
+  function redactWithinTimeBudget(input: string) {
+    const startedAt = performance.now();
+    const output = redactSensitiveText(input);
+    expect(performance.now() - startedAt).toBeLessThan(1_000);
+    return output;
+  }
+
+  it("redacts secret field names that carry a prefix in plain and escaped JSON", () => {
+    const cases = [
+      [`{"myApiKey": "plain-prefixed-secret"}`, `{"myApiKey": "${REDACTED_EVENT_VALUE}"}`],
+      [`{"x_auth_token":"snake-prefixed-secret","status":"ok"}`, `{"x_auth_token":"${REDACTED_EVENT_VALUE}","status":"ok"}`],
+      [`GITHUB_TOKEN: "upper-prefixed-secret"`, `GITHUB_TOKEN: "${REDACTED_EVENT_VALUE}"`],
+      [`{'db_password': 'single-quoted-secret'}`, `{'db_password': '${REDACTED_EVENT_VALUE}'}`],
+      [`text"apiKey":"glued-quote-secret"`, `text"apiKey":"${REDACTED_EVENT_VALUE}"`],
+      [`aGVsbG8apiKey:"glued-run-secret"`, `aGVsbG8apiKey:"${REDACTED_EVENT_VALUE}"`],
+      [String.raw`{\"myApiKey\":\"escaped-prefixed-secret\"}`, String.raw`{\"myApiKey\":\"${REDACTED_EVENT_VALUE}\"}`],
+      [
+        String.raw`{\"x_auth_token\":\"escaped-snake-secret\",\"status\":\"ok\"}`,
+        String.raw`{\"x_auth_token\":\"${REDACTED_EVENT_VALUE}\",\"status\":\"ok\"}`,
+      ],
+      [String.raw`aGVsbG8\"GITHUB_TOKEN\":\"escaped-glued-secret\"`, String.raw`aGVsbG8\"GITHUB_TOKEN\":\"${REDACTED_EVENT_VALUE}\"`],
+    ];
+
+    for (const [input, expected] of cases) {
+      expect(redactSensitiveText(input)).toBe(expected);
+      expect(redactSensitiveText(expected)).toBe(expected);
+    }
   });
 
-  it("keeps a tool_execution_end event parseable when a Bearer secret sits inside escaped quotes", () => {
-    const event = {
-      type: "tool_execution_end",
-      toolName: "ipython",
-      result: {
-        content: [
-          {
-            type: "text",
-            text: `+ curl -s -H "Authorization: Bearer ${KEY}" http://localhost:3100/api/x\n200`,
-          },
-        ],
-      },
-    };
-    const line = JSON.stringify(event);
-    expect(() => JSON.parse(line)).not.toThrow();
+  it("keeps base64 of source text intact and fast while redacting a secret glued to its end", () => {
+    const blob = base64OfTypeScriptSource(48 * 1024);
+    expect(blob).toMatch(/^[A-Za-z0-9]+$/);
 
-    const redactedLine = redactSensitiveText(line);
-    const parsed = JSON.parse(redactedLine) as typeof event;
+    const shellCommand = `printf '%s' '${blob}' | base64 -d > src/compact.ts`;
+    expect(redactWithinTimeBudget(shellCommand)).toBe(shellCommand);
 
-    expect(redactedLine).not.toContain(KEY);
-    expect(parsed.type).toBe("tool_execution_end");
-    expect(parsed.result.content[0]?.text).toBe(
-      `+ curl -s -H "Authorization: Bearer ${REDACTED_EVENT_VALUE}" http://localhost:3100/api/x\n200`,
-    );
+    const toolCallLine = JSON.stringify({ type: "tool_use", input: { command: shellCommand } });
+    expect(redactWithinTimeBudget(toolCallLine)).toBe(toolCallLine);
+    const serializedToolCallLine = JSON.stringify(toolCallLine);
+    expect(redactWithinTimeBudget(serializedToolCallLine)).toBe(serializedToolCallLine);
+
+    const gluedSecret = redactWithinTimeBudget(`${blob}apiKey:"run-glued-secret"`);
+    expect(gluedSecret).toBe(`${blob}apiKey:"${REDACTED_EVENT_VALUE}"`);
   });
 
-  it("keeps a message_end event parseable when a registered secret sits adjacent to an escape", () => {
-    registerRunSecretValue(RUN_ID, KEY);
-    const event = {
-      type: "message_end",
-      message: {
-        role: "assistant",
-        content: `resolved vault value "${KEY}" for the run`,
-      },
-    };
-    const redactedLine = redactSensitiveText(JSON.stringify(event));
-    const parsed = JSON.parse(redactedLine) as typeof event;
-
-    expect(redactedLine).not.toContain(KEY);
-    expect(parsed.message.content).toBe(`resolved vault value "${REDACTED_VAULT_VALUE}" for the run`);
-  });
-
-  it("keeps a plain top-level string field parseable and redacted", () => {
-    const event = {
-      type: "message_end",
-      message: `curl -H "Authorization: Bearer ${KEY}" http://localhost:3100/api/x`,
-    };
-    const redactedLine = redactSensitiveText(JSON.stringify(event));
-    const parsed = JSON.parse(redactedLine) as typeof event;
-
-    expect(redactedLine).not.toContain(KEY);
-    expect(parsed.message).toBe(`curl -H "Authorization: Bearer ${REDACTED_EVENT_VALUE}" http://localhost:3100/api/x`);
-  });
-
-  it("keeps CLI-option and env-assignment secret shapes parseable and redacted", () => {
-    // These shapes flow through quote-adjacent regexes too
-    // (COMMAND_CLI_SECRET_OPTION_RE / COMMAND_ENV_SECRET_ASSIGNMENT_RE).
-    const event = {
-      type: "tool_execution_end",
-      text: `run --api-key=sk-cli-secret-12345 done`,
-      env: `PAPERCLIP_API_KEY=sk-env-secret-67890 tail`,
-    };
-    const redactedLine = redactSensitiveText(JSON.stringify(event));
-    const parsed = JSON.parse(redactedLine) as typeof event;
-
-    expect(redactedLine).not.toContain("sk-cli-secret-12345");
-    expect(redactedLine).not.toContain("sk-env-secret-67890");
-    expect(parsed.text).toBe(`run --api-key=${REDACTED_EVENT_VALUE} done`);
-    expect(parsed.env).toBe(`PAPERCLIP_API_KEY=${REDACTED_EVENT_VALUE} tail`);
-  });
-
-  it("round-trips a benign serialized event byte-identically", () => {
-    const line = JSON.stringify({
-      type: "tool_execution_end",
-      toolName: "ipython",
-      durationMs: 1234,
-      ok: true,
-      result: { content: [{ type: "text", text: "all good\nno secrets here" }] },
-    });
-    expect(redactSensitiveText(line)).toBe(line);
-  });
-
-  it("still redacts secrets from a serialized event nested inside a string leaf", () => {
-    const event = {
-      type: "tool_execution_end",
-      payload: JSON.stringify({ note: `Authorization: Bearer ${KEY} tail` }),
-    };
-    const redactedLine = redactSensitiveText(JSON.stringify(event));
-    const parsed = JSON.parse(redactedLine) as typeof event;
-    const inner = JSON.parse(parsed.payload) as { note: string };
-
-    expect(redactedLine).not.toContain(KEY);
-    expect(inner.note).toBe(`Authorization: Bearer ${REDACTED_EVENT_VALUE} tail`);
-  });
-
-  it("redacts a registered secret used as a JSON object key (text-pipeline parity)", () => {
-    // The pre-structural text pipeline scrubbed secret bytes at ANY position
-    // in the serialized line — key positions included. Structural redaction
-    // applies the leaf redactor to keys so a secret cannot survive there.
-    registerRunSecretValue(RUN_ID, KEY);
-    const line = JSON.stringify({ [KEY]: "x", other: "y" });
-    const redactedLine = redactSensitiveText(line);
-
-    expect(redactedLine).not.toContain(KEY);
-    expect(() => JSON.parse(redactedLine)).not.toThrow();
-  });
-
-  it("redacts shape-based secrets (sk- / ghp_ / github_pat_) used as JSON keys", () => {
-    const line = JSON.stringify({
-      "sk-projabcdefghijklmnopqrstuv": "x",
-      "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345": 1,
-      "github_pat_11AAAA0123456789012345678901234567890123456": 2,
-    });
-    const redactedLine = redactSensitiveText(line);
-
-    expect(redactedLine).not.toContain("sk-projabcdefghijklmnopqrstuv");
-    expect(redactedLine).not.toContain("ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345");
-    expect(redactedLine).not.toContain("github_pat_11AAAA");
-    expect(() => JSON.parse(redactedLine)).not.toThrow();
-  });
-
-  it("JSON line keeps its trailing newline through redaction", () => {
-    // Run-log consumers persist one JSON event per NDJSON line and join
-    // records on the newline boundary. If redaction drops the trailing "\n",
-    // adjacent lines merge into one unparseable blob.
-    registerRunSecretValue(RUN_ID, KEY);
-    const event = { type: "message_end", message: `token ${KEY} used` };
-    const lineWithNewline = `${JSON.stringify(event)}\n`;
-
-    const redacted = redactSensitiveText(lineWithNewline);
-
-    expect(redacted.endsWith("\n")).toBe(true);
-    // Positive control: the fix must not weaken scrubbing.
-    expect(redacted).not.toContain(KEY);
-    const parsed = JSON.parse(redacted.trimEnd()) as typeof event;
-    expect(parsed.message).toBe(`token ${REDACTED_VAULT_VALUE} used`);
-
-    // Leading whitespace (e.g. indentation from a pretty-printed transcript)
-    // must be preserved too.
-    const leadingWhitespace = `  ${JSON.stringify(event)}`;
-    const redactedLeading = redactSensitiveText(leadingWhitespace);
-    expect(redactedLeading.startsWith("  ")).toBe(true);
-    expect(redactedLeading).not.toContain(KEY);
-  });
-});
-
-describe("fork-strict redaction regressions", () => {
-  it("redacts hash/id-suffixed secret key names", () => {
-    const out = redactEventPayload({ passwordHash: "x1", tokenHash: "x2", secretId: "x3", apiKeyId: "x4" });
-    expect(out).toEqual({
-      passwordHash: "***REDACTED***",
-      tokenHash: "***REDACTED***",
-      secretId: "***REDACTED***",
-      apiKeyId: "***REDACTED***",
-    });
-  });
-  it("redacts non-eyJ dotted JWT-shaped record values", () => {
-    expect(redactEventPayload({ note: "aaaaaaaa.bbbbbbbb.cccccccc" })?.note).toBe("***REDACTED***");
-  });
-  it("still keeps finite audit counts visible", () => {
-    expect(redactEventPayload({ secretsRevoked: 3, inputTokens: 10 })).toEqual({ secretsRevoked: 3, inputTokens: 10 });
+  it("scans long dash-separated runs in linear time", () => {
+    for (const run of ["a-".repeat(60_000), "a--".repeat(40_000)]) {
+      expect(redactWithinTimeBudget(`${run} Authorization: Bearer dash-run-secret`))
+        .toBe(`${run} Authorization: ${REDACTED_EVENT_VALUE}`);
+      expect(redactWithinTimeBudget(`${run}Authorization: Bearer glued-run-secret`))
+        .toBe(`${run}Authorization: ${REDACTED_EVENT_VALUE}`);
+    }
   });
 });

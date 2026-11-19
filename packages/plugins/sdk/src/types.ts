@@ -36,7 +36,6 @@ import type {
   AskUserQuestionsInteraction,
   RequestConfirmationInteraction,
   RequestCheckboxConfirmationInteraction,
-  CreateIssueThreadInteraction,
   CreateIssueThreadInteractionInput,
   PluginIssueOriginKind,
   IssueSurfaceVisibility,
@@ -271,156 +270,10 @@ export interface ToolRunContext {
   /** UUID of the company the run belongs to. */
   companyId: string;
   /**
-   * UUID of the project the run belongs to. Absent when the run is not
-   * project-scoped — the host omits the field rather than substituting a
-   * placeholder, so `undefined` means "unknown", never "any project".
+   * UUID of the project the run belongs to, or an empty string when the run
+   * has no project. Check the value before you use it as a project ID.
    */
-  projectId?: string;
-  /**
-   * Cross-tenant artifact fetch client. The host authorizes on behalf of
-   * the dispatching agent identified by `agentId` + `companyId`, not on
-   * behalf of the plugin worker's tenant. Use this from inside a tool
-   * handler to read attachments uploaded by an agent in another company.
-   *
-   * Injected by the worker RPC host when a tool handler runs; the
-   * wire-format runContext carries identity fields only, so host-side
-   * producers legitimately omit this field.
-   *
-   * @see {@link ToolRunContextArtifactsClient}
-   */
-  artifacts?: ToolRunContextArtifactsClient;
-}
-
-/**
- * Resolved artifact (attachment) bytes returned by
- * {@link ToolRunContextArtifactsClient.fetch}.
- */
-export interface ToolRunContextArtifact {
-  /** Raw attachment bytes. */
-  bytes: Uint8Array;
-  /** Original filename if known, otherwise `"attachment"`. */
-  filename: string;
-  /** MIME content type. */
-  contentType: string;
-  /** Total size in bytes. */
-  byteSize: number;
-}
-
-/**
- * `runCtx.artifacts` — fetch attachment bytes on behalf of the dispatching
- * agent during a tool call.
- *
- * Authorization is performed against the **dispatching agent** (the agent
- * identified by this `ToolRunContext`), not against the plugin worker's own
- * tenant. The attachment is fetchable iff the dispatching agent has read
- * access to the attachment-owning company. This enables a Platform-tenant
- * worker to resolve a DPR-tenant attachment when a DPR agent dispatched the
- * tool call.
- *
- * The host validates the runContext server-side before returning bytes,
- * rate-limits per dispatching agent, and writes a six-field audit log entry
- * on every call (success or deny).
- */
-export interface ToolRunContextArtifactsClient {
-  /**
-   * Fetch attachment bytes by ID.
-   *
-   * Returns `{ bytes, filename, contentType, byteSize }` on success.
-   *
-   * Throws on failure with a typed error code surfaced via JsonRpcCallError:
-   * - `runcontext_invalid` — the runContext was not server-validated or has
-   *   expired. Also surfaces if a worker tries to forge a runId.
-   * - `forbidden` — the dispatching agent does not have read access to the
-   *   attachment-owning company.
-   * - `not_found` — the attachment does not exist OR the dispatching agent
-   *   cannot see it (collapsed to a single error shape to prevent
-   *   enumeration via timing/error-shape oracles).
-   * - `rate_limited` — too many fetches from this dispatching agent (host
-   *   enforces both a global per-agent ceiling and a per-(agent, attachment
-   *   company) sub-bucket).
-   *
-   * @param attachmentId - The attachment UUID to fetch.
-   * @returns Attachment bytes + metadata.
-   */
-  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
-
-  /**
-   * Store inbound bytes as a company-scoped Paperclip asset (the
-   * inverse of {@link fetch}). Returns `{ attachmentId }` — the asset id, which
-   * you pass to `issues.createComment`'s `attachmentIds` to surface the bytes
-   * on a comment.
-   *
-   * Requires the `issue.attachments.create` capability (default-deny; declare
-   * it in the manifest). The host:
-   * - authorizes `companyId` against the dispatching/service scope (rejects
-   *   cross-tenant writes with `forbidden`),
-   * - enforces the human-upload size ceiling and a MIME allowlist (images,
-   *   common documents, audio/voice); disallowed types throw `forbidden`,
-   * - dedupes on `(companyId, sha256)` so retries converge (idempotent).
-   *
-   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
-   * `too_large`, `rate_limited`.
-   *
-   * @param input - target company, filename, MIME type, and raw bytes.
-   * @returns `{ attachmentId }` — the created (or deduped) asset id.
-   */
-  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
-}
-
-/**
- * Input to {@link ToolRunContextArtifactsClient.create}.
- */
-export interface ToolRunContextArtifactCreateInput {
-  /** Target company UUID. Must match the dispatching/service scope. */
-  companyId: string;
-  /** Original filename (used for the stored asset's display name). */
-  filename: string;
-  /** MIME type; must be in the host's plugin-artifact allowlist. */
-  mimeType: string;
-  /** Raw bytes to store. */
-  bytes: Uint8Array;
-}
-
-/**
- * `ctx.artifacts` — worker-level attachment client available on the full
- * {@link PluginContext}, not only inside a tool handler.
- *
- * Same method shape as {@link ToolRunContextArtifactsClient}, but reachable
- * from **service/background** code — a `setup()`-started loop (e.g. a
- * `getUpdates` long-poll), `onWebhook`, `onEvent`, or `runJob` — as well as
- * from tool dispatch. It takes no `runId`: the host backfills the active
- * run-context from the worker→host `paperclipInvocationId`
- * (`serviceScope` / `singleInFlightScope`), exactly as
- * {@link PluginSecretsClient.resolve} already does from these contexts.
- *
- * @see worker-ctx artifacts surface
- * @see messenger inbound media relay (the unblocked consumer)
- */
-export interface PluginArtifactsClient {
-  /**
-   * Store inbound bytes as a company-scoped Paperclip asset, returning
-   * `{ attachmentId }` for use in {@link PluginIssuesClient.createComment}'s
-   * `attachmentIds`. Requires the `issue.attachments.create` capability
-   * (default-deny). Host gates match {@link ToolRunContextArtifactsClient.create}:
-   * company scope (cross-tenant writes throw `forbidden`), MIME allowlist, size
-   * ceiling, and `(companyId, sha256)` dedupe (idempotent). Authorized from
-   * `service`/`background` contexts (Gate 2) as well as tool dispatch.
-   *
-   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
-   * `too_large`, `rate_limited`.
-   */
-  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
-
-  /**
-   * Fetch attachment bytes by ID on behalf of the dispatching run-context.
-   *
-   * Works today from a **tool-dispatch** context. From a `service`/`background`
-   * context the host currently rejects reads with `runcontext_invalid` — reads
-   * are scoped to the dispatching agent; widening this is a separately
-   * security-reviewed host change. This SDK surface is already correct
-   * for both: no further SDK change is needed once that host change lands.
-   */
-  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
+  projectId: string;
 }
 
 /**
@@ -597,17 +450,6 @@ export interface PluginConfigClient {
    * companyId; otherwise callers must pass it explicitly.
    */
   get(companyId?: string): Promise<Record<string, unknown>>;
-  /**
-   * Fork-only background read: the company's effective plugin config
-   * (company config row merged with the tenant `configOverrides` subtree),
-   * for use OUTSIDE any dispatch (e.g. a `setup()`-started loop). The host
-   * fail-closes unless the named company is genuinely provisioned for this
-   * plugin install — it must hold a `plugin_config` row for it, and the
-   * plugin must be installed and enabled for that company. Every denial
-   * collapses to one opaque error, so a worker can only ever read config
-   * for a company that configured THIS plugin.
-   */
-  getForServiceScope(companyId: string): Promise<Record<string, unknown>>;
 }
 
 export interface PluginLocalFolderProblem {
@@ -828,30 +670,6 @@ export interface PluginDatabaseClient {
 }
 
 /**
- * Permitted body shapes for `ctx.http.fetch`. Widened beyond
- * `RequestInit.body` so plugins can pass binary payloads (FormData,
- * Uint8Array, ArrayBuffer, Buffer) end-to-end without manual base64
- * plumbing through the worker→host RPC.
- */
-export type PluginHttpFetchBody =
-  | string
-  | Uint8Array
-  | ArrayBuffer
-  | Buffer
-  | FormData;
-
-/**
- * `RequestInit`-shaped options accepted by `ctx.http.fetch`. Mirrors the
- * fields the SDK forwards over the worker→host RPC, but with a widened
- * `body` type to accept binary/multipart payloads.
- */
-export interface PluginHttpFetchInit {
-  method?: string;
-  headers?: HeadersInit;
-  body?: PluginHttpFetchBody | null;
-}
-
-/**
  * `ctx.http` — make outbound HTTP requests.
  *
  * Requires `http.outbound` capability.
@@ -866,23 +684,11 @@ export interface PluginHttpClient {
    * Plugins may also use standard Node `fetch` or other libraries directly —
    * this client exists for host-managed tracing and audit logging.
    *
-   * The `init.body` field accepts strings as well as binary/multipart
-   * payloads (`Uint8Array`, `ArrayBuffer`, `Buffer`, `FormData`). Binary
-   * bodies travel as base64 over the worker→host RPC and are decoded back
-   * to bytes before they hit the wire, so byte-exact payloads (e.g.
-   * gzip-compressed JSON, gcode uploads) round-trip without corruption.
-   *
-   * When `init.body instanceof FormData` and the caller did not set a
-   * `Content-Type` header, the SDK fills in
-   * `multipart/form-data; boundary=<boundary>` to match what `fetch()`
-   * would emit natively.
-   *
    * @param url - Target URL
-   * @param init - Standard `RequestInit`-shaped options; see
-   *               {@link PluginHttpFetchInit} for the widened `body` type.
+   * @param init - Standard `RequestInit` options
    * @returns The response
    */
-  fetch(url: string, init?: PluginHttpFetchInit): Promise<Response>;
+  fetch(url: string, init?: RequestInit): Promise<Response>;
 }
 
 /**
@@ -894,91 +700,25 @@ export interface PluginHttpClient {
  * company-scoped config. This client resolves a bound ref through the
  * Paperclip secret provider system at execution time.
  *
- * Resolution is scoped to the **dispatching company** of the active tool call:
- * the host re-derives the company from the `runId` you pass (never from the
- * worker) and authorizes the ref against that company's
- * `company_secret_bindings`. Resolution is therefore only possible from inside
- * a tool handler, where `runCtx.runId` is available. Calls without a valid
- * active-dispatch `runId` fail closed.
- *
  * @see PLUGIN_SPEC.md §22 — Secrets
  */
 export interface PluginSecretsClient {
   /**
-   * Resolve a secret reference to its current value, scoped to the dispatching
-   * company of the active tool call.
+   * Resolve a secret reference to its current value.
    *
    * The reference must be the shared `secret_ref` object shape from plugin
-   * config. Legacy string UUID references fail closed. Pass `runCtx.runId`
-   * (via `options.runId`) so the host can authorize resolution against the
-   * dispatching company.
+   * config. Legacy string UUID references fail closed.
    *
    * Secret values are resolved at call time and must never be cached or
    * written to logs, config, or other persistent storage.
    *
-   * Throws a typed error (surfaced via JsonRpcCallError):
-   * - `invalid_ref` — the ref is not a well-formed secret UUID.
-   * - `runcontext_invalid` — no active dispatch for this `runId` (e.g. called
-   *   outside a tool handler, or a forged/expired `runId`).
-   * - `not_found` — the ref is not bound for the dispatching company, does not
-   *   exist, or cannot be resolved (collapsed to one shape to prevent
-   *   cross-company existence enumeration).
-   * - `rate_limited` — too many resolutions from this dispatching agent.
-   *
-   * @param secretRef - The secret reference object from plugin config.
-   * @param options.runId - The `runCtx.runId` of the active tool dispatch,
-   *   when resolving from inside a tool handler.
-   * @returns The resolved secret value.
+   * @param secretRef - The secret reference object from plugin config
+   * @returns The resolved secret value
    */
   resolve(
     secretRef: string | EnvSecretRefBinding,
-    options?: { runId?: string; companyId?: string; configPath?: string },
+    options?: { companyId?: string; configPath?: string },
   ): Promise<string>;
-
-  /**
-   * Fork-only background resolve for a worker-lifetime service context
-   * (a `setup()`-started loop or background dispatch — e.g. the messenger
-   * poll loop's bot token). The company is NEVER supplied by the caller: the
-   * host derives it from the secret binding, refuses ambiguous cross-company
-   * bindings, rate-limits per plugin, and requires the host-minted service
-   * scope, so this only ever resolves a secret the plugin is genuinely bound
-   * to outside any dispatch.
-   *
-   * @param secretRef - The secret reference object from plugin config.
-   * @param options.configPath - Optional config path for binding
-   *   disambiguation, mirroring {@link resolve}.
-   * @returns The resolved secret value.
-   */
-  resolveService(
-    secretRef: string | EnvSecretRefBinding,
-    options?: { configPath?: string },
-  ): Promise<string>;
-
-  /**
-   * Exchange a resolved secret plaintext for an opaque **borrowed handle**
-   * (`vault-handle://<runId>/<128-bit-id>`) — Control 2.
-   *
-   * Return the handle to the agent INSTEAD of the plaintext. The host keeps the
-   * real value in a per-run vault and substitutes it back in only at the
-   * worker-dispatch edge of a downstream tool call, so the transcript and the
-   * persisted call record only ever contain the handle, never the secret. The
-   * value is also registered with the Control-1 value-exact redactor.
-   *
-   * Fail-closed: on any error, do NOT fall back to returning plaintext.
-   *
-   * Throws the same typed errors as {@link resolve} (`runcontext_invalid`,
-   * `rate_limited`, …) when minting is refused.
-   *
-   * @param value - The resolved secret plaintext to borrow.
-   * @param runId - The `runCtx.runId` of the active tool dispatch.
-   * @param secretRef - Optional UUID of the secret being borrowed.
-   *   When given, the host captures the secret's per-company binding egress
-   *   allowlist onto the handle at mint time so downstream egress is gated to
-   *   operator-approved destinations. The allowlist is always derived host-side
-   *   from the binding row — naming the ref never lets the worker set it.
-   * @returns The opaque borrowed handle string.
-   */
-  mintHandle(value: string, runId: string, secretRef?: string): Promise<string>;
 }
 
 /**
@@ -1069,13 +809,6 @@ export interface PluginActivityClient {
  * `plugin.state.read` capability required for `get()`.
  * `plugin.state.write` capability required for `set()` and `delete()`.
  *
- * SECURITY (company scope): `scopeKind: "company"` keys state by a company id.
- * Every company-scoped `get()` / `set()` / `delete()` is reach-checked
- * server-side — the named company must be one the plugin is genuinely
- * provisioned for (installed, enabled, and not company-disabled) — and a
- * missing/empty `scopeId` is rejected rather than served as the unkeyed
- * fallback partition. Calls naming any other company fail closed.
- *
  * @see PLUGIN_SPEC.md §21.3 `plugin_state`
  */
 export interface PluginStateClient {
@@ -1144,6 +877,9 @@ export interface PluginEntitiesClient {
  * @see PLUGIN_SPEC.md §7 — Project Workspaces
  */
 export interface PluginProjectsClient {
+  /** Transient GitHub credential for a stored repository in the current host-issued
+   * lifecycle/workspace invocation. Requires projects.git-credentials. Never persist or log. */
+  resolveGitCredential(projectId: string, workspaceId: string, companyId: string): Promise<string | null>;
   /** Trusted worker access to this plugin’s native project credentials.
    * Requires projects.instance-secrets; never expose via UI/data handlers. */
   getInstanceSecrets(projectId: string, companyId: string): Promise<Record<string, string>>;
@@ -1373,6 +1109,13 @@ export interface PluginSpan {
  * active host trace context.
  */
 export interface PluginTracer {
+  /** Invocation-wide monotonic clock anchored to epoch milliseconds. */
+  now?(): number;
+  isRecording?(): boolean;
+  /** Completed bounded timing receipt; the host validates times and parentage. */
+  recordSpan?(span: import("./protocol.js").PluginSpanRecord): void;
+  /** Invocation-scoped nesting; absent on older hosts. No additional IPC per child. */
+  withSpan?<T>(name: string, work: () => T | Promise<T>, attributes?: Record<string, string | number | boolean>): Promise<T>;
   /** Start one span. `options.attributes` seeds the span attributes. */
   startSpan(
     name: string,
@@ -1575,38 +1318,6 @@ export interface PluginIssueWakeupResult {
   runId: string | null;
 }
 
-/** Hard caps for `issues.listWakeupRequests`. */
-export const PLUGIN_WAKEUP_REQUESTS_MAX_ISSUE_IDS = 200;
-export const PLUGIN_WAKEUP_REQUESTS_MAX_ROWS = 1000;
-export const PLUGIN_WAKEUP_REQUESTS_DEFAULT_STATUSES = ["queued", "deferred_issue_execution"] as const;
-
-/**
- * Allow-listed view of one `agent_wakeup_requests` row. Payload, context
- * snapshot, idempotency key, actor ids and error text are never exposed.
- */
-export interface PluginIssueWakeupRequest {
-  id: string;
-  issueId: string;
-  agentId: string;
-  status: string;
-  reason: string | null;
-  source: string;
-  requestedAt: string;
-}
-
-export interface PluginIssueWakeupRequestListOptions {
-  /**
-   * Statuses to include. Defaults to `queued` + `deferred_issue_execution`
-   * when `since` is not set. When `since` is set and `statuses` is omitted,
-   * rows of ANY status requested at/after `since` are returned.
-   */
-  statuses?: string[];
-  /** ISO timestamp; only rows with requestedAt >= since. */
-  since?: string;
-  /** Max rows (default + cap 1000). Newest first. */
-  limit?: number;
-}
-
 export interface PluginIssueWakeupBatchResult {
   issueId: string;
   queued: boolean;
@@ -1636,53 +1347,6 @@ export interface PluginIssueApprovalSummary {
   decidedByUserId: string | null;
   decidedAt: string | null;
   createdAt: string;
-}
-
-/**
- * Field-minimized view of a pending board approval, returned by the
- * `approvals.list` reconcile read. Excludes the requester/decider
- * user-id and decision-note PII carried by {@link PluginIssueApprovalSummary};
- * the digest only needs to identify and relay the pending blocker.
- */
-export interface PluginPendingApproval {
-  id: string;
-  type: string;
-  status: string;
-  payload: Record<string, unknown>;
-  createdAt: string;
-}
-
-/**
- * Field-minimized view of a pending issue thread interaction, returned by the
- * `interactions.list` reconcile read. Excludes creator/resolver
- * user-id PII and the free-form payload/result blobs.
- */
-export interface PluginPendingInteraction {
-  id: string;
-  issueId: string;
-  kind: string;
-  status: string;
-  title: string | null;
-  summary: string | null;
-  createdAt: string;
-}
-
-/**
- * `ctx.approvals` — reconcile read of pending board approvals.
- * Requires `board.approvals.read`. Company-scoped and read-only; intended for a
- * digest plugin to seed/reconcile its in-memory blocker set on worker startup.
- */
-/**
- * `ctx.interactions` — reconcile read of pending issue thread interactions
- * Requires `issue.interactions.read`. Company-scoped, read-only.
- */
-export interface PluginInteractionsClient {
-  /**
-   * List issue thread interactions for a company. Defaults to
-   * `status:"pending"` when `status` is omitted. The host rejects a
-   * missing/empty `companyId`.
-   */
-  list(companyId: string, status?: string): Promise<PluginPendingInteraction[]>;
 }
 
 export interface PluginIssueCostSummary {
@@ -1760,25 +1424,6 @@ export interface PluginIssueSubtree {
   assignees?: Record<string, PluginIssueAssigneeSummary>;
 }
 
-/**
- * Attachment metadata exposed to plugin workers. Deliberately a
- * narrowed projection of the host `issue_attachments` row: raw storage details
- * (provider, objectKey, sha256) are withheld so a worker cannot address the
- * blob store directly — asset bytes go through `ctx.artifacts.fetch(assetId)`.
- * `issueCommentId` is null for issue-level attachments not bound to a comment.
- */
-export interface PluginIssueAttachment {
-  id: string;
-  companyId: string;
-  issueId: string;
-  issueCommentId: string | null;
-  assetId: string;
-  contentType: string | null;
-  byteSize: number | null;
-  originalFilename: string | null;
-  createdAt: Date | string;
-}
-
 export interface PluginIssueSummariesClient {
   /**
    * Read the compact orchestration inputs a workflow plugin needs for an
@@ -1817,7 +1462,6 @@ export interface PluginIssueAttachmentContent {
  * - `issues.wakeup` for assignment wakeup requests
  * - `issues.orchestration.read` for orchestration summaries
  * - `issue.comments.read` for `listComments`
- * - `issue.attachments.read` for `listAttachments`
  * - `issue.comments.create` for `createComment`
  * - `issue.comments.create_human_attributed` for `createComment` calls that pass `actorUserId`
  * - `issue.interactions.create` for `createInteraction`, `suggestTasks`, `askUserQuestions`, `requestConfirmation`, and `requestCheckboxConfirmation`
@@ -1846,6 +1490,7 @@ export interface PluginIssuesClient {
     projectId?: string;
     goalId?: string;
     parentId?: string;
+    /** Inherit this issue's project and workspace strategy. The new issue always gets its own workspace. */
     inheritExecutionWorkspaceFromIssueId?: string;
     title: string;
     description?: string;
@@ -1907,16 +1552,6 @@ export interface PluginIssuesClient {
     companyId: string,
     options?: PluginIssueSubtreeOptions,
   ): Promise<PluginIssueSubtree>;
-  /**
-   * Read pending (default: `queued` | `deferred_issue_execution`) or, with
-   * `since`, recent agent wakeup requests for up to 200 issues in one company.
-   * Read-only, allow-listed fields. Requires `issue.wakeups.read`.
-   */
-  listWakeupRequests(
-    issueIds: string[],
-    companyId: string,
-    options?: PluginIssueWakeupRequestListOptions,
-  ): Promise<PluginIssueWakeupRequest[]>;
   requestWakeup(
     issueId: string,
     companyId: string,
@@ -1936,14 +1571,6 @@ export interface PluginIssuesClient {
     } & PluginIssueMutationActor,
   ): Promise<PluginIssueWakeupBatchResult[]>;
   listComments(issueId: string, companyId: string): Promise<IssueComment[]>;
-  /**
-   * List the attachments bound to an issue and its comments. Lets a
-   * worker map a `issue.comment.created` event onto the asset ids attached to
-   * that comment (filter the returned rows by `issueCommentId`), then fetch each
-   * via `ctx.artifacts.fetch(assetId)`. Company-scoped: returns `[]` for an
-   * issue outside `companyId`. Requires `issue.attachments.read` (default-deny).
-   */
-  listAttachments(issueId: string, companyId: string): Promise<PluginIssueAttachment[]>;
   /**
    * Post a comment on an issue.
    *
@@ -1966,29 +1593,7 @@ export interface PluginIssuesClient {
     issueId: string,
     body: string,
     companyId: string,
-    options?: {
-      authorAgentId?: string;
-      /** Resolve the target issue by identifier (e.g. `ACME-822`) instead of `issueId`. */
-      actorUserId?: string;
-      identifier?: string;
-      /**
-       * Wake the resolved issue's assignee. Body @-mentions are NOT honored as a
-       * wake primitive: relay bodies are untrusted, so mention-wake is omitted to
-       * avoid inbound content fanning out heartbeats.
-       */
-      wakeAssignee?: boolean;
-      /**
-       * Throw instead of inserting when the target issue is done/cancelled.
-       * Defaults to `true` when `wakeAssignee` is set; pass `false` to opt out.
-       */
-      refuseClosed?: boolean;
-      /**
-       * Asset ids returned by `ctx.artifacts.create` to surface on this
-       * comment. Each must belong to the comment's company. Omit/empty keeps the
-       * existing text-only behaviour.
-       */
-      attachmentIds?: string[];
-    },
+    options?: { authorAgentId?: string; actorUserId?: string },
   ): Promise<IssueComment>;
   createInteraction(
     issueId: string,
@@ -1996,25 +1601,9 @@ export interface PluginIssuesClient {
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<IssueThreadInteraction>;
-  /**
-   * Retire (expire) a single pending interaction the plugin is
-   * relaying an operator reply to — e.g. the messenger converting a free-text
-   * Telegram reply into a comment and resolving the `request_confirmation` it
-   * answered so nothing stays `pending`. Terminal status is always `expired`
-   * (never `accepted`), so this cannot trigger accept side-effects. Requires the
-   * default-deny `issue.interactions.resolve` capability. When `supersedingCommentId`
-   * is given the outcome is `superseded_by_comment` + that comment; otherwise the
-   * outcome is the dedicated `superseded`.
-   */
-  resolveInteraction(
-    issueId: string,
-    interactionId: string,
-    companyId: string,
-    options?: { supersedingCommentId?: string | null; reason?: string | null },
-  ): Promise<IssueThreadInteraction>;
   suggestTasks(
     issueId: string,
-    interaction: Omit<Extract<CreateIssueThreadInteraction, { kind: "suggest_tasks" }>, "kind">,
+    interaction: Omit<Extract<CreateIssueThreadInteractionInput, { kind: "suggest_tasks" }>, "kind">,
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<SuggestTasksInteraction>;
@@ -2026,13 +1615,13 @@ export interface PluginIssuesClient {
   ): Promise<AskUserQuestionsInteraction>;
   requestConfirmation(
     issueId: string,
-    interaction: Omit<Extract<CreateIssueThreadInteraction, { kind: "request_confirmation" }>, "kind">,
+    interaction: Omit<Extract<CreateIssueThreadInteractionInput, { kind: "request_confirmation" }>, "kind">,
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<RequestConfirmationInteraction>;
   requestCheckboxConfirmation(
     issueId: string,
-    interaction: Omit<Extract<CreateIssueThreadInteraction, { kind: "request_checkbox_confirmation" }>, "kind">,
+    interaction: Omit<Extract<CreateIssueThreadInteractionInput, { kind: "request_checkbox_confirmation" }>, "kind">,
     companyId: string,
     options?: { authorAgentId?: string },
   ): Promise<RequestCheckboxConfirmationInteraction>;
@@ -2061,6 +1650,8 @@ export interface PluginIssuesClient {
     input: { action: "accept" | "reject"; actorUserId?: string; reason?: string | null },
     companyId: string,
   ): Promise<{ interaction: IssueThreadInteraction; applied: boolean }>;
+  /** List attachment metadata for an issue. Requires `issue.attachments.read`. */
+  listAttachments(issueId: string, companyId: string): Promise<IssueAttachment[]>;
   /**
    * Read an attachment's content bytes (base64) through the capability-scoped
    * host bridge. Requires `issue.attachments.read`.
@@ -2093,14 +1684,6 @@ export interface PluginIssuesClient {
  */
 export interface PluginApprovalsClient {
   list(input: { companyId: string; status?: string | null }): Promise<Approval[]>;
-  /**
-   * Fork-only reconcile read of PENDING board approvals for a company,
-   * field-minimized (no requester/decider user ids, no decision notes) and
-   * fail-closed on provisioning. Intended for a digest plugin's
-   * startup/poll reconcile outside any dispatch; the general {@link list}
-   * read is dispatch-scoped upstream surface.
-   */
-  listPending(companyId: string): Promise<PluginPendingApproval[]>;
   get(approvalId: string, companyId: string): Promise<Approval | null>;
   /**
    * Approve or reject an approval on behalf of a paired board user.
@@ -2146,6 +1729,8 @@ export interface PluginAgentConnectionAssignments {
 export interface PluginAgentRuntimeState {
   connectionAssignments: PluginAgentConnectionAssignments;
   skills: PluginAgentRuntimeSkill[];
+  /** Selected company skills omitted because the environment requires the same skill name. */
+  shadowedSkills?: Array<{ key: string; shadowedBy: string }>;
   revision: string;
   agent: Agent;
   instructionsRootPath: string | null;
@@ -2155,8 +1740,14 @@ export interface PluginAgentRuntimeState {
   instanceSecrets: Record<string, string>;
 }
 
+export type PluginAgentRuntimeIdentity = Pick<PluginAgentRuntimeState, "revision" | "instanceSecrets"> & {
+  agent: Pick<Agent, "id" | "companyId" | "status" | "lifecycleState" | "lifecycleVersion">;
+};
+
 export interface PluginAgentsClient {
-  getRuntime(agentId: string, companyId: string): Promise<PluginAgentRuntimeState | null>;
+  getRuntimeIdentity(agentId: string, companyId: string): Promise<PluginAgentRuntimeIdentity | null>;
+  /** Lifecycle reconciliation can install missing environment skills; task and recovery reads leave this false. */
+  getRuntime(agentId: string, companyId: string, environmentId?: string, installEnvironmentSkills?: boolean): Promise<PluginAgentRuntimeState | null>;
   list(input: { companyId: string; status?: Agent["status"]; limit?: number; offset?: number }): Promise<Agent[]>;
   get(agentId: string, companyId: string): Promise<Agent | null>;
   /** Pause an agent. Throws if agent is terminated or not found. Requires `agents.pause`. */
@@ -2369,27 +1960,11 @@ export interface PluginAuthorizationPolicyRecord {
   updatedAt: Date | string | null;
 }
 
-/**
- * Explicit actor provenance for plugin authorization previews. The host
- * validates these at runtime and denies (403) when the source is unset,
- * unknown, or does not match the actor type — privileged sources such as
- * "session" are never synthesized from an omitted field. `local_implicit` is
- * server-internal and cannot be claimed by plugins.
- */
-export type PluginBoardActorSource = "session" | "board_key" | "cloud_tenant";
-export type PluginAgentActorSource = "agent_key" | "agent_jwt";
-
 export interface PluginAssignmentPreviewInput {
   companyId: string;
   actor:
-    | {
-        type: "board";
-        userId?: string | null;
-        companyIds?: string[];
-        isInstanceAdmin?: boolean;
-        source: PluginBoardActorSource;
-      }
-    | { type: "agent"; agentId: string; companyId: string; source: PluginAgentActorSource };
+    | { type: "board"; userId?: string | null; companyIds?: string[]; isInstanceAdmin?: boolean }
+    | { type: "agent"; agentId: string; companyId: string };
   target: {
     issueId?: string | null;
     projectId?: string | null;
@@ -2477,20 +2052,6 @@ export interface PluginAuthorizationClient {
  * Streams are scoped to `(pluginId, channel, companyId)`. Multiple UI clients
  * can subscribe to the same channel concurrently.
  *
- * Attribution: the host tenant-verifies every notification. Open
- * the channel inside a dispatch for the target company — the host pins the
- * channel to that company, so later out-of-dispatch emits (status loops,
- * reconnect callbacks) are delivered against the pin. Emits that cannot be
- * attributed are dropped with a plugin-visible `streams.dropped` signal.
- *
- * Pins are bounded per worker: once the host's per-worker cap is reached,
- * capturing a new pin evicts the least-recently pinned channel, and the
- * eviction is reported with a `streams.dropped` signal
- * (`reason: "pin_cap_exceeded"`) naming the evicted channel. Close channels
- * you are done with (`ctx.streams.close`) to stay under the cap; an evicted
- * channel keeps working inside dispatches but loses its out-of-dispatch
- * attribution until it is re-opened.
- *
  * @example
  * ```ts
  * // Worker: stream chat tokens to the UI
@@ -2523,42 +2084,6 @@ export interface PluginStreamsClient {
    * clients so they know no more events will arrive.
    */
   close(channel: string): void;
-
-  /**
-   * Subscribe to host `streams.dropped` feedback for this worker.
-   *
-   * The host tenant-verifies every worker→host `streams.*` notification and
-   * sends a `streams.dropped` notification when it drops one (unknown
-   * invocation scope, pin mismatch, unpinned channel, …). The SDK always
-   * surfaces the drop on the plugin log; this subscription hands the same
-   * notice to plugin code so a worker can repair local bookkeeping that
-   * assumed delivery — e.g. clear a cached "channel is open" mirror so the
-   * next dispatch re-opens the channel instead of deduping against a pin
-   * the host never recorded.
-   *
-   * The handler is fire-and-forget: it runs synchronously off the host
-   * notification loop, and a throw is contained (logged, never propagated
-   * into the readline loop). Returns an unsubscribe function.
-   */
-  onDropped(handler: (notice: StreamDropNotice) => void): () => void;
-}
-
-/**
- * Host feedback that a worker→host `streams.*` notification was dropped.
- *
- * Mirrors the `streams.dropped` notification params the host sends (see
- * `PLUGIN_SPEC.md` §14 — SDK Surface): every field is optional because the
- * host omits what the dropped notification did not carry.
- */
-export interface StreamDropNotice {
-  /** The dropped worker→host notification method (`streams.open`, …). */
-  method?: string;
-  /** Channel of the dropped notification, when one was named. */
-  channel?: string;
-  /** Claimed companyId of the dropped notification, when one was sent. */
-  companyId?: string;
-  /** Why the host dropped it (`invalid_invocation_scope`, `pin_mismatch`, …). */
-  reason?: string;
 }
 
 /**
@@ -2715,13 +2240,6 @@ export interface PluginContext {
   /** Resolve secret references. Requires `secrets.read-ref`. */
   secrets: PluginSecretsClient;
 
-  /**
-   * Create and fetch attachment bytes from service/background or tool-dispatch
-   * code. `create` requires `issue.attachments.create` (default-deny). Takes no
-   * `runId` — the host backfills the active run-context.
-   */
-  artifacts: PluginArtifactsClient;
-
   /** Write activity log entries. Requires `activity.log.write`. */
   activity: PluginActivityClient;
 
@@ -2751,9 +2269,6 @@ export interface PluginContext {
 
   /** Read and decide company approvals. Requires `approvals.read` / `approvals.respond`. */
   approvals: PluginApprovalsClient;
-
-  /** Reconcile read of pending issue thread interactions. Requires `issue.interactions.read`. */
-  interactions: PluginInteractionsClient;
 
   /** Read and manage agents. Requires `agents.read` for reads; `agents.pause` / `agents.resume` / `agents.invoke` for write ops. */
   agents: PluginAgentsClient;

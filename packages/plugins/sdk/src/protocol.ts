@@ -1,6 +1,6 @@
 import type { PluginWorkspaceParams, PluginWorkspaceResult } from "./workspace-provider.js";
 import type { PluginEnvironmentTaskParams, PluginEnvironmentTaskResult } from "./environment-tasks.js";
-import type { PluginAgentRuntimeState } from "./types.js";
+import type { PluginAgentRuntimeState, PluginAgentRuntimeIdentity } from "./types.js";
 import type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
 import type { AiConnectionRouterRequest, AiConnectionRouterResult } from "@paperclipai/shared";
 /**
@@ -58,7 +58,6 @@ export type { PluginLauncherRenderContextSnapshot } from "@paperclipai/shared";
 
 import type {
   PluginEvent,
-  PluginIssueAttachment,
   ResourceLifecycleEvent,
   ResourceLifecycleResult,
   PluginIssueCheckoutOwnership,
@@ -68,7 +67,6 @@ import type {
   PluginIssueAttachmentContent,
   PluginIssueWakeupBatchResult,
   PluginIssueWakeupResult,
-  PluginIssueWakeupRequest,
   PluginJobContext,
   PluginExecutionWorkspaceMetadata,
   PluginWorkspace,
@@ -83,8 +81,6 @@ import type {
   PluginAuthorizationDecisionResult,
   PluginAuthorizationPolicyRecord,
   PluginAuthorizationPolicySummary,
-  PluginPendingApproval,
-  PluginPendingInteraction,
 } from "./types.js";
 import type {
   PluginHealthDiagnostics,
@@ -290,21 +286,10 @@ export type PluginRpcErrorCode =
 /**
  * Company scope attached by the host to one top-level plugin invocation.
  * Absence of this metadata means the invocation is instance/global scoped.
- *
- * `runId` / `agentId` are populated by the host for dispatch-style invocations
- * (executeTool, performAction). They let the host correlate a worker→host
- * callback back to the originating outer dispatch — for example, to fill in
- * `runId` on a `secrets.resolve` call from a worker built against an
- * older SDK that did not yet thread the runId itself. The values come
- * entirely from the host-side dispatcher; the worker is never trusted to
- * supply them.
  */
 export interface PluginInvocationScope {
   companyId: string;
-  /** Run UUID of the dispatching agent's heartbeat run. Optional. */
-  runId?: string;
-  /** UUID of the dispatching agent. Optional. */
-  agentId?: string;
+  projectGit?: { projectId: string; workspaceId?: string; runId?: string; agentId?: string; operation?: "prepare" | "inspect" | "remove" };
 }
 
 /**
@@ -329,14 +314,9 @@ export interface PluginInvocationContext {
  * host-issued invocation id.
  */
 export interface WorkerHostCallContext {
+  /** Host-owned aggregate timing budget; never received from the worker. */
+  providerSpanBudget?: { remaining: number };
   invocationScope?: PluginInvocationScope | null;
-  /**
-   * SECURITY-CRITICAL: the host→worker method of the host's OWN dispatch record
-   * for the echoed invocation id (e.g. `"executeTool"`). Set only by the host
-   * worker manager alongside `invocationScope`; never read from worker params.
-   * The cross-company read exemption requires `"executeTool"`.
-   */
-  invocationDispatchMethod?: string;
   invalidInvocationScope?: boolean;
   /**
    * The W3C `traceparent` the host minted for the echoed invocation. The host
@@ -344,38 +324,6 @@ export interface WorkerHostCallContext {
    * can never forge a span parent. The span host handler validates and uses it.
    */
   traceparent?: string;
-  /**
-   * The host-validated scope of the SINGLE host→worker dispatch that
-   * is in-flight when a worker→host call arrives without echoing a
-   * `paperclipInvocationId`. Plugins bundled against an older SDK (e.g.
-   * platform.cad ≤0.1.7) never echo the id, so `invocationScope` cannot be
-   * resolved for their callbacks. When — and only when — exactly one dispatch
-   * is in-flight, that dispatch is unambiguously the one the worker is
-   * servicing, so the host surfaces its scope here for the legacy runId
-   * back-fill (secrets.resolve / artifacts.fetch). It is intentionally NOT used
-   * for company-scope enforcement: `invalidInvocationScope` still governs that,
-   * so a worker can never name an arbitrary target company off this field.
-   * Absent whenever 0 or 2+ dispatches are in-flight (fail closed).
-   */
-  singleInFlightScope?: PluginInvocationScope | null;
-  /**
-   * The worker-lifetime **service run-context**. Unlike
-   * `invocationScope`/`singleInFlightScope` — which only exist while a
-   * host→worker dispatch is in-flight — this is minted once per worker process
-   * and surfaced on EVERY worker→host call, so a background dispatch
-   * (`onEvent`/`onWebhook`/`runJob`) or a loop started in `setup()` (e.g. a
-   * `getUpdates` long-poll) that calls `ctx.secrets.resolve` outside any
-   * dispatch still carries a host-validated `runId`.
-   *
-   * The `runId` is host-minted (never worker-supplied) and registered in the
-   * run-context registry as a system actor (`actorType: "plugin"`). It grants
-   * NO company scope by itself: the secrets handler derives the dispatching
-   * company from the operator-created secret binding, and company-scoped
-   * worker→host calls (issues, state, etc.) still require an `invocationScope`.
-   * So this field is consumed ONLY by the runId back-fill for `secrets.resolve`
-   * — it is never used for company-scope enforcement.
-   */
-  serviceScope?: { runId: string } | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -413,20 +361,6 @@ export interface InitializeResult {
   ok: boolean;
   /** Optional methods the worker has implemented (e.g. "validateConfig", "onEvent"). */
   supportedMethods?: string[];
-  /**
-   * The worker echoes `paperclipInvocationId` on every worker→host
-   * call it makes while servicing a dispatch. Declared by every current SDK;
-   * absent from older workers (platform.cad ≤0.1.7,
-   * klipper) that the `singleInFlightScope` attribution mechanism exists
-   * for.
-   *
-   * When this is `true` an id-less worker→host call is, by construction, a call
-   * that owns NO dispatch (a `setup()`-started loop, a `runJob`, a timer), so
-   * the host must not attribute it to whichever tenant's dispatch happens to be
-   * in flight. Declaring it can only NARROW what the worker is granted, so the
-   * host may honour a worker-supplied value without trusting the worker.
-   */
-  echoesInvocationId?: boolean;
 }
 
 /**
@@ -684,6 +618,12 @@ export interface PluginEnvironmentProbeResult {
   metadata?: Record<string, unknown>;
 }
 
+export interface PluginEnvironmentWorkspaceAllocationFiles {
+  providerLeaseId: string;
+  remoteCwd: string;
+  files: Array<{ relativePath: string; sha256: string }>;
+}
+
 export interface PluginEnvironmentLease {
   providerLeaseId: string | null;
   metadata?: Record<string, unknown>;
@@ -707,6 +647,7 @@ export interface PluginEnvironmentRunnerIngressEndpointParams
 
 export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDriverBaseParams {
   runId: string;
+  creationOperationId?: string;
   /** Explicit platform probes may request a provider-owned immutable snapshot
    * identity. Supporting providers create by that ID and return snapshotIdentity
    * in lease metadata. Older providers may omit it; the host then cannot qualify
@@ -738,8 +679,11 @@ export interface PluginEnvironmentAcquireLeaseParams extends PluginEnvironmentDr
 }
 
 export interface PluginEnvironmentResumeLeaseParams extends PluginEnvironmentDriverBaseParams {
+  /** New run authority for a retained task; omitted by legacy environment consumers. */
+  runId?: string;
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
+  requestedCwd?: string;
 }
 
 export interface PluginEnvironmentReleaseLeaseParams extends PluginEnvironmentDriverBaseParams {
@@ -765,11 +709,14 @@ export interface PluginEnvironmentDestroyLeaseParams extends PluginEnvironmentRe
 /** Observe this exact allocation without starting, stopping or deleting it.
  * Missing resources must be distinguished from permission/transport failures. */
 export interface PluginEnvironmentInspectLeaseParams extends PluginEnvironmentDriverBaseParams {
+  creationOperation?: { id: string; runId: string };
   providerLeaseId: string;
   leaseMetadata?: Record<string, unknown>;
 }
 
 export interface PluginEnvironmentLeaseObservation {
+  creationLease?: PluginEnvironmentLease;
+  creationCleanup?: import("./environment-creation-cleanup.js").PluginEnvironmentCreationCleanup;
   providerLeaseId: string;
   state: "active" | "stopped" | "destroyed" | "unknown";
 }
@@ -863,13 +810,21 @@ export interface PluginSyncFileMapping {
    * shows the bytes only to code that already runs in that sandbox.
    */
   mode?: number;
-  /** Glob patterns to exclude when `kind` is `"directory"`. */
+  /** Directory glob patterns; literal root-relative paths when preserving source entries. */
   exclude?: string[];
   /**
    * Symlink handling for `kind: "directory"` transfers. Falsy preserves symlinks
    * as links; `true` dereferences them to their target bytes. Mirrors tar's `-h`.
    */
   followSymlinks?: boolean;
+  /**
+   * Outbound directory transfers preserve source entry names, including `._*`
+   * and provider scratch-like names. In this mode `exclude` contains literal
+   * root-relative paths; providers omit only those paths and scratch paths
+   * created by this exact transfer. Archive member and symlink validation stay
+   * unchanged. Ignored for syncIn/files.
+   */
+  preserveSourceEntries?: boolean;
   /**
    * Advisory read-write intent for the sandbox target. `"rw"` means the author
    * expects the agent to change the bytes at the target and keep the change.
@@ -951,11 +906,13 @@ export interface PluginSyncOperation {
 export interface PluginEnvironmentSyncInParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
   operations: PluginSyncOperation[];
+  minimumTimeoutMs?: number;
 }
 
 export interface PluginEnvironmentSyncOutParams extends PluginEnvironmentDriverBaseParams {
   lease: PluginEnvironmentLease;
   operations: PluginSyncOperation[];
+  minimumTimeoutMs?: number;
 }
 
 /** Per-operation transfer accounting returned by a sync hook, for observability. */
@@ -1633,6 +1590,18 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
  * These represent the SDK client calls that the worker makes back to the
  * host to access platform services (state, entities, config, etc.).
  */
+export interface PluginSpanRecord {
+  name: string;
+  /** A completed remote lifecycle is linked to its observer, never made its child. */
+  relationship?: "linked";
+  attributes?: Record<string, string | number | boolean>;
+  status?: { code: number; message?: string };
+  startTimeMs?: number;
+  endTimeMs?: number;
+  /** Nested timing receipts, bounded and validated again by the host. */
+  children?: PluginSpanRecord[];
+}
+
 export interface WorkerToHostMethods {
   // Config
   "config.get": [params: { companyId?: string }, result: Record<string, unknown>];
@@ -1767,135 +1736,15 @@ export interface WorkerToHostMethods {
   ];
 
   // HTTP
-  //
-  // `init.body` travels as a string over JSON-RPC. `bodyEncoding` tells the
-  // host how to decode the REQUEST body before writing it on the wire:
-  //   - "utf8"   (default if absent) — body is plain text, written as-is.
-  //   - "base64" — body is base64-encoded bytes, decoded to a Buffer before
-  //                being written on the wire. Used by the SDK for FormData,
-  //                Uint8Array, ArrayBuffer, and Buffer payloads.
-  //
-  // The RESPONSE body has the symmetric problem. `acceptResponseBodyEncoding`
-  // is a worker capability flag: when set to "base64", the worker guarantees it
-  // decodes the result per `result.bodyEncoding`, so the host base64-encodes the
-  // raw response bytes (byte-exact for text AND binary). When absent the host
-  // keeps the legacy lossy `toString("utf8")` behavior — required so plugins
-  // bundling an old SDK (which expect a plain utf8 `result.body` string and
-  // ignore `bodyEncoding`) do not regress. New SDKs always send "base64".
   "http.fetch": [
-    params: {
-      url: string;
-      init?: {
-        method?: string;
-        headers?: Record<string, string>;
-        body?: string;
-        bodyEncoding?: "utf8" | "base64";
-      };
-      acceptResponseBodyEncoding?: "utf8" | "base64";
-    },
-    result: {
-      status: number;
-      statusText: string;
-      headers: Record<string, string>;
-      body: string;
-      // How `body` is encoded. Absent/"utf8" → legacy lossy text decode.
-      // "base64" → `body` is base64 of the exact response bytes; decode with
-      // `Buffer.from(body, "base64")` for a byte-exact reconstruction.
-      bodyEncoding?: "utf8" | "base64";
-    },
+    params: { url: string; init?: Record<string, unknown> },
+    result: { status: number; statusText: string; headers: Record<string, string>; body: string },
   ];
 
   // Secrets
-  //
-  // `runId` MUST be the runId of the currently-executing tool dispatch.
-  // The host looks up the active runContext keyed on (pluginDbId, runId) and
-  // authorizes resolution against the DISPATCHING agent's company (not the
-  // worker JWT), enforcing per-company `company_secret_bindings`. The worker is
-  // never trusted to assert which company is resolving.
   "secrets.resolve": [
-    params: { secretRef: string | EnvSecretRefBinding; runId?: string; companyId?: string; configPath?: string },
+    params: { secretRef: string | EnvSecretRefBinding; companyId?: string; configPath?: string },
     result: string,
-  ];
-
-  // Secrets — borrowed-handle minting (Control 2).
-  //
-  // After a plugin resolves a secret's plaintext (via `secrets.resolve` or its
-  // own backend), it calls `secrets.mintHandle` to exchange the plaintext for
-  // an opaque borrowed handle (`vault-handle://<runId>/<128-bit-id>`). The
-  // plugin returns the HANDLE to the agent instead of the plaintext; the host
-  // substitutes the real value back in only at the worker-dispatch edge of a
-  // downstream tool call, so the transcript and persisted call records never
-  // contain the secret. `runId` MUST be the runId of the currently-executing
-  // tool dispatch (same contract as `secrets.resolve`); the host keys the
-  // borrowed value off the server-validated runContext, never the worker.
-  // Minting also registers the value with the Control-1 value-exact redactor.
-  //
-  // `secretRef` is the UUID of the secret the handle borrows. The
-  // host uses it to look up the per-company `company_secret_bindings` row and
-  // capture that binding's operator-set egress allowlist onto the handle at
-  // mint time. The worker only names WHICH secret it minted; it can never
-  // assert the allowlist itself (EG1-provenance — allowedEgress is
-  // operator-only). Omitted by legacy/own-backend mints, which then get the
-  // migration-safe log-only posture.
-  "secrets.mintHandle": [
-    params: { value: string; runId: string; secretRef?: string },
-    result: { handle: string },
-  ];
-
-  // Artifacts (attachment bytes)
-  //
-  // `runId` is the runId of the currently-executing tool dispatch; the
-  // tool-dispatch `runCtx.artifacts` client always sends it. The worker-level
-  // `ctx.artifacts` client omits it on the wire and the host
-  // backfills the active run-context from the worker→host
-  // `paperclipInvocationId` (serviceScope/singleInFlightScope), exactly as
-  // `secrets.resolve` does from service/background contexts — so the wire type
-  // keeps `runId` required (the host's `backfillDispatchRunId` populates it
-  // before the artifacts handler runs; matching the `secrets.resolve` shape).
-  // Either way the host looks up the active runContext and uses the DISPATCHING
-  // agent (not the worker JWT) for authorization against the attachment's
-  // owning company. Bytes travel as base64 over JSON-RPC; the worker SDK
-  // decodes them to Uint8Array before returning to the plugin caller.
-  "artifacts.fetch": [
-    params: { attachmentId: string; runId: string },
-    result: {
-      filename: string;
-      contentType: string;
-      byteSize: number;
-      contentBase64: string;
-    },
-  ];
-
-  // Artifacts (attachment bytes) — INBOUND write path
-  //
-  // The inverse of `artifacts.fetch`. Stores `contentBase64` bytes as a
-  // company-scoped Paperclip asset via the same storage backend the human
-  // upload route uses, returning `{ attachmentId }` (the asset id). The
-  // returned id can be passed to `issues.createComment`'s `attachmentIds` to
-  // surface the stored bytes on a comment.
-  //
-  // `runId` is the runId of the currently-executing tool dispatch (sent by the
-  // tool-dispatch `runCtx.artifacts` client). The worker-level `ctx.artifacts`
-  // client omits it on the wire for inbound relay loops (e.g. the
-  // messenger `getUpdates`/`onWebhook`/`runJob` path) and the host backfills the
-  // host-minted service/background run id from the worker→host
-  // `paperclipInvocationId` (`backfillDispatchRunId`) before this handler runs —
-  // so the wire type keeps `runId` required, matching `secrets.resolve`. The
-  // host looks up the active runContext: a dispatch/background context's company
-  // MUST equal `companyId` (cross-tenant writes are rejected); a service context
-  // relies on the `serviceScope` company-scope allowlist gate. Bytes travel as
-  // base64 over JSON-RPC; the worker SDK encodes the caller's Uint8Array before
-  // sending. Gated behind the `issue.attachments.create` capability
-  // (default-deny).
-  "artifacts.create": [
-    params: {
-      companyId: string;
-      filename: string;
-      mimeType: string;
-      contentBase64: string;
-      runId: string;
-    },
-    result: { attachmentId: string },
   ];
 
   // Activity
@@ -1946,25 +1795,7 @@ export interface WorkerToHostMethods {
   // real tracer. The worker never sends the parent `traceparent`; the host
   // recovers it from the echoed invocation id. The RPC is capability-gated.
   "span.record": [
-    params: {
-      /** The bounded span name (for example `pack` or `transfer`). The host
-       * clamps it to a closed set, so a name never carries free-form data. */
-      name: string;
-      /** The span attributes. The host drops every key that is not on the closed
-       * plugin-span allowlist and re-clamps each remaining value. */
-      attributes?: Record<string, string | number | boolean>;
-      /** The optional span status. */
-      status?: { code: number; message?: string };
-      /** The optional span start time as epoch milliseconds (`Date.now()`).
-       * The worker captures it when it opens the span. The host validates the
-       * pair and records the span with its true native width. An omitted value
-       * makes the host fall back to a synchronous open-and-end. */
-      startTimeMs?: number;
-      /** The optional span end time as epoch milliseconds (`Date.now()`). The
-       * worker captures it when it ends the span. The host uses it as the span
-       * end time when the pair passes the clock-safety check. */
-      endTimeMs?: number;
-    },
+    params: PluginSpanRecord,
     result: void,
   ];
 
@@ -1982,6 +1813,10 @@ export interface WorkerToHostMethods {
   "projects.list": [
     params: { companyId: string; limit?: number; offset?: number },
     result: Project[],
+  ];
+  "projects.resolveGitCredential": [
+    params: { projectId: string; workspaceId: string; companyId: string },
+    result: string | null,
   ];
   "projects.getInstanceSecrets": [
     params: { projectId: string; companyId: string },
@@ -2191,16 +2026,6 @@ export interface WorkerToHostMethods {
     },
     result: PluginIssueSubtree,
   ];
-  "issues.listWakeupRequests": [
-    params: {
-      companyId: string;
-      issueIds: string[];
-      statuses?: string[];
-      since?: string;
-      limit?: number;
-    },
-    result: PluginIssueWakeupRequest[],
-  ];
   "issues.requestWakeup": [
     params: {
       issueId: string;
@@ -2246,15 +2071,6 @@ export interface WorkerToHostMethods {
       body: string;
       companyId: string;
       authorAgentId?: string;
-      identifier?: string;
-      wakeAssignee?: boolean;
-      refuseClosed?: boolean;
-      /**
-       * Asset ids returned by `artifacts.create` to surface on this
-       * comment. Each must belong to the comment's company or the call is
-       * rejected. Omitted/empty keeps the existing text-only behaviour.
-       */
-      attachmentIds?: string[];
       /** Active human company member the comment is attributed to. Requires `issue.comments.create_human_attributed`. */
       actorUserId?: string;
     },
@@ -2291,28 +2107,11 @@ export interface WorkerToHostMethods {
   ];
   "issues.listAttachments": [
     params: { issueId: string; companyId: string },
-    result: PluginIssueAttachment[],
+    result: IssueAttachment[],
   ];
   "issues.getAttachmentContent": [
     params: { attachmentId: string; companyId: string; maxBytes?: number | null },
     result: PluginIssueAttachmentContent | null,
-  ];
-  // Resolve (expire) a single pending interaction the plugin is
-  // relaying an operator reply to. Terminal status is always "expired"; never
-  // "accepted", so this can never fire accept side-effects. Scoped to the
-  // plugin's own company via host-side requireInCompany. Gated by the
-  // default-deny `issue.interactions.resolve` capability (messenger-only).
-  "issues.resolveInteraction": [
-    params: {
-      issueId: string;
-      companyId: string;
-      interactionId: string;
-      /** When set, records `superseded_by_comment` + this comment id; when
-       * omitted the interaction is recorded with the `superseded` outcome. */
-      supersedingCommentId?: string | null;
-      reason?: string | null;
-    },
-    result: IssueThreadInteraction,
   ];
 
   // Issue Documents
@@ -2366,50 +2165,17 @@ export interface WorkerToHostMethods {
     result: { approval: Approval; applied: boolean },
   ];
 
-  // Fork reconcile reads — authoritative pending-blocker snapshot for the
-  // messenger digest to seed/reconcile on worker startup. Company-scoped,
-  // read-only; the host rejects kind:"all" / missing companyId.
-  "interactions.list": [
-    params: { companyId: string; status?: string },
-    result: PluginPendingInteraction[],
-  ];
-
-  // Fork-only reconcile read of PENDING board approvals (field-minimized,
-  // provisioned-gated). Upstream's general `approvals.list` surface is
-  // unchanged; the digest targets this method so the fork contract
-  // (pending-only default, no requester/decider PII, defensive row cap)
-  // survives without diverging the public surface.
-  "approvals.listPending": [
-    params: { companyId: string },
-    result: PluginPendingApproval[],
-  ];
-
-  // Fork-only background config read: per-company effective plugin config
-  // behind the fail-closed provisioning gate. Company-scoped, read-only; the
-  // host rejects kind:"all" / missing companyId.
-  "config.getForServiceScope": [
-    params: { companyId: string },
-    result: Record<string, unknown>,
-  ];
-
-  // Fork-only worker-lifetime service-context secret read: the company is
-  // derived server-side from the secret binding (never worker-supplied) and
-  // the host-minted serviceScope is mandatory at the bridge.
-  "secrets.resolveService": [
-    params: {
-      secretRef: string | EnvSecretRefBinding;
-      configPath?: string;
-    },
-    result: string,
-  ];
-
   // Agents (read)
   "agents.list": [
     params: { companyId: string; status?: string; limit?: number; offset?: number },
     result: Agent[],
   ];
-  "agents.getRuntime": [
+  "agents.getRuntimeIdentity": [
     params: { agentId: string; companyId: string },
+    result: PluginAgentRuntimeIdentity | null,
+  ];
+  "agents.getRuntime": [
+    params: { agentId: string; companyId: string; environmentId?: string; installEnvironmentSkills?: boolean },
     result: PluginAgentRuntimeState | null,
   ];
   "agents.get": [
@@ -2645,38 +2411,6 @@ export interface WorkerToHostNotifications {
   "streams.close": {
     channel: string;
     companyId: string;
-  };
-
-  /**
-   * Host→worker feedback: the host DROPPED a `streams.*`
-   * notification because it could not be tenant-verified — no resolvable
-   * invocation scope, no channel pin captured at `streams.open` inside an
-   * attributed dispatch, or a companyId that mismatches the pin.
-   *
-   * This notification is fire-and-forget in both directions: the worker RPC
-   * host forwards it to the plugin log (`level: "warn"`) so out-of-dispatch
-   * emitters are diagnosable instead of silently dead. Reason codes:
-   * `invalid_invocation_scope`, `no_invocation_scope`, `company_mismatch`,
-   * `unpinned_channel`, `pin_mismatch`, `pin_cap_exceeded`.
-   *
-   * `pin_cap_exceeded` is the eviction report: the host bounds the pins it
-   * keeps per worker, so capturing a new pin once the cap is reached evicts
-   * the least-recently captured pin. On eviction `channel`/`companyId` name
-   * the EVICTED pin (not the notification being processed) and `method` is
-   * the capture that triggered the eviction. The channel itself keeps
-   * working in-dispatch; only its out-of-dispatch attribution and exit-time
-   * cleanup are given up. Close channels you are done with to stay under
-   * the cap.
-   */
-  "streams.dropped": {
-    /** The dropped worker→host notification method (`streams.emit`, …). */
-    method: string;
-    /** Channel of the dropped notification, when one was named. */
-    channel?: string;
-    /** Claimed companyId of the dropped notification, when one was sent. */
-    companyId?: string;
-    /** Why the host dropped it. */
-    reason: string;
   };
 
   /**

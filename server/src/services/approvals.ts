@@ -1,18 +1,18 @@
-import { dispatchCapabilityEscalationResolution } from "./plugin-capability-escalation.js";
+import { notifyToolReviewChange } from "./tool-review-work-notifications.js";
+import { writeApprovalChange } from "./approval-work-notifications.js";
 import { approvalResolutionRecords, resolvableApprovalStatuses as resolvableStatuses } from "../lib/approval-records.js";
 import { notifyHireApproved } from "./hire-hook.js";
 
 import { and, asc, eq, inArray, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { approvalComments, approvals } from "@paperclipai/db";
-import { forbidden, unprocessable } from "../errors.js";
+import { unprocessable } from "../errors.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { createAgentLifecycle } from "./agent-lifecycle.js";
 
 import { instanceSettingsService } from "./instance-settings.js";
 
 export function approvalRecords(db: Db) {
-  type ApprovalRecord = typeof approvals.$inferSelect;
   const instanceSettings = instanceSettingsService(db);
   const { getExistingApproval, resolveApproval } = approvalResolutionRecords(db);
 
@@ -55,19 +55,22 @@ export function approvalRecords(db: Db) {
     },
 
     create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
+      writeApprovalChange(db, companyId, tx => tx
         .insert(approvals)
         .values({ ...data, companyId })
         .returning()
-        .then((rows) => rows[0]),
+        .then((rows) => rows[0])),
 
     // Cancel an open (pending/revision_requested) approval without a board
     // decision — e.g. when its paired agent is terminated during duplicate
     // cleanup. Idempotent: a no-op on already-resolved approvals.
     cancel: async (id: string, reason?: string | null) => {
       const now = new Date();
-      const updated = await db
-        .update(approvals)
+      const [existing] = await db.select({ companyId: approvals.companyId }).from(approvals).where(eq(approvals.id, id));
+      if (!existing) return null;
+      const updated = await writeApprovalChange(db, existing.companyId, async tx => {
+        await notifyToolReviewChange(tx, existing.companyId);
+        return tx.update(approvals)
         .set({
           status: "cancelled",
           decisionNote: reason ?? null,
@@ -77,6 +80,7 @@ export function approvalRecords(db: Db) {
         .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
         .returning()
         .then((rows) => rows[0] ?? null);
+      }, { approvalId: id });
       return updated;
     },
 
@@ -87,7 +91,7 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return db
+      return writeApprovalChange(db, existing.companyId, tx => tx
         .update(approvals)
         .set({
           status: "revision_requested",
@@ -98,7 +102,7 @@ export function approvalRecords(db: Db) {
         })
         .where(eq(approvals.id, id))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]), { approvalId: id });
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
@@ -108,7 +112,7 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return db
+      return writeApprovalChange(db, existing.companyId, tx => tx
         .update(approvals)
         .set({
           status: "pending",
@@ -120,43 +124,7 @@ export function approvalRecords(db: Db) {
         })
         .where(eq(approvals.id, id))
         .returning()
-        .then((rows) => rows[0]);
-    },
-
-    withdraw: async (
-      id: string,
-      actor: { agentId: string; runId?: string | null },
-    ): Promise<{ approval: ApprovalRecord; applied: boolean }> => {
-      const existing = await getExistingApproval(id);
-      if (existing.requestedByAgentId !== actor.agentId) {
-        throw forbidden("Only the requesting agent can withdraw this approval");
-      }
-      if (existing.status === "withdrawn") {
-        // Idempotent retry by the same agent converges instead of erroring.
-        return { approval: existing, applied: false };
-      }
-      if (existing.status !== "pending") {
-        throw unprocessable("Only pending approvals can be withdrawn");
-      }
-
-      const now = new Date();
-      const updated = await db
-        .update(approvals)
-        .set({ status: "withdrawn", updatedAt: now })
-        .where(and(eq(approvals.id, id), eq(approvals.status, "pending")))
-        .returning()
-        .then((rows) => rows[0] ?? null);
-
-      if (updated) {
-        return { approval: updated, applied: true };
-      }
-
-      // Lost a race with a board decision — re-read and report the outcome.
-      const latest = await getExistingApproval(id);
-      if (latest.status === "withdrawn") {
-        return { approval: latest, applied: false };
-      }
-      throw unprocessable("Only pending approvals can be withdrawn");
+        .then((rows) => rows[0]), { approvalId: id });
     },
 
     listComments: async (approvalId: string) => {
@@ -226,17 +194,7 @@ export function approvalService(db: Db) {
       const result = await decideHire({ approvalId: id }, status, userId, note);
       return { approval: result!.approval!, applied: result!.applied };
     }
-    const result = await resolveApproval(id, status, userId, note);
-    if (result.applied) {
-      // Apply (approved) or revert (rejected) a parked plugin capability
-      // escalation. No-op for payloads that are not escalations.
-      await dispatchCapabilityEscalationResolution({
-        payload: result.approval.payload,
-        outcome: status === "approved" ? "approved" : "rejected",
-        approvalId: result.approval.id,
-      });
-    }
-    return result;
+    return resolveApproval(id, status, userId, note);
   }
   return { ...records,
     approveHire: (agentId: string, userId: string, note?: string | null) => decideHire(agentId, "approved", userId, note),

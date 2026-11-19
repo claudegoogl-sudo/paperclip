@@ -1,7 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it, vi } from "vitest";
-import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { describe, expect, it, vi } from "vitest";
+import type { Company, PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   createHostClientHandlers,
   JsonRpcCallError,
@@ -27,22 +27,16 @@ vi.mock("../middleware/logger.js", () => {
 });
 
 import { logger } from "../middleware/logger.js";
+import { PluginWorkerUnavailableError, PLUGIN_WORKER_UNAVAILABLE_CODE } from "../services/plugin-worker-unavailable-error.js";
+import { withRunExecutionTiming } from "../services/execution-preparation-timing.js";
 import {
   appendStderrExcerpt,
   createDuplexRouteSlotController,
-  createBoundedFrameReader,
   createPluginWorkerHandle,
   createPluginWorkerManager,
   formatWorkerFailureMessage,
-  resolveMaxIpcFrameBytes,
   resolveRpcCallTimeoutMs,
 } from "../services/plugin-worker-manager.js";
-import { createPluginRunContextRegistry } from "../services/plugin-run-context-registry.js";
-import {
-  clearRunSecretValues,
-  registerRunSecretValue,
-  registeredRunCount,
-} from "../run-secret-registry.js";
 
 const FIXTURES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures");
 const DELAYED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-delayed.cjs");
@@ -50,36 +44,8 @@ const INVOCATION_SCOPE_WORKER_ENTRYPOINT = path.join(
   FIXTURES_DIR,
   "plugin-worker-invocation-scope.cjs",
 );
-const LEGACY_SECRETS_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-legacy-secrets.cjs",
-);
-const NOID_SECRETS_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-noid-secrets.cjs",
-);
 const TERMINATED_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-terminated.cjs");
 const EXECUTE_LOG_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-execute-log.cjs");
-const STREAM_SCOPE_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-stream-scope.cjs",
-);
-const ONEVENT_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-onevent.cjs",
-);
-const INBOUND_COMMENT_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-inbound-comment.cjs",
-);
-const OVERSIZE_FRAME_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-oversize-frame.cjs",
-);
-const IPC_CHANNEL_WORKER_ENTRYPOINT = path.join(
-  FIXTURES_DIR,
-  "plugin-worker-ipc-channel.cjs",
-);
 
 const TEST_MANIFEST: PaperclipPluginManifestV1 = {
   id: "test.plugin",
@@ -112,6 +78,24 @@ describe("worker configuration completion", () => {
       await manager.call("test.plugin", "configChanged", { companyId: "company-1", config: {} });
       expect(applied).toHaveBeenCalledTimes(1);
     } finally { unsubscribe(); await manager.stopAll(); }
+  });
+});
+
+describe("plugin worker unavailable refusals", () => {
+  it("refuses calls to a stopped or missing worker with a typed, unsent error", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: DELAYED_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1, hostHandlers: {},
+    });
+    const settled = vi.fn();
+    const stopped = await handle.call("environmentExecute", {} as never, undefined, undefined, settled).catch(error => error);
+    expect(stopped).toBeInstanceOf(PluginWorkerUnavailableError);
+    expect(stopped).toMatchObject({ code: PLUGIN_WORKER_UNAVAILABLE_CODE, pluginId: "test.plugin", workerStatus: "stopped",
+      message: 'Cannot call "environmentExecute" — worker for "test.plugin" is stopped' });
+    expect(settled).toHaveBeenCalledTimes(1);
+    const missing = await createPluginWorkerManager().call("missing.plugin", "environmentExecute", {} as never).catch(error => error);
+    expect(missing).toBeInstanceOf(PluginWorkerUnavailableError);
+    expect(missing).toMatchObject({ workerStatus: null, message: 'No worker registered for plugin "missing.plugin"' });
   });
 });
 
@@ -272,7 +256,8 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
-  it("does not emit an unhandled rejection when a plugin responds with terminated before callers attach handlers", async () => {
+  it.each(["", "http://collector.test"])("does not emit an unhandled rejection before callers attach handlers (endpoint %s)", async endpoint => {
+    vi.stubEnv("OTEL_EXPORTER_OTLP_ENDPOINT", endpoint);
     const unhandledRejection = vi.fn();
     process.on("unhandledRejection", unhandledRejection);
 
@@ -291,29 +276,63 @@ describe("plugin-worker-manager stderr failure context", () => {
     try {
       await handle.start();
 
-      const pendingCall = handle.call(
-        "environmentExecute" as keyof HostToWorkerMethods,
-        {
-          driverKey: "e2b",
-          companyId: "company-1",
-          environmentId: "environment-1",
-          config: {},
-          lease: { providerLeaseId: "lease-1" },
-          command: "echo",
-        } as HostToWorkerMethods[keyof HostToWorkerMethods][0],
-      );
+      await withRunExecutionTiming("early-worker-error", async () => {
+        let settled!: () => void;
+        const workerSettled = new Promise<void>(resolve => { settled = resolve; });
+        const pendingCall = handle.call(
+          "environmentExecute" as keyof HostToWorkerMethods,
+          {
+            driverKey: "e2b",
+            companyId: "company-1",
+            environmentId: "environment-1",
+            config: {},
+            lease: { providerLeaseId: "lease-1" },
+            command: "echo",
+          } as HostToWorkerMethods[keyof HostToWorkerMethods][0],
+          undefined, undefined, settled,
+        );
 
-      await new Promise((resolve) => setImmediate(resolve));
+        await workerSettled;
+        await new Promise((resolve) => setImmediate(resolve));
 
-      await expect(pendingCall).rejects.toBeInstanceOf(JsonRpcCallError);
-      await expect(pendingCall).rejects.toMatchObject({
-        message: expect.stringContaining("terminated"),
+        await expect(pendingCall).rejects.toBeInstanceOf(JsonRpcCallError);
+        await expect(pendingCall).rejects.toMatchObject({
+          message: expect.stringContaining("terminated"),
+        });
+        expect(unhandledRejection).not.toHaveBeenCalled();
       });
-      expect(unhandledRejection).not.toHaveBeenCalled();
     } finally {
       process.off("unhandledRejection", unhandledRejection);
       await handle.stop().catch(() => undefined);
+      vi.unstubAllEnvs();
     }
+  });
+
+  it("mints project Git scope only for project lifecycle and workspace operations", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1,
+      hostHandlers: { "companies.get": (async (_params: unknown, context?: { invocationScope?: unknown }) => context?.invocationScope) as never },
+    });
+    const common = { companyId: "company-a", params: { mode: "echo", requestedCompanyId: "company-a" } };
+    try {
+      await handle.start();
+      await expect(handle.call("resourceLifecycle", { ...common, resourceType: "project", resourceId: "project-a" } as never))
+        .resolves.toEqual({ companyId: "company-a", projectGit: { projectId: "project-a" } });
+      await expect(handle.call("resourceLifecycle", { ...common, resourceType: "agent", resourceId: "agent-a" } as never))
+        .resolves.toEqual({ companyId: "company-a" });
+      for (const kind of ["prepare", "inspect", "remove", "finalize"]) {
+        const params = { ...common, projectId: "project-a", runId: "run-a", agentId: "agent-a", operation: {
+          kind, source: { id: "workspace-a" }, binding: { projectWorkspaceId: "workspace-a" } } };
+        await expect(handle.call("workspaceOperation", params as never)).resolves.toEqual({ companyId: "company-a",
+          ...(kind === "finalize" ? {} : { projectGit: { projectId: "project-a", workspaceId: "workspace-a", operation: kind,
+            ...(kind === "prepare" ? { runId: "run-a", agentId: "agent-a" } : {}) } }) });
+      }
+      await expect(handle.call("workspaceOperation", { ...common, projectId: "project-a", runId: null, agentId: null,
+        operation: { kind: "prepare", source: { id: "workspace-a" } } } as never)).resolves.toEqual({ companyId: "company-a", projectGit: { projectId: "project-a", workspaceId: "workspace-a", operation: "prepare" } });
+      await expect(handle.call("workspaceOperation", { ...common, projectId: "project-a", runId: null, agentId: "agent-a",
+        operation: { kind: "prepare", source: { id: "workspace-a" } } } as never)).resolves.toEqual({ companyId: "company-a" });
+    } finally { await handle.stop().catch(() => undefined); }
   });
 
   it("passes performAction invocation scope to nested worker host calls", async () => {
@@ -359,26 +378,9 @@ describe("plugin-worker-manager stderr failure context", () => {
         id: "company-a",
         scopedCompanyId: "company-a",
       });
-      // The invocation scope now carries the dispatching agent's
-      // runId/agentId so worker→host callbacks (e.g. legacy
-      // `secrets.resolve({secretRef})`) can be back-filled by host-client-
-      // factory. The values come from the host's `actorContext` and were
-      // already on the wire — they're just exposed via scope now too.
-      // The host-minted worker-lifetime service scope is also surfaced
-      // on every worker→host call (the fallback runId for background/setup-loop
-      // secrets.resolve). It never overrides an active dispatch scope.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-a" },
-        {
-          invocationScope: {
-            companyId: "company-a",
-            runId: "run-1",
-            agentId: "agent-1",
-          },
-          // Host-minted from its own dispatch record, never from worker params.
-          invocationDispatchMethod: "performAction",
-          serviceScope: { runId: expect.any(String) },
-        },
+        { invocationScope: { companyId: "company-a" }, traceparent: undefined, providerSpanBudget: { remaining: 256 } },
       );
     } finally {
       await handle.stop().catch(() => undefined);
@@ -386,7 +388,7 @@ describe("plugin-worker-manager stderr failure context", () => {
   });
 
   it("passes echoed invocation scope to worker-to-host handlers", async () => {
-    const companiesGet = vi.fn(async () => ({ id: "company-1" }));
+    const companiesGet = vi.fn(async () => ({ id: "company-1" }) as Company);
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT,
       manifest: TEST_MANIFEST,
@@ -413,14 +415,9 @@ describe("plugin-worker-manager stderr failure context", () => {
         },
       } as HostToWorkerMethods["getData"][0])).resolves.toEqual({ id: "company-1" });
 
-      // The service scope is always present alongside the echoed scope.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-1" },
-        {
-          invocationScope: { companyId: "company-1" },
-          invocationDispatchMethod: "getData",
-          serviceScope: { runId: expect.any(String) },
-        },
+        { invocationScope: { companyId: "company-1" }, traceparent: undefined, providerSpanBudget: { remaining: 256 } },
       );
     } finally {
       await handle.stop().catch(() => undefined);
@@ -565,672 +562,6 @@ describe("plugin-worker-manager stderr failure context", () => {
       }
 
       expect(companiesGet).not.toHaveBeenCalled();
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("drops company-scoped stream notifications with no resolvable invocation scope", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: STREAM_SCOPE_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: {
-        instanceId: "instance-1",
-        hostVersion: "1.0.0",
-      },
-      apiVersion: 1,
-      hostHandlers: {},
-      onStreamNotification,
-    });
-
-    try {
-      await handle.start();
-
-      // performAction with an empty actor companyId derives no invocation
-      // scope, so the worker's stream notifications arrive with an empty host
-      // context ({}). The fixture emits a company-scoped notification (dropped)
-      // followed by a scope-less one (forwarded) so ordering is deterministic.
-      await expect(handle.call("performAction", {
-        key: "probe",
-        params: {},
-        actorContext: {
-          type: "agent",
-          userId: null,
-          agentId: "agent-1",
-          runId: "run-1",
-          companyId: "",
-        },
-        renderEnvironment: null,
-      })).resolves.toEqual({ ok: true });
-
-      const channels = onStreamNotification.mock.calls.map(
-        ([, params]) => (params as { channel?: string }).channel,
-      );
-      expect(channels).toContain("no-company");
-      expect(channels).not.toContain("scoped-dropped");
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-});
-
-describe("back-fill runId for legacy SDK secrets.resolve", () => {
-  // Plugins bundled against the legacy SDK (e.g. platform.cad ≤0.1.7)
-  // call `ctx.secrets.resolve(secretRef)` without threading runId. The new
-  // server-side handler requires runId, so any such call would otherwise fail
-  // with `runcontext_invalid` even when the host has a valid active dispatch.
-  // The fix carries runId/agentId on PluginInvocationScope, and the gated
-  // wrapper in host-client-factory back-fills `runId` from the scope.
-  //
-  // This integration test wires a worker that emulates the legacy wire shape
-  // (sends `{secretRef}` only) and asserts the host-side service handler
-  // receives the runId from the executeTool dispatch.
-
-  it("back-fills runId from the executeTool invocation scope when the worker omits it", async () => {
-    const secretsResolve = vi.fn(async (params: { secretRef: string; runId?: string }) => {
-      // The real handler would do dispatch lookup + binding check; we just
-      // assert the back-fill threaded runId through to this point.
-      return `value-for-${params.secretRef}-via-${params.runId ?? "<missing>"}`;
-    });
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["secrets.read-ref"],
-      services: {
-        secrets: { resolve: secretsResolve },
-      } as unknown as HostServices,
-    });
-    const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: LEGACY_SECRETS_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: handlers,
-    });
-
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("executeTool", {
-          toolName: "cad.export",
-          parameters: {
-            secretRef: "11111111-1111-1111-1111-111111111111",
-          },
-          runContext: {
-            agentId: "agent-1",
-            runId: "run-pla673",
-            companyId: "company-a",
-            projectId: "project-1",
-          },
-        } as unknown as HostToWorkerMethods["executeTool"][0]),
-      ).resolves.toMatchObject({
-        data: {
-          resolvedTo: "value-for-11111111-1111-1111-1111-111111111111-via-run-pla673",
-        },
-      });
-
-      expect(secretsResolve).toHaveBeenCalledTimes(1);
-      // The wire payload arrived from the worker without runId; the gated
-      // wrapper back-filled it from the active invocation scope (which the
-      // host populated from the outer dispatcher's runContext). The restored
-      // upstream handler also threads the scope-validated companyId
-      // (fork test adaptation for the upstream {…params, companyId} shape).
-      expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
-        secretRef: "11111111-1111-1111-1111-111111111111",
-        runId: "run-pla673",
-        companyId: "company-a",
-      });
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("still fails closed when there is no active invocation (no scope to back-fill from)", async () => {
-    const secretsResolve = vi.fn(async () => "should-not-be-called");
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["secrets.read-ref"],
-      services: {
-        secrets: { resolve: secretsResolve },
-      } as unknown as HostServices,
-    });
-    // No active invocation: a forged worker→host call with no
-    // paperclipInvocationId arrives. Upstream's proactive company-context
-    // guard is RESTORED (host-client-factory `resolveRequiredCompanyId`), so
-    // the scope-less call is denied at the SDK layer before host services run.
-    // The server-side secrets handler keeps its own fail-close
-    // (`runcontext_invalid` / company check) as defense in depth beneath it.
-    await expect(
-      handlers["secrets.resolve"](
-        { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
-        {},
-      ),
-    ).rejects.toMatchObject({
-      name: "InvocationScopeDeniedError",
-      message: expect.stringContaining("company context is required"),
-    });
-
-    expect(secretsResolve).not.toHaveBeenCalled();
-  });
-});
-
-describe("back-fill runId when the worker echoes no invocation id", () => {
-  // The deployed platform.cad worker (cad ≤0.1.7) sends `secrets.resolve`
-  // with neither `runId` NOR `paperclipInvocationId` (verified: its bundled
-  // worker.js has zero `paperclipInvocation` references). The scope back-fill
-  // above therefore had nothing to resolve a scope from and the call failed closed
-  // at the server's secrets handler. This fix attributes such an id-less
-  // callback to the SINGLE in-flight host→worker dispatch and surfaces its
-  // host-validated scope via `singleInFlightScope`, so the runId back-fill
-  // succeeds — without trusting any worker-supplied field.
-
-  it("back-fills runId from the single in-flight dispatch when the worker omits the invocation id", async () => {
-    const secretsResolve = vi.fn(async (params: { secretRef: string; runId?: string }) => {
-      return `value-for-${params.secretRef}-via-${params.runId ?? "<missing>"}`;
-    });
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["secrets.read-ref"],
-      services: {
-        secrets: { resolve: secretsResolve },
-      } as unknown as HostServices,
-    });
-    const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: NOID_SECRETS_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: handlers,
-    });
-
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("executeTool", {
-          toolName: "cad.export",
-          parameters: {
-            secretRef: "11111111-1111-1111-1111-111111111111",
-          },
-          runContext: {
-            agentId: "agent-1",
-            runId: "run-pla719",
-            companyId: "company-a",
-            projectId: "project-1",
-          },
-        } as unknown as HostToWorkerMethods["executeTool"][0]),
-      ).resolves.toMatchObject({
-        data: {
-          resolvedTo: "value-for-11111111-1111-1111-1111-111111111111-via-run-pla719",
-        },
-      });
-
-      expect(secretsResolve).toHaveBeenCalledTimes(1);
-      // No runId AND no invocation id arrived on the wire; the host resolved
-      // the single in-flight executeTool dispatch and the gated wrapper
-      // back-filled runId from its host-validated scope. The restored
-      // upstream handler also threads the scope-validated companyId.
-      expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
-        secretRef: "11111111-1111-1111-1111-111111111111",
-        runId: "run-pla719",
-        companyId: "company-a",
-      });
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("does not back-fill (fails closed) when no scope is surfaced — neither invocationScope nor singleInFlightScope", async () => {
-    const secretsResolve = vi.fn(async () => "should-not-be-resolved");
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["secrets.read-ref"],
-      services: {
-        secrets: { resolve: secretsResolve },
-      } as unknown as HostServices,
-    });
-
-    // Context with invalidInvocationScope but NO singleInFlightScope models the
-    // ambiguous case (0 or 2+ dispatches in-flight). With upstream's
-    // company-context guard restored, the SDK denies before host services run
-    // — and names the unresolvable invocation scope as the reason.
-    await expect(
-      handlers["secrets.resolve"](
-        { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
-        { invalidInvocationScope: true },
-      ),
-    ).rejects.toMatchObject({
-      name: "InvocationScopeDeniedError",
-      message: expect.stringContaining("missing, expired, or unknown invocation scope"),
-    });
-
-    expect(secretsResolve).not.toHaveBeenCalled();
-  });
-
-  it("back-fills runId from singleInFlightScope while leaving company-scope enforcement to invalidInvocationScope", async () => {
-    const secretsResolve = vi.fn(
-      async (params: { secretRef: string; runId?: string }) => params.runId ?? "<missing>",
-    );
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["secrets.read-ref"],
-      services: {
-        secrets: { resolve: secretsResolve },
-      } as unknown as HostServices,
-    });
-
-    // A dispatch-attributed id-less callback (singleInFlightScope — the
-    // host-observed single in-flight dispatch, never a worker-supplied field)
-    // is the fork's legacy-worker accommodation: `forkLegacyScopeContext`
-    // presents it as the invocation scope so upstream's guard authorizes the
-    // call, and the host-derived runId back-fill rides along. The restored
-    // upstream handler shape threads the scope-validated companyId too.
-    await expect(
-      handlers["secrets.resolve"](
-        { secretRef: "11111111-1111-1111-1111-111111111111" } as never,
-        {
-          invalidInvocationScope: true,
-          singleInFlightScope: {
-            companyId: "company-a",
-            runId: "run-pla719",
-            agentId: "agent-1",
-          },
-        },
-      ),
-    ).resolves.toEqual("run-pla719");
-
-    expect(secretsResolve).toHaveBeenCalledWith(
-      {
-        secretRef: "11111111-1111-1111-1111-111111111111",
-        runId: "run-pla719",
-        companyId: "company-a",
-      },
-      expect.anything(), // the original host call context (upstream 2-arg shape)
-    );
-  });
-
-  it("cannot widen company scope: a worker naming company-b is denied even when singleInFlightScope is company-a", async () => {
-    // SEC invariant: the new `singleInFlightScope` feeds the runId
-    // back-fill ONLY. `requireInvocationCompanyScope` runs first, never reads
-    // `singleInFlightScope`, and the no-id branch always sets
-    // `invalidInvocationScope` — so a worker that names a *different* company in
-    // params is still denied. This pins that the field can't widen tenant scope.
-    const companiesGet = vi.fn(async (params: { companyId: string }) => ({ id: params.companyId }));
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["companies.read"],
-      services: {
-        companies: { get: companiesGet },
-      } as unknown as HostServices,
-    });
-
-    await expect(
-      handlers["companies.get"](
-        { companyId: "company-b" } as never,
-        {
-          invalidInvocationScope: true,
-          singleInFlightScope: {
-            companyId: "company-a",
-            runId: "run-pla719",
-            agentId: "agent-1",
-          },
-        },
-      ),
-    ).rejects.toMatchObject({
-      code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
-      message: expect.stringContaining("unknown invocation scope"),
-    });
-
-    expect(companiesGet).not.toHaveBeenCalled();
-  });
-});
-
-describe("inbound relay createComment authorized end-to-end under invalidInvocationScope", () => {
-  // The live fork.16 bug: an operator reply routed through the messenger's
-  // onWebhook/getUpdates path calls `ctx.issues.createComment` WITHOUT echoing a
-  // resolvable invocation id while a host→worker dispatch is in flight. The host
-  // base context surfaces `invalidInvocationScope: true` and attaches the
-  // worker-lifetime `serviceScope`. Pre-fix the SDK gate threw on
-  // `invalidInvocationScope` before reaching the allowlist bypass, so the
-  // comment was denied and never landed. This proves the FULL chain
-  // (contextForWorkerMessage → SDK gate) now authorizes the reach-checked,
-  // allowlisted createComment — guarding against a context-shape regression
-  // silently re-breaking the relay.
-
-  it("authorizes an id-less issues.createComment emitted during an in-flight dispatch (real worker)", async () => {
-    const createComment = vi.fn(async (params: { issueId: string; body: string; companyId: string }) => ({
-      id: `comment-for-${params.issueId}`,
-    }));
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["issue.comments.create"],
-      services: {
-        issues: { createComment },
-      } as unknown as HostServices,
-    });
-    const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: INBOUND_COMMENT_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: handlers,
-    });
-
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("executeTool", {
-          toolName: "messenger.route",
-          parameters: {
-            issueId: "issue-1",
-            body: "operator reply",
-            companyId: "company-a",
-          },
-          runContext: {
-            agentId: "agent-1",
-            runId: "run-pla818",
-            companyId: "company-a",
-            projectId: "project-1",
-          },
-        } as unknown as HostToWorkerMethods["executeTool"][0]),
-      ).resolves.toMatchObject({
-        data: { commentedVia: { id: "comment-for-issue-1" } },
-      });
-
-      // The nested createComment carried no invocation id (→ invalidInvocationScope
-      // in base context) yet was authorized via the serviceScope allowlist bypass.
-      expect(createComment).toHaveBeenCalledTimes(1);
-      expect(createComment).toHaveBeenCalledWith({
-        issueId: "issue-1",
-        body: "operator reply",
-        companyId: "company-a",
-      });
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-});
-
-describe("background dispatch run-context (item 1) + redaction cleanup (item 2)", () => {
-  const SECRET_REF = "11111111-1111-4111-8111-111111111111";
-
-  it("mints a company-scoped background run-context for an onEvent dispatch and threads its runId to the worker's secrets.resolve", async () => {
-    const registry = createPluginRunContextRegistry({ sweepIntervalMs: 60_000 });
-    const registerBackground = vi.spyOn(registry, "registerBackground");
-
-    const secretsResolve = vi.fn(
-      async (params: { secretRef: string; runId?: string }) =>
-        `value-via-${params.runId ?? "<missing>"}`,
-    );
-    const handlers = createHostClientHandlers({
-      pluginId: "test.plugin",
-      capabilities: ["secrets.read-ref"],
-      services: {
-        secrets: { resolve: secretsResolve },
-      } as unknown as HostServices,
-    });
-
-    const handle = createPluginWorkerHandle(
-      "test.plugin",
-      {
-        entrypointPath: ONEVENT_WORKER_ENTRYPOINT,
-        manifest: TEST_MANIFEST,
-        config: {},
-        instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-        apiVersion: 1,
-        hostHandlers: handlers,
-      },
-      { runContextRegistry: registry },
-    );
-
-    try {
-      await handle.start();
-
-      await handle.call("onEvent", {
-        event: { companyId: "company-a", secretRef: SECRET_REF },
-      } as unknown as HostToWorkerMethods["onEvent"][0]);
-
-      // A per-dispatch background ctx was minted for the TRIGGERING company.
-      expect(registerBackground).toHaveBeenCalledTimes(1);
-      const [, mintedRunId, companyId] = registerBackground.mock.calls[0]!;
-      expect(companyId).toBe("company-a");
-
-      // The worker's id-less secrets.resolve callback was back-filled with the
-      // minted background runId — NOT the worker-lifetime service runId. The
-      // restored upstream handler also threads the scope-validated companyId
-      // (here derived from the in-flight onEvent dispatch's own scope).
-      expect(secretsResolve).toHaveBeenCalledTimes(1);
-      expect(secretsResolve.mock.calls[0]?.[0]).toEqual({
-        secretRef: SECRET_REF,
-        runId: mintedRunId,
-        companyId: "company-a",
-      });
-      expect(mintedRunId).not.toBe(handle.serviceRunId);
-
-      // The per-dispatch ctx is cleared once the dispatch settles.
-      expect(registry.get("test.plugin", mintedRunId)).toBeNull();
-    } finally {
-      await handle.stop().catch(() => undefined);
-      registry.dispose();
-    }
-  });
-
-  it("clears the worker's service-runId redaction values on manager stopWorker (item 2)", async () => {
-    const registry = createPluginRunContextRegistry({ sweepIntervalMs: 60_000 });
-    const manager = createPluginWorkerManager({ runContextRegistry: registry });
-
-    const handle = await manager.startWorker("test.plugin", {
-      entrypointPath: ONEVENT_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: {},
-    });
-
-    const serviceRunId = handle.serviceRunId;
-    clearRunSecretValues(serviceRunId);
-
-    try {
-      // Simulate a background/setup-loop secrets.resolve registering plaintext
-      // under the service runId (TTL-exempt — lingers without explicit clear).
-      registerRunSecretValue(serviceRunId, "Zx7Qm2Lp9Rt4Wv6Yb1Nc");
-      expect(registeredRunCount()).toBeGreaterThan(0);
-
-      await manager.stopWorker("test.plugin");
-
-      // The service runId's plaintext is gone after stop.
-      expect(registeredRunCount()).toBe(0);
-    } finally {
-      clearRunSecretValues(serviceRunId);
-      await manager.stopAll().catch(() => undefined);
-      registry.dispose();
-    }
-  });
-});
-
-// Bounded worker→host IPC frame reader (OOM hardening).
-describe("resolveMaxIpcFrameBytes", () => {
-  const ENV_KEY = "PAPERCLIP_PLUGIN_MAX_IPC_FRAME_BYTES";
-  const original = process.env[ENV_KEY];
-
-  afterEach(() => {
-    if (original === undefined) delete process.env[ENV_KEY];
-    else process.env[ENV_KEY] = original;
-  });
-
-  it("prefers a valid explicit override", () => {
-    process.env[ENV_KEY] = "100";
-    expect(resolveMaxIpcFrameBytes(4096)).toBe(4096);
-  });
-
-  it("falls back to the env var when no override is given", () => {
-    process.env[ENV_KEY] = "12345";
-    expect(resolveMaxIpcFrameBytes()).toBe(12345);
-  });
-
-  it("ignores non-positive / non-finite values and uses the default", () => {
-    delete process.env[ENV_KEY];
-    const def = resolveMaxIpcFrameBytes();
-    expect(def).toBe(64 * 1024 * 1024);
-    expect(resolveMaxIpcFrameBytes(0)).toBe(def);
-    expect(resolveMaxIpcFrameBytes(-5)).toBe(def);
-    expect(resolveMaxIpcFrameBytes(Number.NaN)).toBe(def);
-    process.env[ENV_KEY] = "not-a-number";
-    expect(resolveMaxIpcFrameBytes()).toBe(def);
-  });
-});
-
-describe("createBoundedFrameReader", () => {
-  it("emits complete newline-delimited frames, including several in one chunk", () => {
-    const frames: string[] = [];
-    const reader = createBoundedFrameReader({
-      maxFrameBytes: 1024,
-      onFrame: (line) => frames.push(line),
-      onOversize: () => {
-        throw new Error("unexpected oversize");
-      },
-    });
-    reader.push(Buffer.from("a\nbb\nccc\n"));
-    expect(frames).toEqual(["a", "bb", "ccc"]);
-  });
-
-  it("reassembles a frame split across multiple chunks", () => {
-    const frames: string[] = [];
-    const reader = createBoundedFrameReader({
-      maxFrameBytes: 1024,
-      onFrame: (line) => frames.push(line),
-      onOversize: () => {
-        throw new Error("unexpected oversize");
-      },
-    });
-    reader.push(Buffer.from("hel"));
-    reader.push(Buffer.from("lo wor"));
-    reader.push(Buffer.from("ld\nnext\n"));
-    expect(frames).toEqual(["hello world", "next"]);
-  });
-
-  it("allows a frame exactly at the cap but trips one byte over", () => {
-    const atCap: string[] = [];
-    const atCapReader = createBoundedFrameReader({
-      maxFrameBytes: 8,
-      onFrame: (line) => atCap.push(line),
-      onOversize: () => {
-        throw new Error("should not trip at exactly the cap");
-      },
-    });
-    atCapReader.push(Buffer.from("12345678\n"));
-    expect(atCap).toEqual(["12345678"]);
-
-    const overFrames: string[] = [];
-    const trips: Array<{ bytesSeen: number; limit: number }> = [];
-    const overReader = createBoundedFrameReader({
-      maxFrameBytes: 8,
-      onFrame: (line) => overFrames.push(line),
-      onOversize: (info) => trips.push(info),
-    });
-    overReader.push(Buffer.from("123456789\n"));
-    expect(overFrames).toEqual([]);
-    expect(trips).toHaveLength(1);
-    expect(trips[0]!.limit).toBe(8);
-  });
-
-  it("trips before the full payload is buffered and resynchronizes on the next frame", () => {
-    const frames: string[] = [];
-    const trips: Array<{ bytesSeen: number; limit: number }> = [];
-    const reader = createBoundedFrameReader({
-      maxFrameBytes: 16,
-      onFrame: (line) => frames.push(line),
-      onOversize: (info) => trips.push(info),
-    });
-
-    // Stream a giant newline-less frame in small chunks, then a valid frame.
-    for (let i = 0; i < 1000; i++) {
-      reader.push(Buffer.from("x".repeat(64)));
-    }
-    // Trips exactly once; never accumulates the whole 64 KiB.
-    expect(trips).toHaveLength(1);
-    // bytesSeen is bounded near the cap + one chunk, not the 64 KiB total.
-    expect(trips[0]!.bytesSeen).toBeLessThanOrEqual(16 + 64);
-
-    // The next newline resynchronizes; subsequent valid frames parse again.
-    reader.push(Buffer.from("\nrecovered\n"));
-    expect(frames).toEqual(["recovered"]);
-    expect(trips).toHaveLength(1);
-  });
-});
-
-describe("plugin worker IPC frame cap (end-to-end)", () => {
-  it("terminates a worker that emits an over-limit IPC frame", async () => {
-    const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: OVERSIZE_FRAME_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: {},
-      autoRestart: false,
-      maxIpcFrameBytes: 4096,
-    });
-
-    const crashed = new Promise<void>((resolve) => {
-      handle.on("crash", () => resolve());
-    });
-
-    try {
-      await handle.start();
-
-      // Ask the worker to emit a single ~5 MiB newline-less frame, far above the
-      // 4 KiB cap. The host must drop + terminate rather than buffer it.
-      const call = handle.call(
-        "environmentExecute",
-        { oversizeBytes: 5 * 1024 * 1024 } as HostToWorkerMethods["environmentExecute"][0],
-      );
-      await expect(call).rejects.toThrow();
-      await crashed;
-      expect(handle.status).not.toBe("running");
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-});
-
-describe("plugin worker node IPC channel removal", () => {
-  it("spawns the worker with no live node IPC channel (fd 3 gone)", async () => {
-    const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: IPC_CHANNEL_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: {},
-      autoRestart: false,
-    });
-
-    try {
-      await handle.start();
-
-      const probe = (await handle.call(
-        "environmentExecute",
-        {} as HostToWorkerMethods["environmentExecute"][0],
-      )) as {
-        hasProcessSend: boolean;
-        hasChannel: boolean;
-        fd3Write: { threw: boolean; code?: string };
-      };
-
-      // The worker has no IPC channel: no `process.send`, no `process.channel`.
-      expect(probe.hasProcessSend).toBe(false);
-      expect(probe.hasChannel).toBe(false);
-      // The OOM bypass vector — a raw newline-less write to fd 3 — fails because
-      // the fd is not provisioned, so the host never buffers the payload.
-      expect(probe.fd3Write.threw).toBe(true);
     } finally {
       await handle.stop().catch(() => undefined);
     }
@@ -1494,7 +825,7 @@ describe("plugin proactive events.subscribe: options-seeded scope + filter parit
   // Each case drives a real worker so the subscribe flows through the manager's
   // context resolution exactly as it does in production.
   function makeEventsHandle(seededCompanies: readonly string[]) {
-    const eventsSubscribe = vi.fn(async () => undefined);
+    const eventsSubscribe = vi.fn(async (_params: unknown) => undefined);
     const hostHandlers = createHostClientHandlers({
       pluginId: "test.plugin",
       capabilities: ["events.subscribe"],
@@ -1880,17 +1211,6 @@ function ptyOpenInput(directive: unknown) {
   };
 }
 
-// Every case below drives a real fixture worker: a spawned child process that
-// speaks stdio JSON-RPC with the manager. On loaded CI runners the spawn plus
-// the round trips can outlast vitest's 5s default per-test timeout while the
-// manager is still healthy - its own open handshake allows 30s (see
-// SETUP_TOKEN_PTY_OPEN_TIMEOUT_MS) - which intermittently surfaced as a 5012ms
-// timeout on the "delivers output only for the exact bound worker session id
-// and drops a mismatch" case. Give the route-gate tests the same 30s headroom
-// the manager grants the open handshake. This only widens the timing bound;
-// every assertion, including the forged-session-id drop, is unchanged.
-const PTY_ROUTE_GATE_TEST_TIMEOUT_MS = 30_000;
-
 describe("plugin worker manager setup-token pty route gate", () => {
   it("rejects a command key that is not in the closed set before the worker call", async () => {
     const handle = makeLoginPtyHandle();
@@ -1947,7 +1267,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("permits two concurrent credential pseudo-terminals on one worker", async () => {
     const handle = makeLoginPtyHandle();
@@ -1968,7 +1288,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("delivers output only for the exact bound worker session id and drops a mismatch", async () => {
     const handle = makeLoginPtyHandle();
@@ -1995,85 +1315,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
-
-  it("delivers output that races the open reply in the same frame batch and drops a mismatch", async () => {
-    const handle = makeLoginPtyHandle();
-    try {
-      await handle.start();
-      // `batchWithOpenReply` makes the fixture write the open reply, the output
-      // frames, and the exit as one raw stdout write, so the host dispatches
-      // every frame before the open reply's promise continuation binds the
-      // route. The manager must buffer and replay such pre-bind frames:
-      // dropping them left `session.wait()` unsettled forever (the flaky CI
-      // timeout this pin guards against).
-      const session = await handle.openLoginPtySession(
-        ptyOpenInput({
-          workerSessionId: "ws-A",
-          batchWithOpenReply: true,
-          outputs: [
-            { chunk: "good-1" },
-            { chunk: "forged", sid: "ws-EVIL" },
-            { chunk: "good-2" },
-          ],
-          exitCode: 0,
-        }),
-      );
-      const chunks: string[] = [];
-      session.onData((chunk) => chunks.push(chunk));
-      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
-      // The replay applies the same sid check, so the forged frame is dropped
-      // and only the two bound chunks reach the listener, in order.
-      expect(chunks).toEqual(["good-1", "good-2"]);
-      await session.close();
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
-
-  it("drops non-string pre-bind chunks at admission and keeps them from consuming the buffer budget", async () => {
-    const handle = makeLoginPtyHandle({
-      loginPtyLimits: { maxPreBindChars: 1024 },
-    });
-    try {
-      await handle.start();
-      // `batchWithOpenReply` writes the open reply and the whole scripted
-      // flood in one raw stdout write, so every output frame lands in the
-      // pre-bind queue before the route binds. The first 300 frames carry a
-      // non-string chunk the post-bind routing would never deliver; the last
-      // two carry a valid string chunk. The queue's character bound is 1024,
-      // so a flood frame that was buffered whole (worker session id plus the
-      // serialized non-string chunk) would exhaust the bound and terminalize
-      // the route before the valid tail could replay. Admission must drop
-      // the undeliverable frames without charging them and retain a projected
-      // minimal copy of the deliverable ones.
-      const junkFrames = Array.from({ length: 300 }, () => ({
-        chunk: { blob: "x" },
-      }));
-      const outputs = [
-        ...junkFrames,
-        { chunk: "late-1" },
-        { chunk: "late-2" },
-      ];
-      const session = await handle.openLoginPtySession(
-        ptyOpenInput({
-          workerSessionId: "ws-A",
-          batchWithOpenReply: true,
-          outputs,
-          exitCode: 0,
-        }),
-      );
-      const chunks: string[] = [];
-      session.onData((chunk) => chunks.push(chunk));
-      // The exit still settles the wait, and only the valid string chunks
-      // reach the listener, in arrival order.
-      await expect(session.wait()).resolves.toEqual({ exitCode: 0 });
-      expect(chunks).toEqual(["late-1", "late-2"]);
-      await session.close();
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  }, 15_000);
 
   it("routes delayed input to the worker and back to the listener", async () => {
     const handle = makeLoginPtyHandle();
@@ -2087,17 +1329,12 @@ describe("plugin worker manager setup-token pty route gate", () => {
       session.write("browser-code");
       // The worker echoes the input as one output notification for the bound
       // session, so the listener receives it.
-      await vi.waitFor(
-        () => expect(chunks).toContain("echo:browser-code"),
-        // Delivery rides a real child-process round trip; give slow runners the
-        // same headroom as the surrounding test instead of the 1s waitFor default.
-        { timeout: 15_000 },
-      );
+      await vi.waitFor(() => expect(chunks).toContain("echo:browser-code"));
       await session.close();
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("terminalizes the route when the cumulative output passes the per-route bound", async () => {
     const handle = makeLoginPtyHandle({
@@ -2123,45 +1360,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
-
-  it("terminalizes the route when echoed input passes the per-route bound", async () => {
-    const handle = makeLoginPtyHandle({
-      loginPtyLimits: { maxTotalChars: 10 },
-    });
-    try {
-      await handle.start();
-      const session = await handle.openLoginPtySession(
-        ptyOpenInput({ workerSessionId: "ws-A" }),
-      );
-      // Drive the over-bound frame through the input-echo round trip instead
-      // of fixture-scripted outputs. Scripted outputs can coalesce with the
-      // open reply into one pipe read, in which case they are replayed before
-      // this test attaches the listener, and a terminalizing last frame wipes
-      // the route's not-yet-delivered buffer (terminalized routes deliver
-      // nothing — that fail-closed behavior is intentional). An echo can only
-      // come back after the matching input round trip, so the listener below
-      // is always attached first and the bound's delivery accounting is
-      // observed deterministically.
-      const chunks: string[] = [];
-      session.onData((chunk) => chunks.push(chunk));
-      session.write("aaaaa"); // "echo:aaaaa" = 10 chars ≤ 10 → delivered
-      await vi.waitFor(
-        () => expect(chunks).toContain("echo:aaaaa"),
-        // Delivery rides a real child-process round trip; give slow runners
-        // the same headroom as the surrounding tests.
-        { timeout: 15_000 },
-      );
-      session.write("bbbbb"); // "echo:bbbbb" would exceed 10 → terminalize
-      // The per-route bound terminalizes the route, so the login wait resolves
-      // with a null exit code and the over-bound echo never reaches the
-      // listener.
-      await expect(session.wait()).resolves.toEqual({ exitCode: null });
-      expect(chunks).toEqual(["echo:aaaaa"]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("terminalizes and fails closed on a malformed open reply, then admits a later open", async () => {
     const handle = makeLoginPtyHandle();
@@ -2180,7 +1379,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("terminalizes the route on an open timeout", async () => {
     const handle = makeLoginPtyHandle({
@@ -2194,7 +1393,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("binds the worker session id one time and ignores a duplicate open reply", async () => {
     const handle = makeLoginPtyHandle();
@@ -2218,7 +1417,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("closes the route with a fixed exit when the worker exits", async () => {
     const handle = makeLoginPtyHandle();
@@ -2235,7 +1434,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 
   it("retires the worker on an unconfirmed close acknowledgement", async () => {
     const handle = makeLoginPtyHandle({
@@ -2259,7 +1458,7 @@ describe("plugin worker manager setup-token pty route gate", () => {
     } finally {
       await handle.stop().catch(() => undefined);
     }
-  }, PTY_ROUTE_GATE_TEST_TIMEOUT_MS);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3304,585 +2503,6 @@ describe("plugin worker manager login pseudo-terminal pre-bind queue", () => {
         .map((arg) => JSON.stringify(arg))
         .join("\n");
       expect(loggedText).not.toContain(secretMarker);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-});
-
-// ---------------------------------------------------------------------------
-// Stream attribution: pinned out-of-dispatch emits
-// ---------------------------------------------------------------------------
-
-const STREAM_PIN_WORKER_ENTRYPOINT = path.join(FIXTURES_DIR, "plugin-worker-stream-pin.cjs");
-
-/**
- * performAction with a company-scoped actorContext derives an invocation
- * scope, so stream notifications the fixture sends while servicing it echo
- * the host-minted paperclipInvocation and resolve to that company. After the
- * call settles the invocation is cleared — later fixture notifications are
- * id-less with nothing in flight (the async-loop shape).
- */
-function companyAction(params: Record<string, unknown>, companyId: string) {
-  return {
-    key: "probe",
-    params,
-    actorContext: {
-      type: "agent",
-      userId: null,
-      agentId: "agent-1",
-      runId: "run-1",
-      companyId,
-    },
-    renderEnvironment: null,
-  } as unknown as HostToWorkerMethods["performAction"][0];
-}
-
-function streamChannels(callback: ReturnType<typeof vi.fn>) {
-  return callback.mock.calls.map(
-    (call) =>
-      `${call[0]}:${(call[1] as { channel?: string }).channel}:${
-        (call[1] as { companyId?: string }).companyId
-      }`,
-  );
-}
-
-describe("plugin stream attribution: pinned out-of-dispatch emits", () => {
-  function makePinHandle(onStreamNotification: ReturnType<typeof vi.fn>) {
-    return createPluginWorkerHandle("test.plugin", {
-      entrypointPath: STREAM_PIN_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: {},
-      onStreamNotification: onStreamNotification as unknown as (
-        method: string,
-        params: Record<string, unknown>,
-      ) => void,
-    });
-  }
-
-  it("forwards an out-of-dispatch emit for a channel pinned at an attributed open", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      // Open inside a company-1 dispatch: forwarded and pinned.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toEqual(["streams.open:printer-status:company-1"]);
-
-      // Emit after the dispatch settled (id-less, nothing in flight): the pin
-      // attributes it — the event must LAND, not silently vanish.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "printer-status", companyId: "company-1", event: { type: "status" } },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toEqual([
-        "streams.open:printer-status:company-1",
-        "streams.emit:printer-status:company-1",
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("drops an out-of-dispatch emit for an unpinned channel with a plugin-visible signal", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "never-opened", companyId: "company-1" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(onStreamNotification).not.toHaveBeenCalled();
-
-      // The drop is reported back to the worker (streams.dropped), never silent.
-      const drops = await handle.call("performAction", companyAction(
-        { scenario: "report-drops" },
-        "",
-      ));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.emit", channel: "never-opened", companyId: "company-1", reason: "unpinned_channel" },
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("drops an out-of-dispatch emit whose company mismatches the pin", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      // Cross-tenant attempt: the channel is pinned to company-1, the emit
-      // claims company-2 — fail closed with a visible signal.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "printer-status", companyId: "company-2" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toEqual(["streams.open:printer-status:company-1"]);
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.emit", channel: "printer-status", companyId: "company-2", reason: "pin_mismatch" },
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("clears the pin on close so later emits are dropped with a signal", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      // Out-of-dispatch close matching the pin: forwarded, pin cleared.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "close", channel: "printer-status", companyId: "company-1" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toEqual([
-        "streams.open:printer-status:company-1",
-        "streams.close:printer-status:company-1",
-      ]);
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "printer-status", companyId: "company-1" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toHaveLength(2);
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.emit", channel: "printer-status", companyId: "company-1", reason: "unpinned_channel" },
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("never pins from an id-less open during another company's dispatch", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      // Legacy worker shape: the open carries no paperclipInvocationId while a
-      // company-2 dispatch is in flight. The single-in-flight heuristic must
-      // NOT be trusted for pin capture — fail closed.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-idless", channel: "legacy-ch", companyId: "company-2" },
-          "company-2",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(onStreamNotification).not.toHaveBeenCalled();
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "legacy-ch", companyId: "company-2" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(onStreamNotification).not.toHaveBeenCalled();
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.open", channel: "legacy-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
-        { method: "streams.emit", channel: "legacy-ch", companyId: "company-2", reason: "unpinned_channel" },
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("never pins or delivers via proactive scope: id-less streams.* naming a proactively configured company drop with a signal", async () => {
-    const onStreamNotification = vi.fn();
-    // The proactive allowlist is the second would-be attribution source the
-    // pin design must not trust: a proactive scope is a timer/loop
-    // authorization, not a host-validated dispatch.
-    const handle = createPluginWorkerHandle("test.plugin", {
-      entrypointPath: STREAM_PIN_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: {},
-      proactiveCompanyScopes: ["proactive-co"],
-      onStreamNotification: onStreamNotification as unknown as (
-        method: string,
-        params: Record<string, unknown>,
-      ) => void,
-    });
-    try {
-      await handle.start();
-
-      // The trap dispatch derives no invocation scope (empty actorContext
-      // companyId), so its host→worker request pends WITHOUT an invocation
-      // while the fixture sends id-less streams.* naming the proactively
-      // configured company. Proactive resolution must not apply to
-      // streams.*: no pin, no publish, every notification dropped loudly.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "pin-proactive-trap", channel: "trap-ch", companyId: "proactive-co" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(onStreamNotification).not.toHaveBeenCalled();
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.open", channel: "trap-ch", companyId: "proactive-co", reason: "no_invocation_scope" },
-        { method: "streams.emit", channel: "trap-ch", companyId: "proactive-co", reason: "unpinned_channel" },
-        { method: "streams.close", channel: "trap-ch", companyId: "proactive-co", reason: "unpinned_channel" },
-      ]);
-
-      // Nothing was pinned, so a later out-of-dispatch emit stays dropped.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "trap-ch", companyId: "proactive-co" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(onStreamNotification).not.toHaveBeenCalled();
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("drops a company-agnostic notification on a pinned channel with a signal", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      // A pinned channel has a host-validated tenant, so a notification that
-      // claims NO company is an unattributable write to a known tenant's
-      // channel — not a wildcard broadcast. Fail closed at the attribution
-      // layer instead of relying on the SSE bridge's empty-companyId assert
-      // downstream.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "printer-status", companyId: "" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toEqual(["streams.open:printer-status:company-1"]);
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.emit", channel: "printer-status", reason: "pin_mismatch" },
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("pins from an in-dispatch emit so a seeded loop keeps landing", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      // First emit happens inside the dispatch (attributed), without an
-      // explicit open — the async-loop seed shape.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "loop-ch", companyId: "company-1", event: { n: 1 } },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "loop-ch", companyId: "company-1", event: { n: 2 } },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toEqual([
-        "streams.emit:loop-ch:company-1",
-        "streams.emit:loop-ch:company-1",
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("stamps pluginId when the manager-level onStreamNotification is wired", async () => {
-    const onManagerStreamNotification = vi.fn();
-    const manager = createPluginWorkerManager({
-      onStreamNotification: onManagerStreamNotification,
-    });
-    const handle = await manager.startWorker("pin.plugin", {
-      entrypointPath: STREAM_PIN_WORKER_ENTRYPOINT,
-      manifest: TEST_MANIFEST,
-      config: {},
-      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" },
-      apiVersion: 1,
-      hostHandlers: {},
-      autoRestart: false,
-    });
-
-    try {
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      expect(onManagerStreamNotification).toHaveBeenCalledWith({
-        pluginId: "pin.plugin",
-        method: "streams.open",
-        params: { channel: "printer-status", companyId: "company-1" },
-      });
-    } finally {
-      await manager.stopAll().catch(() => undefined);
-    }
-  });
-
-  it("never pins from an id-less open/emit naming a proactive-allowlisted company", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-      // The worker is configured (proactive allowlist) for company-2, so an
-      // id-less stream call naming company-2 must still never resolve a scope:
-      // pin capture requires an echoed, host-minted invocation id. While a
-      // company-2 dispatch is in flight, the id-less open+emit ride its pending
-      // request — exactly the traffic the proactive resolver used to see.
-      handle.setProactiveCompanyScopes(["company-2"]);
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-emit-idless", channel: "allowlist-ch", companyId: "company-2" },
-          "company-2",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(onStreamNotification).not.toHaveBeenCalled();
-
-      // After the dispatch settled there is still nothing pinned to leak
-      // through: the follow-up emit fails closed too.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "allowlist-ch", companyId: "company-2" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(onStreamNotification).not.toHaveBeenCalled();
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.open", channel: "allowlist-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
-        { method: "streams.emit", channel: "allowlist-ch", companyId: "company-2", reason: "invalid_invocation_scope" },
-        { method: "streams.emit", channel: "allowlist-ch", companyId: "company-2", reason: "unpinned_channel" },
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("fails closed on a pinned channel when a notification carries no company claim", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "printer-status", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      // No companyId claim at all on a pinned channel: the pin checks live in
-      // the companyId branch, so an unclaimed notification must not slip
-      // through unverified — and an unclaimed close must not tear the pin down.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "printer-status", event: { type: "status" } },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "close", channel: "printer-status" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      // The pin survived both unclaimed attempts: the claimed emit still lands.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "printer-status", companyId: "company-1", event: { n: 2 } },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      expect(streamChannels(onStreamNotification)).toEqual([
-        "streams.open:printer-status:company-1",
-        "streams.emit:printer-status:company-1",
-      ]);
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.emit", channel: "printer-status", reason: "pin_mismatch" },
-        { method: "streams.close", channel: "printer-status", reason: "pin_mismatch" },
-      ]);
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("caps pins per worker: oldest pin evicted, reported via streams.dropped, and no longer attributed", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      // One dispatch opens 130 host-verified channels: the first 128 pin, and
-      // capturing pins 129/130 evicts the two oldest pins (cap-ch-0/1).
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-burst", prefix: "cap-ch-", count: 130, companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      // Every open was verified in-dispatch and forwarded to the bus — the
-      // cap limits attribution memory, it does not silently swallow traffic.
-      expect(streamChannels(onStreamNotification)).toHaveLength(130);
-      expect(streamChannels(onStreamNotification)[0]).toBe("streams.open:cap-ch-0:company-1");
-      expect(streamChannels(onStreamNotification)[129]).toBe("streams.open:cap-ch-129:company-1");
-
-      // Both evictions are plugin-visible with the cap reason, oldest first.
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.open", channel: "cap-ch-0", companyId: "company-1", reason: "pin_cap_exceeded" },
-        { method: "streams.open", channel: "cap-ch-1", companyId: "company-1", reason: "pin_cap_exceeded" },
-      ]);
-
-      // An evicted channel lost out-of-dispatch attribution: fail closed with
-      // the unpinned signal (which the plugin also sees as a drop).
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "cap-ch-0", companyId: "company-1" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toHaveLength(130);
-
-      // A channel still under the cap keeps its pin: the emit lands.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "cap-ch-129", companyId: "company-1" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toHaveLength(131);
-      expect(streamChannels(onStreamNotification)[130]).toBe("streams.emit:cap-ch-129:company-1");
-    } finally {
-      await handle.stop().catch(() => undefined);
-    }
-  });
-
-  it("refreshes pin recency on re-open so the oldest untouched pin evicts first", async () => {
-    const onStreamNotification = vi.fn();
-    const handle = makePinHandle(onStreamNotification);
-    try {
-      await handle.start();
-
-      // Fill the cap exactly: 128 pinned channels.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-burst", prefix: "rec-ch-", count: 128, companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toHaveLength(128);
-
-      // Re-open rec-ch-0 — the re-capture refreshes its recency, so it is no
-      // longer the eviction candidate.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "rec-ch-0", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      // One more channel pushes the map over the cap: the oldest UNtouched
-      // pin (rec-ch-1) evicts, not the refreshed rec-ch-0.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "open-in-dispatch", channel: "rec-ch-128", companyId: "company-1" },
-          "company-1",
-        )),
-      ).resolves.toEqual({ ok: true });
-
-      const drops = await handle.call("performAction", companyAction({ scenario: "report-drops" }, ""));
-      expect((drops as { dropped: Array<Record<string, unknown>> }).dropped).toEqual([
-        { method: "streams.open", channel: "rec-ch-1", companyId: "company-1", reason: "pin_cap_exceeded" },
-      ]);
-
-      // The refreshed channel kept its pin: the out-of-dispatch emit lands.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "rec-ch-0", companyId: "company-1" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).toContain("streams.emit:rec-ch-0:company-1");
-
-      // The evicted channel fails closed.
-      await expect(
-        handle.call("performAction", companyAction(
-          { scenario: "emit", channel: "rec-ch-1", companyId: "company-1" },
-          "",
-        )),
-      ).resolves.toEqual({ ok: true });
-      expect(streamChannels(onStreamNotification)).not.toContain("streams.emit:rec-ch-1:company-1");
     } finally {
       await handle.stop().catch(() => undefined);
     }
