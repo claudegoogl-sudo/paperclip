@@ -4,7 +4,6 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LOW_TRUST_REVIEW_PRESET, buildSkillMentionHref } from "@paperclipai/shared";
 import {
-  LOW_TRUST_REVIEW_PRESET,
   SANCTIONED_BRIDGE_ENV_KEY,
   applyRunScopedMentionedSkillKeys,
   buildReferencedProjectRunObservability,
