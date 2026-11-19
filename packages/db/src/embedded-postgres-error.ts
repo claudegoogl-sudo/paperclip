@@ -35,6 +35,11 @@ function summarizeRecentLogs(recentLogs: string[]): string | null {
 
 function detectEmbeddedPostgresHint(recentLogs: string[]): string | null {
   const haystack = recentLogs.join("\n").toLowerCase();
+  if (haystack.includes("could not create semaphores") || haystack.includes("semget(")) {
+    return "Embedded PostgreSQL could not allocate operating-system semaphores. " +
+      "Check for stale PostgreSQL IPC resources and unfinished test servers. " +
+      "This is not disk exhaustion or a SQL lock limit; integration tests must not be skipped.";
+  }
   if (!haystack.includes("could not create shared memory segment")) {
     return null;
   }
@@ -85,8 +90,8 @@ export function formatEmbeddedPostgresError(
 ): Error {
   const baseError = toError(error, input.fallbackMessage);
   const recentLogs = input.recentLogs ?? [];
-  const parts = [scrubConnectionString(baseError.message)];
-  const hint = detectEmbeddedPostgresHint(recentLogs);
+  const parts = [baseError.message];
+  const hint = detectEmbeddedPostgresHint([baseError.message, ...recentLogs]);
   const recentSummary = summarizeRecentLogs(recentLogs);
 
   if (hint) {

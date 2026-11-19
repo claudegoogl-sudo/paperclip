@@ -1,4 +1,5 @@
 import { isExternalChatWaitAuthorizationContention } from "./native-runtime/chat-attachment-reuse.js";
+import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 
 export const CHAT_CONTROL_ADMISSION_RETRY_MIN_DELAY_MS = 50;
 export const CHAT_CONTROL_ADMISSION_RETRY_MAX_DELAY_MS = 150;
@@ -22,7 +23,8 @@ export async function retryChatControlAdmission<T>(
     try {
       return await attempt();
     } catch (error) {
-      if (retry >= 50 || !isExternalChatWaitAuthorizationContention(error)) throw error;
+      if (retry >= 50 || !(isExternalChatWaitAuthorizationContention(error)
+        || error instanceof NativeChatReviewPresentationContentionError)) throw error;
     }
     // The previous transaction has released all locks. The next attempt must
     // read current run ownership and close evidence again before admission.

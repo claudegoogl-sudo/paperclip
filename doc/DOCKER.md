@@ -245,9 +245,11 @@ PostgreSQL data persists in a named Docker volume (`pgdata`). Paperclip data per
 
 Both published ports bind to `127.0.0.1` by default (see [Published ports bind to loopback by default](#published-ports-bind-to-loopback-by-default)). The server reaches PostgreSQL over the Compose network at `db:5432`, so the published `5432` exists only for host-side tooling such as `psql -h 127.0.0.1`.
 Both Compose files pass `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` to the server.
-Set it to enable signed tool-action approvals, and keep it independent from
-`BETTER_AUTH_SECRET`. Leaving it unset preserves startup without approval-gated
-tool actions; those calls report `signing_secret_unconfigured`.
+When configured, keep it independent from `BETTER_AUTH_SECRET`. When unset,
+the server derives a separate signing key from its persisted secrets master key.
+Keep that key with database backups, and share the signing key or master key
+across processes serving the same instance. Approvals fail closed if valid key
+material cannot be loaded; rotating it can invalidate approvals and retry matching.
 
 ### Untrusted PR review
 

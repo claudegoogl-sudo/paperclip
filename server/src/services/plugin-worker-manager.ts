@@ -1,3 +1,6 @@
+import { pluginIdleManifestGeneration, type IdlePluginCatalogEntry } from "./plugin-idle-catalog.js";
+import { createHash, randomUUID } from "node:crypto";
+import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.js";
 /**
  * PluginWorkerManager — spawns and manages out-of-process plugin worker child
  * processes, routes JSON-RPC 2.0 calls over stdio, and handles lifecycle
@@ -18,8 +21,7 @@
  * @see PLUGIN_SPEC.md §13 — Host-Worker Protocol
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { fork, type ChildProcess } from "node:child_process";
 import { beginIdleTrackedWork, readTaskDrain, trackIdleWork } from "./task-admission.js";
 import { EventEmitter } from "node:events";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
@@ -65,17 +67,8 @@ import {
   type LoginCommandKey,
 } from "./login-command.js";
 import { logger } from "../middleware/logger.js";
-import {
-  getActorProvenance,
-  runWithActorProvenance,
-  runWithoutActorProvenance,
-  type ActorProvenance,
-} from "../middleware/actor-context.js";
-import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
-import { clearRunSecretValues } from "../run-secret-registry.js";
-import { redactSensitiveText } from "../redaction.js";
-import { redactSecretsForLog } from "../secret-patterns.js";
-import { sanitiseMeta } from "./plugin-host-services.js";
+import { measureRunPhase } from "./execution-preparation-timing.js";
+import { context as otelContext } from "@opentelemetry/api";
 import { traceparentFromContextToken } from "../instrumentation.js";
 
 // ---------------------------------------------------------------------------
@@ -131,6 +124,14 @@ const MAX_CONSECUTIVE_CRASHES = 10;
 
 /** Time window in which crashes are considered consecutive (10 minutes). */
 const CRASH_WINDOW_MS = 10 * 60 * 1_000;
+
+/**
+ * Maximum fail-closed retirements within {@link CRASH_WINDOW_MS} before the host
+ * stops replacing the worker. Unlike the crash counter, a successful restart does
+ * not reset this count, so a worker that initializes cleanly and is then retired
+ * again cannot restart in an unbounded loop.
+ */
+const MAX_CONSECUTIVE_RETIREMENTS = 5;
 
 /** Maximum number of stderr characters retained for worker failure context. */
 const MAX_STDERR_EXCERPT_CHARS = 8_000;
@@ -604,6 +605,16 @@ export interface WorkerStartOptions {
   maxIpcFrameBytes?: number;
   /** Whether to auto-restart on crash. Defaults to true. */
   autoRestart?: boolean;
+  /**
+   * Crash-recovery tuning. A test shortens the backoff and the retirement bound
+   * to exercise replacement without long waits.
+   */
+  crashRecovery?: {
+    /** The first restart delay, in milliseconds. Later attempts double it. */
+    minBackoffMs?: number;
+    /** Max fail-closed retirements in the crash window before restarts stop. */
+    maxConsecutiveRetirements?: number;
+  };
   /** Node.js execArgv passed to the child process. */
   execArgv?: string[];
   /** Environment variables passed to the child process. */
@@ -718,6 +729,8 @@ interface PendingRequest {
 }
 
 interface ActiveInvocation {
+  startupContextId?: string;
+  providerSpanBudget: {remaining:number};
   scope: PluginInvocationScope;
   /** Host→worker method of this host-issued dispatch (host-minted, never worker-supplied). */
   method?: string;
@@ -886,6 +899,10 @@ const BACKGROUND_DISPATCH_METHODS: ReadonlySet<string> = new Set([
  * with exponential backoff automatically when `autoRestart` is enabled.
  */
 export interface PluginWorkerHandle {
+  hasStartupWork?(): boolean;
+  drainStartup?(contextId: string): Promise<void>;
+  recoverStartupAcquisition?(contextId: string, creationOperationId: string): void;
+  retireStartup?(contextId: string): Promise<void>;
   prepareIdleSleep?(hold: { ownerId: string; expiresAt: number }): Promise<"none" | "present" | "unknown">;
   releaseIdleSleep?(): void;
   /** The plugin ID this worker serves. */
@@ -936,6 +953,8 @@ export interface PluginWorkerHandle {
     timeoutMs?: number,
     executeLogSink?: ExecuteLogSink,
     onWorkerSettled?: () => void,
+    startupContextId?: string,
+    observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
   ): Promise<HostToWorkerMethods[M][1]>;
 
   /**
@@ -1016,10 +1035,21 @@ export interface WorkerDiagnostics {
  * for starting/stopping all workers and routing RPC calls.
  */
 export interface PluginWorkerManager {
+  drainStartup?(contextId: string): Promise<void>;
+  recoverStartupAcquisition?(contextId: string, creationOperationId: string): void;
+  retireStartup?(contextId: string): Promise<void>;
   /** Subscribe after a worker successfully applies live company configuration. */
   onConfigApplied(listener: () => void): () => void;
+  /**
+   * Subscribe to every worker `ready`: first start, crash respawn, and a
+   * replacement handle from a restart. Unlike `getWorker(id).on("ready")`, it
+   * survives the handle being replaced. Returns the unsubscribe function.
+   */
+  onWorkerReady?(listener: (pluginId: string) => void): () => void;
   inspectIdleSleep?(hold: { ownerId: string; expiresAt: number }): Promise<{
     backgroundWork: "none" | "present" | "unknown"; pluginIds: string[];
+    catalogGeneration?: string;
+    catalog?: IdlePluginCatalogEntry[];
   }>;
   releaseIdleSleep?(): void;
   /**
@@ -1072,6 +1102,9 @@ export interface PluginWorkerManager {
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
     executeLogSink?: ExecuteLogSink,
+    onWorkerSettled?: () => void,
+    startupContextId?: string,
+    observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
   ): Promise<HostToWorkerMethods[M][1]>;
 
   /**
@@ -1119,7 +1152,7 @@ export interface PluginWorkerHandleDeps {
 export function createPluginWorkerHandle(
   pluginId: string,
   options: WorkerStartOptions,
-  deps: PluginWorkerHandleDeps = {},
+  onStartupWorkChanged?: () => void,
 ): PluginWorkerHandle {
   const log = logger.child({ service: "plugin-worker", pluginId });
   const runContextRegistry = deps.runContextRegistry;
@@ -1142,6 +1175,31 @@ export function createPluginWorkerHandle(
   // Unlike RPC promises, these survive timeouts. A late response is the
   // completion receipt. A worker crash cannot manufacture one.
   const unsettledCalls = new Map<string | number, () => void>();
+  const observedResults = new Map<string | number, {
+    contextId: string; response?: JsonRpcResponse; running?: Promise<void>;
+    creationOperationId?: string; track: () => void;
+    observe: (result: unknown) => Promise<void>; finish: () => void;
+  }>();
+  const startupCalls = new Map<string, Set<() => void>>();
+  const startupRetirements = new Map<string, Promise<void>>();
+  const startupHostHandlers = new Map<string, Set<Promise<void>>>();
+  const revokeStartupInvocations = (contextId: string) => {
+    for (const [id, invocation] of activeInvocations) {
+      if (invocation.startupContextId !== contextId) continue;
+      if (invocation.timer) clearTimeout(invocation.timer);
+      activeInvocations.delete(id);
+    }
+  };
+  const waitForStartupHandlers = async (contextId: string) => {
+    if (!startupHostHandlers.get(contextId)?.size) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => { while (startupHostHandlers.get(contextId)?.size) await Promise.all([...startupHostHandlers.get(contextId)!]); })(),
+        new Promise<never>((_resolve, reject) => { timer = setTimeout(() => reject(new Error("Task cleanup is still pending")), 15_000); timer.unref?.(); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  };
   const unsettledInspections = new Set<() => void>();
   let activeHostHandlers = 0;
   let idleHold: { ownerId: string; expiresAt: number; ready: boolean } | null = null;
@@ -1306,58 +1364,26 @@ export function createPluginWorkerHandle(
   let backoffTimer: ReturnType<typeof setTimeout> | null = null;
   let nextRestartAt: number | null = null;
 
-  // SECURITY-CRITICAL: tenant pin for stream channels. Maps channel → companyId.
-  // A pin is captured ONLY from a host-validated invocation scope: either a
-  // `streams.open` (or an in-dispatch `streams.emit`) whose echoed
-  // `paperclipInvocationId` resolves to an active host-minted invocation, with
-  // the notification's claimed companyId equal to that scope's companyId. Once
-  // pinned, out-of-dispatch `streams.emit`/`streams.close` notifications for
-  // the channel are tenant-verified against the pin per emit — the
-  // worker can never attribute a channel to a company it was not dispatched
-  // by, because the pin's value comes from the dispatch scope, never from the
-  // worker's claim. Pins live until `streams.close`, eviction under the
-  // per-worker cap (`MAX_PINNED_STREAM_CHANNELS`, least-recently captured
-  // first), or worker exit (crash emits a synthetic close and clears them
-  // below). An evicted channel keeps streaming in-dispatch — only its
-  // out-of-dispatch attribution and exit cleanup are given up.
-  const pinnedStreamChannels = new Map<string, string>();
+  // Fail-closed retirement tracking. A retirement kills the current process
+  // because the host cannot prove one of its routes is gone. The exit that
+  // follows replaces the process with a fresh one, bounded by
+  // `maxConsecutiveRetirements` within the crash window.
+  let retirementPending = false;
+  let consecutiveRetirements = 0;
+  let lastRetirementAt: number | null = null;
 
-  /**
-   * Capture a host-verified channel pin, evicting the least-recently captured
-   * pin when the worker is over `MAX_PINNED_STREAM_CHANNELS`.
-   *
-   * Recency: re-capturing an already-pinned channel moves it to newest, so a
-   * channel the worker is actively (re-)opening is never the eviction
-   * candidate. Every eviction is reported twice — never silently: a
-   * `streams.dropped` notification tells the PLUGIN its pin was evicted (so
-   * it knows out-of-dispatch emits for that channel will now fail closed),
-   * and the host warn log records it for querying.
-   */
-  function captureStreamPin(channel: string, companyId: string, sourceMethod: string): void {
-    pinnedStreamChannels.delete(channel);
-    pinnedStreamChannels.set(channel, companyId);
-    while (pinnedStreamChannels.size > MAX_PINNED_STREAM_CHANNELS) {
-      const oldest = pinnedStreamChannels.keys().next();
-      if (oldest.done) break;
-      const evictedChannel = oldest.value;
-      const evictedCompanyId = pinnedStreamChannels.get(evictedChannel) ?? "";
-      pinnedStreamChannels.delete(evictedChannel);
-      dropStreamNotification(
-        sourceMethod,
-        evictedChannel,
-        evictedCompanyId,
-        "pin_cap_exceeded",
-        "evicted plugin stream channel pin: worker exceeded the per-worker pinned-channel cap",
-      );
-    }
-  }
+  // Track open stream channels so we can emit synthetic close on crash.
+  // Maps channel → companyId.
+  const openStreamChannels = new Map<string, string>();
 
   // Shutdown coordination
   let intentionalStop = false;
 
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const autoRestart = options.autoRestart ?? true;
-  const maxIpcFrameBytes = resolveMaxIpcFrameBytes(options.maxIpcFrameBytes);
+  const minBackoffMs = options.crashRecovery?.minBackoffMs ?? MIN_BACKOFF_MS;
+  const maxConsecutiveRetirements =
+    options.crashRecovery?.maxConsecutiveRetirements ?? MAX_CONSECUTIVE_RETIREMENTS;
 
   // -----------------------------------------------------------------------
   // Status management
@@ -1434,24 +1460,51 @@ export function createPluginWorkerHandle(
   /**
    * Handle a JSON-RPC response from the worker (matching a pending request).
    */
+  function settleResponse(response: JsonRpcResponse): void {
+    const id = response.id!;
+    unsettledCalls.get(id)?.();
+    unsettledCalls.delete(id);
+    const pending = pendingRequests.get(id);
+    if (!pending) { log.warn({ id }, "received response for unknown request id"); return; }
+    clearTimeout(pending.timer);
+    pendingRequests.delete(id);
+    pending.resolve(response);
+  }
+
+  function processObservedResult(id: string | number): Promise<void> {
+    const observer = observedResults.get(id);
+    if (!observer?.response) return Promise.resolve();
+    if (observer.running) return observer.running;
+    const response = observer.response;
+    const processing = (async () => {
+      if (isJsonRpcSuccessResponse(response)) await observer.observe(response.result);
+      observedResults.delete(id);
+      observer.finish();
+      settleResponse(response);
+    })();
+    observer.running = processing;
+    void processing.catch(() => {
+      const pending = pendingRequests.get(id);
+      pending?.resolve(createErrorResponse(id, JSONRPC_ERROR_CODES.INTERNAL_ERROR, "Plugin result could not be recorded"));
+    }).finally(() => { if (observer.running === processing) observer.running = undefined; });
+    return processing;
+  }
+
   function handleResponse(response: JsonRpcResponse): void {
     const id = response.id;
     if (id === null || id === undefined) {
       log.warn("received response with null/undefined id");
       return;
     }
-
-    unsettledCalls.get(id)?.();
-    unsettledCalls.delete(id);
-    const pending = pendingRequests.get(id);
-    if (!pending) {
-      log.warn({ id }, "received response for unknown request id");
+    const observer = observedResults.get(id);
+    if (observer) {
+      if (observer.response) return;
+      observer.track();
+      observer.response = response;
+      void processObservedResult(id).catch(() => log.warn({ id }, "plugin result recording will retry during cleanup"));
       return;
     }
-
-    clearTimeout(pending.timer);
-    pendingRequests.delete(id);
-    pending.resolve(response);
+    settleResponse(response);
   }
 
   function readNonEmptyString(value: unknown): string | null {
@@ -1469,7 +1522,26 @@ export function createPluginWorkerHandle(
     if (!isRecord(params)) return null;
 
     const directCompanyId = readNonEmptyString(params.companyId);
-    if (directCompanyId) return { companyId: directCompanyId };
+    if (directCompanyId) {
+      if (method === "resourceLifecycle" && params.resourceType === "project" && readNonEmptyString(params.resourceId)) {
+        return { companyId: directCompanyId, projectGit: { projectId: params.resourceId as string } };
+      }
+      if (method === "workspaceOperation" && isRecord(params.operation)) {
+        const operation = params.operation;
+        const source = operation.kind === "prepare" ? operation.source : operation.binding;
+        const workspaceId = isRecord(source) ? readNonEmptyString(operation.kind === "prepare" ? source.id : source.projectWorkspaceId) : null;
+        const projectId = readNonEmptyString(params.projectId);
+        if (projectId && workspaceId && (operation.kind === "prepare" || operation.kind === "inspect" || operation.kind === "remove")) {
+          // Only foreground preparation may use a run. Maintenance uses project consent.
+          const runId = operation.kind === "prepare" ? readNonEmptyString(params.runId) : null;
+          const agentId = operation.kind === "prepare" ? readNonEmptyString(params.agentId) : null;
+          if (Boolean(runId) !== Boolean(agentId)) return { companyId: directCompanyId };
+          return { companyId: directCompanyId, projectGit: { projectId, workspaceId, operation: operation.kind,
+            ...(runId && agentId ? { runId, agentId } : {}) } };
+        }
+      }
+      return { companyId: directCompanyId };
+    }
 
     if (method === "performAction" && isRecord(params.actorContext)) {
       const companyId = readNonEmptyString(params.actorContext.companyId);
@@ -1512,39 +1584,13 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(
-    scope: PluginInvocationScope,
-    ttlMs?: number,
-    method?: HostToWorkerMethodName | string,
-  ): PluginInvocationContext {
-    // SECURITY-CRITICAL: for a background dispatch carrying a triggering company (and no
-    // dispatching agent runId of its own), mint a per-dispatch company-scoped
-    // run-context and surface its runId on the scope. The worker echoes it on
-    // its `secrets.resolve` callback (or the host back-fills it from this
-    // scope), so the resolve is company-scoped instead of falling through to
-    // the company-agnostic worker-lifetime service path.
-    let effectiveScope = scope;
-    let backgroundRunId: string | undefined;
-    if (
-      method !== undefined &&
-      BACKGROUND_DISPATCH_METHODS.has(method) &&
-      scope.companyId &&
-      !scope.runId &&
-      runContextRegistry
-    ) {
-      backgroundRunId = randomUUID();
-      effectiveScope = { ...scope, runId: backgroundRunId };
-      runContextRegistry.registerBackground(pluginId, backgroundRunId, scope.companyId);
-    }
-
-    // Mint a W3C `traceparent` from the active startup span, so the worker's
-    // provider span can parent to it. The host keeps the value on its own record
-    // (below) and never trusts the worker to supply the parent. Outside a
-    // measured startup step there is no active span, so this is undefined.
+  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+    // Keep the owning operation's parent host-side; workspace/runtime operations
+    // use the same per-invocation contract as measured provider startup.
     const activeStep = getActiveStepContext();
     const traceparent = activeStep
       ? traceparentFromContextToken(activeStep.parentContext)
-      : undefined;
+      : process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? traceparentFromContextToken(otelContext.active()) : undefined;
     const invocation: PluginInvocationContext = {
       id: randomUUID(),
       scope: effectiveScope,
@@ -1559,6 +1605,7 @@ export function createPluginWorkerHandle(
       ...(provenance ? { provenance } : {}),
       ...(method !== undefined ? { method } : {}),
     };
+    const entry: ActiveInvocation = { scope, traceparent, providerSpanBudget:{remaining:256} };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -1917,7 +1964,7 @@ export function createPluginWorkerHandle(
         { pluginId },
         "login pseudo-terminal close not acknowledged; retiring worker",
       );
-      void killProcess();
+      retireWorkerProcess();
     }
   }
 
@@ -2418,7 +2465,7 @@ export function createPluginWorkerHandle(
   // overflow. The host never logs the raw frame content on a violation.
   function retireDuplexWorkerOnViolation(reason: string): void {
     log.error({ pluginId }, `duplex channel ownership violation (${reason}); retiring worker`);
-    void killProcess();
+    retireWorkerProcess();
   }
 
   // Install a tombstone for a bound pair atomically with the removal of its live
@@ -2525,7 +2572,7 @@ export function createPluginWorkerHandle(
         { pluginId },
         "duplex channel close not acknowledged; retiring worker",
       );
-      void killProcess();
+      retireWorkerProcess();
     }
   }
 
@@ -3209,29 +3256,7 @@ export function createPluginWorkerHandle(
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
-    if (echoesInvocationId) echoObserved = true;
-    return {
-      invocationScope: entry.scope,
-      traceparent: entry.traceparent,
-      ...(entry.method ? { invocationDispatchMethod: entry.method } : {}),
-    };
-  }
-
-  /**
-   * Credential provenance for a worker→host request. Positive evidence only:
-   * resolved solely from an echoed, host-minted `paperclipInvocationId` that
-   * hits a live entry. SECURITY: the `singleInFlightScope` heuristic and every
-   * id-less path are deliberately NOT used — a global worker's id-less call
-   * may belong to no dispatch at all (timer, poll loop, job), and stamping it
-   * with whichever request is mid-flight would forge `board_key` attribution.
-   * `null` (recorded as NULL) is the correct answer when the id is absent.
-   */
-  function provenanceForWorkerRequest(message: JsonRpcRequest): ActorProvenance | null {
-    const invocationId = readNonEmptyString(
-      (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
-    );
-    if (!invocationId) return null;
-    return activeInvocations.get(invocationId)?.provenance ?? null;
+    return { invocationScope: entry.scope, traceparent: entry.traceparent, providerSpanBudget:entry.providerSpanBudget };
   }
 
   /**
@@ -3240,6 +3265,15 @@ export function createPluginWorkerHandle(
   async function handleWorkerRequest(request: JsonRpcRequest): Promise<void> {
     const done = beginIdleTrackedWork();
     activeHostHandlers++;
+    const invocationId = readNonEmptyString((request as { paperclipInvocationId?: unknown }).paperclipInvocationId);
+    const startupId = invocationId ? activeInvocations.get(invocationId)?.startupContextId : undefined;
+    let complete = () => {}, pending: Promise<void> | undefined;
+    if (startupId) {
+      pending = new Promise<void>(resolve => { complete = resolve; });
+      let handlers = startupHostHandlers.get(startupId);
+      if (!handlers) { handlers = new Set(); startupHostHandlers.set(startupId, handlers); }
+      handlers.add(pending);
+    }
     try {
       // A queued notification may already be running in the worker while its
       // prepare request is in flight. Let its writes finish until that worker
@@ -3251,7 +3285,12 @@ export function createPluginWorkerHandle(
         return;
       }
       await dispatchWorkerRequest(request);
-    } finally { activeHostHandlers--; done(); }
+    } finally {
+      if (pending) startupHostHandlers.get(startupId ?? "")?.delete(pending);
+      if (startupId && startupHostHandlers.get(startupId)?.size === 0) startupHostHandlers.delete(startupId);
+      complete(); activeHostHandlers--; done();
+      if (startupId) onStartupWorkChanged?.();
+    }
   }
 
   async function dispatchWorkerRequest(request: JsonRpcRequest): Promise<void> {
@@ -3749,6 +3788,8 @@ export function createPluginWorkerHandle(
     signal: NodeJS.Signals | null,
   ): void {
     const wasIntentional = intentionalStop;
+    const wasRetired = retirementPending;
+    retirementPending = false;
 
     // The stdout/stderr readers are plain `data` listeners on the child's
     // streams, which are destroyed when the process exits — no explicit
@@ -3767,6 +3808,11 @@ export function createPluginWorkerHandle(
     // Read-only requests cannot continue in an exited worker. Do not infer
     // completion for execute/cleanup calls, whose provider work may outlive it.
     for (const finish of [...unsettledInspections]) finish();
+    for (const [id, observer] of observedResults) {
+      if (observer.response) continue;
+      observedResults.delete(id);
+      observer.finish();
+    }
 
     // Close the one login pseudo-terminal route with a fixed non-secret exit and
     // clear the route one time. The pending pseudo-terminal calls
@@ -3793,9 +3839,15 @@ export function createPluginWorkerHandle(
     emitter.emit("exit", { pluginId, code, signal });
 
     if (wasIntentional) {
-      // Graceful stop — status is already "stopping" or will be set to "stopped"
+      // Graceful stop — status is already "stopping" or will be set to "stopped".
+      // A deliberate stop that races a retirement stays stopped.
       setStatus("stopped");
       log.info({ code, signal }, "worker process stopped");
+      return;
+    }
+
+    if (wasRetired) {
+      handleRetiredProcessExit(code, signal);
       return;
     }
 
@@ -3822,11 +3874,49 @@ export function createPluginWorkerHandle(
     emitter.emit("crash", { pluginId, code, signal, willRestart });
 
     if (willRestart) {
-      scheduleRestart();
+      scheduleRestart(consecutiveCrashes);
     } else {
       log.error(
         { consecutiveCrashes, maxCrashes: MAX_CONSECUTIVE_CRASHES },
         "max consecutive crashes reached, not restarting",
+      );
+    }
+  }
+
+  // The retired process is gone, together with every route, reservation, and
+  // tombstone it held (the exit path above already settled them as failed).
+  // Replace it with a fresh process through the same backoff timer a crash uses.
+  // The fresh process starts with empty route state, and host route ids are
+  // monotonic, so no retired route can resolve against it. The retirement count
+  // survives a successful restart, so repeated retirements stop restarting after
+  // `maxConsecutiveRetirements` within the crash window.
+  function handleRetiredProcessExit(
+    code: number | null,
+    signal: NodeJS.Signals | null,
+  ): void {
+    totalCrashes++;
+    const now = Date.now();
+    if (lastRetirementAt !== null && now - lastRetirementAt > CRASH_WINDOW_MS) {
+      consecutiveRetirements = 0;
+    }
+    consecutiveRetirements++;
+    lastRetirementAt = now;
+
+    const willRestart = autoRestart && consecutiveRetirements <= maxConsecutiveRetirements;
+    log.error(
+      { code, signal, consecutiveRetirements, totalCrashes, willRestart },
+      "retired worker process exited",
+    );
+
+    setStatus("crashed");
+    emitter.emit("crash", { pluginId, code, signal, willRestart });
+
+    if (willRestart) {
+      scheduleRestart(consecutiveRetirements);
+    } else {
+      log.error(
+        { consecutiveRetirements, maxRetirements: maxConsecutiveRetirements },
+        "max consecutive worker retirements reached, not restarting",
       );
     }
   }
@@ -3853,23 +3943,23 @@ export function createPluginWorkerHandle(
   // Crash recovery with exponential backoff
   // -----------------------------------------------------------------------
 
-  function computeBackoffMs(): number {
-    // Exponential backoff: MIN_BACKOFF * MULTIPLIER^(consecutiveCrashes - 1)
+  function computeBackoffMs(attempt: number): number {
+    // Exponential backoff: MIN_BACKOFF * MULTIPLIER^(attempt - 1)
     const delay =
-      MIN_BACKOFF_MS * Math.pow(BACKOFF_MULTIPLIER, consecutiveCrashes - 1);
+      minBackoffMs * Math.pow(BACKOFF_MULTIPLIER, Math.max(attempt, 1) - 1);
     // Add jitter: ±25%
     const jitter = delay * 0.25 * (Math.random() * 2 - 1);
     return Math.min(Math.round(delay + jitter), MAX_BACKOFF_MS);
   }
 
-  function scheduleRestart(): void {
-    const delay = computeBackoffMs();
+  function scheduleRestart(attempt: number): void {
+    const delay = computeBackoffMs(attempt);
     nextRestartAt = Date.now() + delay;
 
     setStatus("backoff");
 
     log.info(
-      { delayMs: delay, consecutiveCrashes },
+      { delayMs: delay, attempt },
       "scheduling restart with backoff",
     );
 
@@ -3879,7 +3969,7 @@ export function createPluginWorkerHandle(
       // A temporary idle hold must not consume the crash-recovery attempt.
       // Keep the bounded backoff until admission reopens.
       if (readTaskDrain(new Date())?.ownerId) {
-        scheduleRestart();
+        scheduleRestart(attempt);
         return;
       }
       try {
@@ -3911,6 +4001,7 @@ export function createPluginWorkerHandle(
     }
 
     intentionalStop = false;
+    retirementPending = false;
     setStatus("starting");
     stderrExcerpt = "";
 
@@ -4071,19 +4162,17 @@ export function createPluginWorkerHandle(
     });
   }
 
-  /**
-   * SECURITY-CRITICAL: SIGKILL a worker that sent an oversized IPC frame. Deliberately
-   * does NOT set `intentionalStop`, so {@link handleProcessExit} treats the
-   * death as a crash and the normal exponential-backoff / consecutive-crash
-   * ceiling applies — a worker that keeps emitting oversized frames is
-   * eventually abandoned rather than restarted forever.
-   */
-  function terminateForOversizeFrame(): void {
+  // Retire the current process on a fail-closed route violation. Unlike
+  // `killProcess`, this is not a deliberate stop: the exit replaces the process
+  // with a fresh one. A deliberate stop already in progress wins, so a plugin
+  // disable, upgrade, or shutdown still ends stopped.
+  function retireWorkerProcess(): void {
     if (!childProcess) return;
+    if (!intentionalStop) retirementPending = true;
     try {
       childProcess.kill("SIGKILL");
     } catch {
-      // Process may already be dead.
+      // Process may already be dead; its exit event still runs the exit path.
     }
   }
 
@@ -4196,8 +4285,31 @@ export function createPluginWorkerHandle(
     meterDuplexWrite = false,
     onRequestId?: (id: number) => void,
     onWorkerSettled?: () => void,
+    startupContextId?: string,
+    observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
+  ): Promise<HostToWorkerMethods[M][1]> {
+    const dispatched = measureRunPhase("execution.plugin_dispatch", () => callInternalRaw(method, params, timeoutMs, executeLogSink, onWorkerSettled, startupContextId, observeResult));
+    // Tracing wraps the RPC in a new promise. Guard the promise handed to the
+    // caller as well, without swallowing its eventual rejection for that caller.
+    void dispatched.catch(() => undefined);
+    return dispatched;
+  }
+
+  function callInternalRaw<M extends HostToWorkerMethodName>(
+    method: M,
+    params: HostToWorkerMethods[M][0],
+    timeoutMs?: number,
+    executeLogSink?: ExecuteLogSink,
+    onWorkerSettled?: () => void,
+    startupContextId?: string,
+    observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
   ): Promise<HostToWorkerMethods[M][1]> {
     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
+      if (startupContextId && startupRetirements.has(startupContextId)) {
+        onWorkerSettled?.();
+        reject(new Error("Plugin startup group is retiring"));
+        return;
+      }
       const idleControl = method === "prepareIdleSleep" || method === "releaseIdleSleep";
       if (!idleControl && method !== "shutdown" && idleSleepHeld()) {
         onWorkerSettled?.();
@@ -4207,9 +4319,10 @@ export function createPluginWorkerHandle(
       if (!childProcess?.stdin?.writable) {
         onWorkerSettled?.();
         reject(
-          new Error(
-            `Cannot call "${method}" — worker for "${pluginId}" is not running`,
-          ),
+          // The status can still read "running" while the child's stdin is
+          // closed, so no status is reported for this refusal.
+          new PluginWorkerUnavailableError({ pluginId, workerStatus: null,
+            message: `Cannot call "${method}" — worker for "${pluginId}" is not running` }),
         );
         return;
       }
@@ -4224,14 +4337,44 @@ export function createPluginWorkerHandle(
           finishIdle();
           unsettledInspections.delete(finish);
           unsettledCalls.delete(id);
+          startupCalls.get(startupContextId ?? "")?.delete(finish);
+          if (startupContextId && startupCalls.get(startupContextId)?.size === 0) startupCalls.delete(startupContextId);
           onWorkerSettled?.();
+          if (startupContextId) onStartupWorkChanged?.();
         };
         unsettledCalls.set(id, finish);
+        if (startupContextId) {
+          let calls = startupCalls.get(startupContextId);
+          if (!calls) { calls = new Set(); startupCalls.set(startupContextId, calls); }
+          calls.add(finish);
+        }
         if (method === "environmentInspectLease") unsettledInspections.add(finish);
+      }
+      if (observeResult && startupContextId) {
+        let processing: Promise<void> | undefined, finish!: () => void;
+        const track = () => {
+          if (processing) return;
+          processing = new Promise<void>(resolve => { finish = resolve; });
+          let handlers = startupHostHandlers.get(startupContextId);
+          if (!handlers) { handlers = new Set(); startupHostHandlers.set(startupContextId, handlers); }
+          handlers.add(processing);
+        };
+        track();
+        observedResults.set(id, { contextId: startupContextId,
+          creationOperationId: method === "environmentAcquireLease" && isRecord(params) ? readNonEmptyString((params as Record<string, unknown>).creationOperationId) ?? undefined : undefined,
+          track, observe: observeResult as (result: unknown) => Promise<void>, finish: () => {
+            if (!processing) return;
+            startupHostHandlers.get(startupContextId)?.delete(processing);
+            if (startupHostHandlers.get(startupContextId)?.size === 0) startupHostHandlers.delete(startupContextId);
+            processing = undefined;
+            finish();
+            onStartupWorkChanged?.();
+          } });
       }
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope, undefined, method) : null;
+      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      if (invocation && startupContextId) activeInvocations.get(invocation.id)!.startupContextId = startupContextId;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived
       // invocation scope, never from the worker. This binds the sink to the
@@ -4295,6 +4438,8 @@ export function createPluginWorkerHandle(
       } catch (err) {
         clearTimeout(timer);
         pendingRequests.delete(id);
+        observedResults.get(id)?.finish();
+        observedResults.delete(id);
         unsettledCalls.get(id)?.();
         unsettledCalls.delete(id);
         clearInvocation(invocation);
@@ -4383,6 +4528,33 @@ export function createPluginWorkerHandle(
       await stopInternal();
       await startInternal();
     },
+    hasStartupWork() { return startupCalls.size > 0 || startupHostHandlers.size > 0 || startupRetirements.size > 0; },
+    recoverStartupAcquisition(contextId: string, creationOperationId: string) {
+      for (const observer of observedResults.values()) {
+        if (observer.contextId === contextId && observer.creationOperationId === creationOperationId && !observer.response) observer.finish();
+      }
+    },
+    async drainStartup(contextId: string) {
+      revokeStartupInvocations(contextId);
+      for (const [id, observer] of observedResults) if (observer.contextId === contextId) void processObservedResult(id).catch(() => undefined);
+      await waitForStartupHandlers(contextId);
+    },
+    async retireStartup(contextId: string) {
+      const current = startupRetirements.get(contextId);
+      if (current) return current;
+      const retiring = (async () => {
+        revokeStartupInvocations(contextId);
+        for (const [id, observer] of observedResults) if (observer.contextId === contextId) void processObservedResult(id).catch(() => undefined);
+        await waitForStartupHandlers(contextId);
+        for (const finish of [...startupCalls.get(contextId) ?? []]) finish();
+      })();
+      startupRetirements.set(contextId, retiring);
+      try { await retiring; }
+      finally {
+        if (startupRetirements.get(contextId) === retiring) startupRetirements.delete(contextId);
+        onStartupWorkChanged?.();
+      }
+    },
 
     call<M extends HostToWorkerMethodName>(
       method: M,
@@ -4390,16 +4562,17 @@ export function createPluginWorkerHandle(
       timeoutMs?: number,
       executeLogSink?: ExecuteLogSink,
       onWorkerSettled?: () => void,
+      startupContextId?: string,
+      observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
     ): Promise<HostToWorkerMethods[M][1]> {
       if (status !== "running" && status !== "starting") {
         onWorkerSettled?.();
         return Promise.reject(
-          new Error(
-            `Cannot call "${method}" — worker for "${pluginId}" is ${status}`,
-          ),
+          new PluginWorkerUnavailableError({ pluginId, workerStatus: status,
+            message: `Cannot call "${method}" — worker for "${pluginId}" is ${status}` }),
         );
       }
-      return callInternal(method, params, timeoutMs, executeLogSink, false, undefined, onWorkerSettled);
+      return callInternal(method, params, timeoutMs, executeLogSink, onWorkerSettled, startupContextId, observeResult);
     },
 
     openLoginPtySession(input: LoginPtyOpenInput) {
@@ -4650,7 +4823,16 @@ export function createPluginWorkerManager(
 ): PluginWorkerManager {
   const log = logger.child({ service: "plugin-worker-manager" });
   const workers = new Map<string, PluginWorkerHandle>();
+  const retiredStartupWorkers = new Set<PluginWorkerHandle>();
+  const retainStartupWorker = (handle: PluginWorkerHandle) => {
+    if (handle.hasStartupWork?.()) retiredStartupWorkers.add(handle);
+  };
+  const pruneStartupWorker = (handle: PluginWorkerHandle) => {
+    if (!handle.hasStartupWork?.()) retiredStartupWorkers.delete(handle);
+  };
+  const startupWorkers = () => new Set([...workers.values(), ...retiredStartupWorkers]);
   const configApplied = new Set<() => void>();
+  const workerReady = new Set<(pluginId: string) => void>();
   let activeInspections = 0;
   /** Per-plugin startup locks to prevent concurrent spawn races. */
   const startupLocks = new Map<string, Promise<PluginWorkerHandle>>();
@@ -4661,10 +4843,18 @@ export function createPluginWorkerManager(
     managerOptions?.maxConcurrentDuplexRoutes,
   );
 
+  const idleWorkerIdentities = new WeakMap<PluginWorkerHandle, string>();
+  const idleWorkerManifests = new WeakMap<PluginWorkerHandle, string>();
+  const idleManagerGeneration = randomUUID();
+  let nextIdleWorkerIdentity = 0;
   return {
     onConfigApplied(listener) {
       configApplied.add(listener);
       return () => { configApplied.delete(listener); };
+    },
+    onWorkerReady(listener) {
+      workerReady.add(listener);
+      return () => { workerReady.delete(listener); };
     },
     async inspectIdleSleep(hold) {
       if (startupLocks.size) return { backgroundWork: "unknown", pluginIds: [] };
@@ -4675,7 +4865,16 @@ export function createPluginWorkerManager(
         return { backgroundWork: "unknown", pluginIds: [] };
       }
       const backgroundWork = results.includes("present") ? "present" : results.includes("unknown") ? "unknown" : "none";
-      return { backgroundWork, pluginIds: backgroundWork === "none" ? snapshot.map(([id]) => id) : [] };
+      const catalogGeneration = createHash("sha256").update(JSON.stringify([idleManagerGeneration, snapshot.map(([id, worker]) => {
+        let identity = idleWorkerIdentities.get(worker);
+        if (!identity) { identity = String(++nextIdleWorkerIdentity); idleWorkerIdentities.set(worker, identity); }
+        return [id, identity, idleWorkerManifests.get(worker)];
+      })])).digest("hex");
+      const catalog = snapshot.flatMap(([pluginId, worker]) => {
+        const manifestGeneration = idleWorkerManifests.get(worker);
+        return manifestGeneration ? [{ pluginId, manifestGeneration }] : [];
+      });
+      return { backgroundWork, pluginIds: backgroundWork === "none" ? snapshot.map(([id]) => id) : [], catalogGeneration, catalog };
     },
     releaseIdleSleep() {
       for (const worker of workers.values()) worker.releaseIdleSleep?.();
@@ -4703,21 +4902,16 @@ export function createPluginWorkerManager(
         // caller already supplied its own (a test may inject its own).
         duplexRouteSlots,
         ...options,
-        // Stamp the emitting pluginId on stream notifications fanned out at the
-        // manager level, unless the caller supplied its own per-worker callback.
-        onStreamNotification:
-          options.onStreamNotification ??
-          (managerOptions?.onStreamNotification
-            ? (method, params) => {
-                const notify = managerOptions.onStreamNotification;
-                if (notify) notify({ pluginId, method, params });
-              }
-            : undefined),
-      }, {
-        runContextRegistry: managerOptions?.runContextRegistry,
-        workerLogPersist: managerOptions?.workerLogPersist,
-      });
+      }, () => pruneStartupWorker(handle));
+      idleWorkerManifests.set(handle, pluginIdleManifestGeneration(options.manifest));
+      if (existing) retainStartupWorker(existing);
       workers.set(pluginId, handle);
+      handle.on("ready", (payload) => {
+        for (const listener of [...workerReady]) {
+          try { listener(payload.pluginId); }
+          catch (err) { log.warn({ err, pluginId: payload.pluginId }, "worker ready listener failed"); }
+        }
+      });
 
       // SECURITY-CRITICAL: register the worker-lifetime service run-context so background
       // dispatches / setup() loops can resolve secrets (system actor). Stable
@@ -4786,16 +4980,21 @@ export function createPluginWorkerManager(
 
       log.info({ pluginId }, "stopping plugin worker");
       await trackIdleWork(handle.stop());
-      managerOptions?.runContextRegistry?.deregister(pluginId, handle.serviceRunId);
-      // SECURITY-CRITICAL: the service runId is TTL-exempt in the redaction map,
-      // so without this its resolved plaintext would linger for the process
-      // lifetime (lazy prune only). Clear it on stop.
-      clearRunSecretValues(handle.serviceRunId);
-      workers.delete(pluginId);
+      retainStartupWorker(handle);
+      if (workers.get(pluginId) === handle) workers.delete(pluginId);
     },
 
     getWorker(pluginId: string): PluginWorkerHandle | undefined {
       return workers.get(pluginId);
+    },
+    async retireStartup(contextId: string) {
+      await Promise.all([...startupWorkers()].map(worker => worker.retireStartup?.(contextId)));
+    },
+    recoverStartupAcquisition(contextId: string, creationOperationId: string) {
+      for (const worker of startupWorkers()) worker.recoverStartupAcquisition?.(contextId, creationOperationId);
+    },
+    async drainStartup(contextId: string) {
+      await Promise.all([...startupWorkers()].map(worker => worker.drainStartup?.(contextId)));
     },
 
     isRunning(pluginId: string): boolean {
@@ -4822,10 +5021,12 @@ export function createPluginWorkerManager(
             },
             "error stopping worker during shutdown",
           );
+        } finally {
+          retainStartupWorker(handle);
+          if (workers.get(handle.pluginId) === handle) workers.delete(handle.pluginId);
         }
       });
       await Promise.all(promises);
-      workers.clear();
     },
 
     diagnostics(): WorkerDiagnostics[] {
@@ -4838,23 +5039,36 @@ export function createPluginWorkerManager(
       params: HostToWorkerMethods[M][0],
       timeoutMs?: number,
       executeLogSink?: ExecuteLogSink,
+      onWorkerSettled?: () => void,
+      startupContextId?: string,
+      observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
     ): Promise<HostToWorkerMethods[M][1]> {
       const handle = workers.get(pluginId);
+      if (!startupContextId && ["environmentReleaseLease", "environmentDestroyLease"].includes(method)) {
+        const cleanup = (params as { leaseMetadata?: { runnerTaskStartupCleanup?: { contextId?: unknown; requiresPreparationStop?: unknown } } }).leaseMetadata?.runnerTaskStartupCleanup;
+        if (typeof cleanup?.requiresPreparationStop === "boolean" && typeof cleanup.contextId === "string" && cleanup.contextId.trim()) startupContextId = cleanup.contextId.trim();
+      }
       if (!handle) {
+        onWorkerSettled?.();
         return Promise.reject(
-          new Error(`No worker registered for plugin "${pluginId}"`),
+          new PluginWorkerUnavailableError({ pluginId, workerStatus: null,
+            message: `No worker registered for plugin "${pluginId}"` }),
         );
       }
       let finishInspection: (() => void) | undefined;
       if (method === "environmentInspectLease") {
-        if (activeInspections >= 2) return Promise.reject(new Error("Provider inspection concurrency limit reached"));
+        if (activeInspections >= 2) {
+          onWorkerSettled?.();
+          return Promise.reject(new Error("Provider inspection concurrency limit reached"));
+        }
         activeInspections += 1;
         let finished = false;
         finishInspection = () => { if (!finished) { finished = true; activeInspections -= 1; } };
       }
       // A caller timeout is not worker completion. Inspection capacity is
       // released only by its actual reply, send failure, or worker exit.
-      const result = handle.call(method, params, timeoutMs, executeLogSink, finishInspection);
+      const finish = onWorkerSettled ? () => { finishInspection?.(); onWorkerSettled(); } : finishInspection;
+      const result = handle.call(method, params, timeoutMs, executeLogSink, finish, startupContextId, observeResult);
       if (method === "configChanged") void result.then(() => {
         for (const listener of configApplied) {
           try { listener(); }
@@ -4868,7 +5082,8 @@ export function createPluginWorkerManager(
       const handle = workers.get(pluginId);
       if (!handle) {
         return Promise.reject(
-          new Error(`No worker registered for plugin "${pluginId}"`),
+          new PluginWorkerUnavailableError({ pluginId, workerStatus: null,
+            message: `No worker registered for plugin "${pluginId}"` }),
         );
       }
       return handle.openLoginPtySession(input);

@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import { pgTable, uuid, text, timestamp, jsonb, index } from "drizzle-orm/pg-core";
 import { companies } from "./companies.js";
 import { agents } from "./agents.js";
@@ -45,10 +46,14 @@ export const activityLog = pgTable(
     ),
     runIdIdx: index("activity_log_run_id_idx").on(table.runId),
     entityIdx: index("activity_log_entity_type_id_idx").on(table.entityType, table.entityId),
-    // Serves the per-issue MAX(created_at) lookup behind issue-list ordering as a single
-    // index seek. Without the trailing created_at the planner instead scans
-    // activity_log_company_created_idx backwards across the whole company per row.
-    companyEntityCreatedIdx: index("activity_log_company_entity_created_idx")
-      .on(table.companyId, table.entityType, table.entityId, table.createdAt),
+    companyEntityCreatedIdx: index("activity_log_company_entity_created_idx").on(
+      table.companyId,
+      table.entityType,
+      table.entityId,
+      table.createdAt,
+    ),
+    companyUserIssueActorIdx: index("activity_log_company_user_issue_actor_idx")
+      .on(table.companyId, table.actorId, table.entityId)
+      .where(sql`${table.actorType} = 'user' AND ${table.entityType} = 'issue'`),
   }),
 );
