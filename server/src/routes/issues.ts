@@ -14706,7 +14706,7 @@ export function issueRoutes(
         { name: "comment", value: req.body.comment },
         { name: "title", value: req.body.title },
       ], { issueId: existing.id, companyId: existing.companyId })) return;
-      if (!(await assertIssueReadAllowed(req, res, existing))) return;
+      if (!crossCompanyPatch && !(await assertIssueReadAllowed(req, res, existing))) return;
       await assertNativeRunKeepsOwnExecutionLock(req, existing);
       if (req.body.expectedStatusVersion !== undefined && (
         existing.statusVersion !== req.body.expectedStatusVersion || existing.status !== "backlog"
@@ -19813,6 +19813,19 @@ export function issueRoutes(
           res.status(422).json({ error: "Cross-company comments cannot reopen, resume, interrupt or attach assets" });
           return;
         }
+      }
+      if (
+        req.actor.type === "board" &&
+        req.actor.boardKeyScope?.kind === "plugin_ops" &&
+        (req.body.reopen === true ||
+          req.body.resume === true ||
+          req.body.interrupt === true ||
+          isClosedIssueStatus(issue.status))
+      ) {
+        // plugin_ops keys may post plain comments only: issue mutation (reopen,
+        // resume, interrupt, implicit reopen of a closed issue) is out of scope.
+        res.status(403).json({ error: "plugin_ops keys cannot reopen, resume or interrupt issues" });
+        return;
       }
       if (crossCompanyComment && resolvedComment.marker && typeof req.body.body === "string") {
         // M8: host-written marker on every cross-company comment.
