@@ -17,7 +17,7 @@ describe("SE-triaged fork guards survive the upstream sync", () => {
     const block = src.slice(start, src.indexOf("]);", start));
     expect(block).toContain("SANCTIONED_BRIDGE_ENV_KEY");
     expect(block).toContain('"PAPERCLIP_API_KEY"');
-    expect(read("../task-bridge-keys.ts")).toContain("PAPERCLIP_BRIDGE_API_KEY");
+    expect(read("../services/task-bridge-keys.ts")).toContain("PAPERCLIP_BRIDGE_API_KEY");
   });
 
   it("issue comment route refuses plugin_ops keys that reopen, resume, interrupt or comment on closed issues", () => {
