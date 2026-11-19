@@ -59,6 +59,8 @@ import type {
   PluginEnvironmentProbeParams,
   PluginEnvironmentProbeResult,
   PluginEnvironmentLease,
+  PluginEnvironmentInspectLeaseParams,
+  PluginEnvironmentLeaseObservation,
   PluginEnvironmentAcquireLeaseParams,
   PluginEnvironmentResumeLeaseParams,
   PluginEnvironmentReleaseLeaseParams,
@@ -117,6 +119,7 @@ export interface TestHarness {
   seed(input: {
     companies?: Company[];
     lifecycleEvents?: ResourceLifecycleEvent[];
+    projectInstanceSecrets?: Array<{ companyId: string; projectId: string; values: Record<string, string> }>;
     projects?: Project[];
     issues?: Issue[];
     issueComments?: IssueComment[];
@@ -172,6 +175,7 @@ export interface EnvironmentEventRecord {
     | "resumeLease"
     | "releaseLease"
     | "stopLease"
+    | "inspectLease"
     | "destroyLease"
     | "realizeWorkspace"
     | "execute"
@@ -199,6 +203,7 @@ export interface EnvironmentTestHarnessOptions extends TestHarnessOptions {
     onResumeLease?: (params: PluginEnvironmentResumeLeaseParams) => Promise<PluginEnvironmentLease>;
     onReleaseLease?: (params: PluginEnvironmentReleaseLeaseParams) => Promise<PluginEnvironmentTerminationReceipt | void>;
     onStopLease?: (params: PluginEnvironmentReleaseLeaseParams) => Promise<PluginEnvironmentTerminationReceipt>;
+    onInspectLease?: (params: PluginEnvironmentInspectLeaseParams) => Promise<PluginEnvironmentLeaseObservation>;
     onDestroyLease?: (params: PluginEnvironmentDestroyLeaseParams) => Promise<PluginEnvironmentTerminationReceipt | void>;
     onRealizeWorkspace?: (params: PluginEnvironmentRealizeWorkspaceParams) => Promise<PluginEnvironmentRealizeWorkspaceResult>;
     onExecute?: (params: PluginEnvironmentExecuteParams) => Promise<PluginEnvironmentExecuteResult>;
@@ -226,6 +231,8 @@ export interface EnvironmentTestHarness extends TestHarness {
   releaseLease(params: PluginEnvironmentReleaseLeaseParams): Promise<PluginEnvironmentTerminationReceipt | void>;
   /** Stop and preserve an allocation independently of its release policy. */
   stopLease(params: PluginEnvironmentReleaseLeaseParams): Promise<PluginEnvironmentTerminationReceipt>;
+  /** Observe an allocation without starting or modifying it. */
+  inspectLease(params: PluginEnvironmentInspectLeaseParams): Promise<PluginEnvironmentLeaseObservation | undefined>;
   /** Invoke the environment driver's destroyLease hook. */
   destroyLease(params: PluginEnvironmentDestroyLeaseParams): Promise<PluginEnvironmentTerminationReceipt | void>;
   /** Invoke the environment driver's realizeWorkspace hook. */
@@ -509,6 +516,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
   const lifecycleEvents = new Map<string, ResourceLifecycleEvent>();
   const lifecycleAcknowledgments = new Set<string>();
   const projects = new Map<string, Project>();
+  const projectInstanceSecrets = new Map<string, Record<string, string>>();
   const routines = new Map<string, Routine>();
   const routineRuns = new Map<string, RoutineRun>();
   const issues = new Map<string, Issue>();
@@ -1075,6 +1083,14 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     projects: {
+      async getInstanceSecrets(projectId, companyId) {
+        requireCapability(manifest, capabilitySet, "projects.instance-secrets");
+        requireCapability(manifest, capabilitySet, "events.subscribe");
+        if (!manifest.resourceLifecycle?.includes("project")) throw new Error("Project instance secrets outside plugin scope");
+        const project = projects.get(projectId);
+        if (!isInCompany(project, companyId) || project.archivedAt) throw new Error("Project instance secrets unavailable");
+        return structuredClone(projectInstanceSecrets.get(JSON.stringify([companyId, projectId])) ?? {});
+      },
       async list(input) {
         requireCapability(manifest, capabilitySet, "projects.read");
         const companyId = requireCompanyId(input?.companyId);
@@ -2212,6 +2228,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       },
     },
     agents: {
+      async getRuntime() {
+        requireCapability(manifest, capabilitySet, "agents.lifecycle.manage");
+        throw new Error("Agent runtime state requires a host service fixture");
+      },
       async list(input) {
         requireCapability(manifest, capabilitySet, "agents.read");
         const companyId = requireCompanyId(input?.companyId);
@@ -2719,6 +2739,7 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
       for (const row of input.lifecycleEvents ?? []) lifecycleEvents.set(row.id, row);
       for (const row of input.companies ?? []) companies.set(row.id, row);
       for (const row of input.projects ?? []) projects.set(row.id, row);
+      for (const row of input.projectInstanceSecrets ?? []) projectInstanceSecrets.set(JSON.stringify([row.companyId, row.projectId]), structuredClone(row.values));
       for (const row of input.issues ?? []) {
         issues.set(row.id, row);
         if (row.blockedBy) {
@@ -2932,6 +2953,9 @@ export function createEnvironmentTestHarness(options: EnvironmentTestHarnessOpti
     async stopLease(params) {
       return callHook("stopLease", driver.onStopLease, params, "onStopLease");
     },
+    async inspectLease(params) {
+      return callHook("inspectLease", driver.onInspectLease, params, "onInspectLease");
+    },
     async destroyLease(params) {
       return callHook("destroyLease", driver.onDestroyLease, params, "onDestroyLease");
     },
@@ -2984,4 +3008,13 @@ export function createEnvironmentTestHarness(options: EnvironmentTestHarnessOpti
   };
 
   return envHarness;
+}
+
+/** Run the same operation/result validation as the worker RPC boundary. */
+export function createWorkspaceProviderHarness(handler: (params: import("./workspace-provider.js").PluginWorkspaceParams) => Promise<import("./workspace-provider.js").PluginWorkspaceResult>) {
+  return { async operation(params: import("./workspace-provider.js").PluginWorkspaceParams) {
+    const { pluginWorkspaceParamsSchema, parseWorkspaceProviderResult } = await import("./workspace-provider.js");
+    pluginWorkspaceParamsSchema.parse(params);
+    return parseWorkspaceProviderResult(params, await handler(params));
+  } };
 }

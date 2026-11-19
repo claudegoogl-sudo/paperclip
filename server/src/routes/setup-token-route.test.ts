@@ -19,7 +19,7 @@
 import express from "express";
 import { Writable } from "node:stream";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   SETUP_TOKEN_SESSION_NOT_FOUND,
@@ -469,6 +469,11 @@ async function settle(): Promise<void> {
     await new Promise((resolve) => setImmediate(resolve));
   }
 }
+
+beforeAll(() => {
+  vi.resetModules();
+  registerModuleMocks();
+});
 
 beforeEach(() => {
   vi.clearAllMocks();

@@ -1,6 +1,6 @@
 import { createHash, timingSafeEqual } from "node:crypto";
-import type { Application, Request, RequestHandler } from "express";
-import { and, eq, isNull } from "drizzle-orm";
+import type { Request, RequestHandler } from "express";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   activityLog,
@@ -23,13 +23,8 @@ import {
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
-import {
-  isAgentApiKeyExpired,
-  isUuidLike,
-  normalizeAgentApiKeyScope,
-  normalizeBoardApiKeyScope,
-  type DeploymentMode,
-} from "@paperclipai/shared";
+import { loadAgentRunAuthentication } from "./agent-run-authentication.js";
+import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { actorProvenanceMiddleware } from "./actor-context.js";
 import { logger } from "./logger.js";
@@ -70,7 +65,7 @@ function pruneCloudTenantWriteDebounce(
     debounce.delete(oldestSubject);
   }
 }
-import { instanceSettingsService } from "../services/instance-settings.js";
+import { resolveOwnerInstanceAdmin } from "../services/cloud-tenant-authority.js";
 import { ensureHumanRoleDefaultGrants } from "../services/principal-access-compatibility.js";
 import { forbidden, unauthorized, unprocessable } from "../errors.js";
 
@@ -161,10 +156,18 @@ async function auditAgentJwtRunHeaderMismatch(
   input: { companyId: string; agentId: string; claimRunId: string; headerRunId: string; method: string; url: string },
 ) {
   try {
-    // F5: actor_source/actor_key_id are NULL here BY CONSTRUCTION, not by omission. This row
-    // audits the *failure* to establish an actor, and it is written from inside actorMiddleware,
-    // which runs before actorProvenanceMiddleware binds any provenance. There is no established
-    // credential provenance to record.
+    // The claimed run id is untrusted input from a rejected token. activity_log
+    // .run_id is a real FK to heartbeat_runs, so writing it unconditionally
+    // makes the insert fail — and the catch swallows it — exactly when the
+    // claim is bogus. Keep the claim in entityId/details and populate the FK
+    // column only when the row actually exists.
+    const claimedRunExists = isUuidLike(input.claimRunId)
+      ? await db
+          .select({ id: heartbeatRuns.id })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.claimRunId))
+          .then((rows) => rows.length > 0)
+      : false;
     await db.insert(activityLog).values({
       companyId: input.companyId,
       actorType: "agent",
@@ -173,7 +176,7 @@ async function auditAgentJwtRunHeaderMismatch(
       entityType: "heartbeat_run",
       entityId: input.claimRunId,
       ...(isUuidLike(input.agentId) ? { agentId: input.agentId } : {}),
-      ...(isUuidLike(input.claimRunId) ? { runId: input.claimRunId } : {}),
+      ...(claimedRunExists ? { runId: input.claimRunId } : {}),
       details: {
         claimRunId: input.claimRunId,
         headerRunId: input.headerRunId,
@@ -580,6 +583,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
+      if (agentRecord.lifecycleHolds?.includes("setup")) {
+        next(unauthorized("Agent setup is incomplete and cannot authenticate"));
+        return;
+      }
       if (agentRecord.status === "terminated") {
         next(unauthorized("Agent is terminated and cannot authenticate"));
         return;
@@ -609,11 +616,11 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         return;
       }
 
-      const [identityRun] = await db.select({ activeIdentityContextId: heartbeatRuns.activeIdentityContextId,
-        responsibleUserId: heartbeatRuns.responsibleUserId, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson,
-        contextSnapshot: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
-          eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
-        ));
+      const [identityRun] = await loadAgentRunAuthentication(db, {
+        runId: claims.run_id,
+        companyId: claims.company_id,
+        agentId: claims.sub,
+      });
       if (agentRunWritesRevoked(identityRun)
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
         const conversation = identityRun?.contextSnapshot?.conversationMode === true;
@@ -625,6 +632,29 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         const captured = await captureRunIdentity(db, { companyId: claims.company_id, agentId: claims.sub, runId: claims.run_id });
         identityRun.activeIdentityContextId = captured.context?.id ?? null;
         identityRun.responsibleUserId = captured.context?.responsibleUserId ?? null;
+      }
+      if (claims.authorizing_user_id) {
+        // This signed projection exists only for internal native tools. Recheck
+        // the admitted run and current immutable binding on every API call.
+        try {
+          const { parseNativeExecutionInput } = await import("../vendor/paperclip-runner/index.js");
+          const { museRunnerBroker } = await import("../services/muse-runner-broker.js");
+          const [nativeRun] = await db.select({ status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode,
+            nativeExecutionInput: sql<unknown>`${heartbeatRuns.runnerProfileJson}->'nativeExecutionInput'`,
+          }).from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.id, claims.run_id), eq(heartbeatRuns.companyId, claims.company_id), eq(heartbeatRuns.agentId, claims.sub),
+          ));
+          const execution = parseNativeExecutionInput(nativeRun?.nativeExecutionInput);
+          if (nativeRun?.status !== "running" || nativeRun.runtimeMode !== "native" || execution.schema !== "paperclip.native-execution-input.v8"
+            || execution.binding.runId !== claims.run_id || execution.binding.agentId !== claims.sub || execution.binding.companyId !== claims.company_id
+            || await museRunnerBroker(db).authorizingUserIdForBinding(execution.provider.binding) !== claims.authorizing_user_id) {
+            throw new Error("Muse internal tool authority mismatch");
+          }
+          await museRunnerBroker(db).assertRunAuthority(execution);
+        } catch {
+          _res.status(403).json({ error: "Muse native tool authority is unavailable" });
+          return;
+        }
       }
       const onBehalfOfUserId = identityRun?.activeIdentityContextId
         ? identityRun.responsibleUserId
@@ -648,6 +678,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         keyScope: normalizeAgentApiKeyScope(claims.key_scope),
         runId: claims.run_id,
         onBehalfOfUserId,
+        ...(claims.authorizing_user_id ? { authorizingUserId: claims.authorizing_user_id } : {}),
         identityContextId: identityRun?.activeIdentityContextId ?? null,
         onBehalfOfMemberships,
         source: "agent_jwt",
@@ -669,6 +700,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
 
     if (!agentRecord || agentRecord.companyId !== key.companyId) {
       next(unauthorized("Agent record is missing or belongs to another company; obtain fresh credentials and retry"));
+      return;
+    }
+    if (agentRecord.lifecycleHolds?.includes("setup")) {
+      next(unauthorized("Agent setup is incomplete and cannot authenticate"));
       return;
     }
     if (agentRecord.status === "terminated") {
@@ -728,258 +763,6 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
     }
     continueRequest?.();
   };
-}
-
-/**
- * Routes a `{ kind: "plugin_ops" }` board API key is permitted to reach.
- *
- * The taxonomy is intentionally minimal — plugin lifecycle
- * (install/enable/disable/upgrade/config) plus issue read/comment so the
- * operator's CLI can still report status, plus the board-key self-service
- * surface so the scoped key can mint a successor and revoke itself. This is
- * not a general permission system.
- *
- * This list is allowlist-shaped and fail-closed: a scoped key hitting ANY route
- * not listed here gets 403 with `code: "board_key_scope_violation"`. Add a route
- * here only when a new plugin-ops flow genuinely requires it — never to "fix" a
- * 403 a regression test caught, because that 403 is the control firing.
- *
- * Path matching is against `req.path` as seen at app root (this middleware runs
- * before the `/api` mount strips the prefix), so patterns are written against
- * `/api/plugins/install`, not `/plugins/install`.
- */
-const PLUGIN_OPS_ALLOWED_ROUTES: ReadonlyArray<{
-  readonly method: string;
-  readonly pathPattern: RegExp;
-}> = [
-  // --- Plugin lifecycle (the actual reason this scope exists) ---
-  { method: "POST", pathPattern: /^\/api\/plugins\/install$/ },
-  {
-    method: "POST",
-    pathPattern: /^\/api\/plugins\/[^/]+\/(?:enable|disable|upgrade|config|config\/test)$/,
-  },
-  { method: "GET", pathPattern: /^\/api\/plugins(?:\/[^/]+)?$/ },
-  { method: "GET", pathPattern: /^\/api\/plugins\/[^/]+\/config$/ },
-  // Read-only per-company config overrides (host checkers). Writes stay denied.
-  { method: "GET", pathPattern: /^\/api\/plugins\/[^/]+\/companies\/[^/]+\/config-overrides$/ },
-  { method: "GET", pathPattern: /^\/api\/plugins\/examples$/ },
-  { method: "GET", pathPattern: /^\/api\/plugins\/ui-contributions$/ },
-
-  // --- Board API key self-service (mint a successor, list, revoke) ---
-  // POST /board-api-keys is allowed, but the force-inheritance branch below
-  // forces any successor this key mints to inherit this key's scope (no
-  // escalation).
-  { method: "POST", pathPattern: /^\/api\/board-api-keys$/ },
-  { method: "GET", pathPattern: /^\/api\/board-api-keys$/ },
-  { method: "DELETE", pathPattern: /^\/api\/board-api-keys\/[^/]+$/ },
-  { method: "POST", pathPattern: /^\/api\/cli-auth\/revoke-current$/ },
-  // Read-only self identity. The CLI's own login/whoami/connect flows call
-  // this with the key they just received; without it the CLI's default
-  // plugin_ops scope cannot complete its own login.
-  { method: "GET", pathPattern: /^\/api\/cli-auth\/me$/ },
-
-  // --- Issue read/comment (operator-readable activity surface) ---
-  // Allows GETs on issue detail/list/comments/documents and posting a comment.
-  // Issue create (POST /issues) and issue mutate (PATCH /issues/:id) are out
-  // of scope: this is plugin_ops, not a general operator surrogate.
-  { method: "GET", pathPattern: /^\/api\/issues(?:\/[^/]+)?(?:\/.*)?$/ },
-  { method: "POST", pathPattern: /^\/api\/issues\/[^/]+\/comments$/ },
-  { method: "GET", pathPattern: /^\/api\/companies\/[^/]+\/issues(?:\/.*)?$/ },
-
-  // --- Company list (board-read snapshot discovery; reads only) ---
-  // The board-read snapshot timer must enumerate companies before it reads
-  // each company's issues. Exact match on the list path only: company detail
-  // (GET /companies/:id), create, and update stay outside this scope.
-  { method: "GET", pathPattern: /^\/api\/companies$/ },
-];
-
-/**
- * The scope a `{ kind: "plugin_ops" }` board key forces onto any new board key
- * it mints via POST /api/board-api-keys. Without this, a scoped key could mint
- * an unscoped owner key and silently escalate; with it, scoped-ness is sticky
- * down the mint chain — a CLI using a scoped credential cannot mint an
- * unscoped owner key on this instance.
- */
-const PLUGIN_OPS_FORCED_SUCCESSOR_SCOPE = { kind: "plugin_ops" } as const;
-
-/**
- * Board-key scope enforcement. Runs after actorMiddleware, so req.actor is
- * populated. Only acts on a board API key that carries a non-standard scope —
- * every other actor source (session, local_implicit, agent_key, agent_jwt,
- * cloud_tenant, none) and every unscoped board key falls through unchanged.
- *
- * For a `{ kind: "plugin_ops" }` key: 403 with code
- * `board_key_scope_violation` unless the request matches an entry in
- * PLUGIN_OPS_ALLOWED_ROUTES. The route allowlist is the scope taxonomy made
- * literal — an allowlist-shaped predicate is the required shape here, and
- * this is that shape.
- *
- * As a side effect on POST /api/board-api-keys, the body's `scope` field is
- * force-set to the acting key's scope, so a scoped key cannot mint a wider
- * successor. This is the second half of "CLI unable to mint an unscoped
- * owner key": even if the CLI did not request plugin_ops explicitly, the
- * scoped successor inherits the acting scope.
- */
-export function enforceBoardKeyScopeMiddleware(): RequestHandler {
-  return (req, _res, next) => {
-    const actor = req.actor;
-    if (
-      !actor ||
-      actor.type !== "board" ||
-      actor.source !== "board_key" ||
-      !actor.boardKeyScope ||
-      actor.boardKeyScope.kind !== "plugin_ops"
-    ) {
-      next();
-      return;
-    }
-
-    const matched = PLUGIN_OPS_ALLOWED_ROUTES.some(
-      (entry) =>
-        req.method.toUpperCase() === entry.method.toUpperCase() &&
-        entry.pathPattern.test(req.path),
-    );
-    if (!matched) {
-      next(
-        forbidden("Board API key scope does not permit this route", {
-          code: "board_key_scope_violation",
-          scope: actor.boardKeyScope.kind,
-          method: req.method.toUpperCase(),
-          path: req.path,
-        }),
-      );
-      return;
-    }
-
-    // Force-inherit the acting scope on any new board key this key mints. This
-    // is the server-side half of AC4: even with the CLI always requesting
-    // plugin_ops, a hand-rolled client cannot mint an unscoped owner key
-    // through a plugin_ops-scoped credential.
-    if (
-      req.method.toUpperCase() === "POST" &&
-      /^\/api\/board-api-keys$/.test(req.path) &&
-      req.body &&
-      typeof req.body === "object"
-    ) {
-      req.body.scope = PLUGIN_OPS_FORCED_SUCCESSOR_SCOPE;
-    }
-
-    next();
-  };
-}
-
-/**
- * Routes a `{ kind: "notify_only" }` agent API key may reach. Each pattern
- * captures the issue id, which must be one of the key's `issueIds` (UUIDs,
- * compared case-insensitively; identifiers such as `ABC-1` are not accepted,
- * so the allow-list check needs no DB lookup). Fail-closed: anything else is
- * 403 `agent_key_scope_violation`.
- */
-const NOTIFY_ONLY_ALLOWED_ROUTES: ReadonlyArray<{
-  readonly method: string;
-  readonly pathPattern: RegExp;
-}> = [
-  { method: "GET", pathPattern: /^\/api\/issues\/([^/]+)$/ },
-  { method: "POST", pathPattern: /^\/api\/issues\/([^/]+)\/interactions$/ },
-];
-
-/**
- * Agent-key scope enforcement for `notify_only` keys. Runs after
- * actorMiddleware. Every other actor (including every other agent-key scope)
- * falls through unchanged. A notify_only key never carries a run id: any
- * `X-Paperclip-Run-Id` header is dropped so run attribution cannot be forged.
- */
-export function enforceAgentKeyScopeMiddleware(): RequestHandler {
-  return (req, _res, next) => {
-    const actor = req.actor;
-    if (
-      !actor ||
-      actor.type !== "agent" ||
-      actor.keyScope?.kind !== "notify_only"
-    ) {
-      next();
-      return;
-    }
-
-    actor.runId = undefined;
-    const allowed = new Set((actor.keyScope.issueIds ?? []).map((id) => id.toLowerCase()));
-    const method = req.method.toUpperCase();
-    const matched = NOTIFY_ONLY_ALLOWED_ROUTES.some((entry) => {
-      if (method !== entry.method) return false;
-      const m = entry.pathPattern.exec(req.path);
-      if (!m) return false;
-      let issueId: string;
-      try {
-        issueId = decodeURIComponent(m[1] ?? "").toLowerCase();
-      } catch {
-        return false;
-      }
-      return allowed.has(issueId);
-    });
-    if (!matched) {
-      logger.warn(
-        { agentId: actor.agentId, keyId: actor.keyId, method, path: req.path },
-        "agent key scope violation (notify_only)",
-      );
-      next(
-        forbidden("Agent API key scope does not permit this route", {
-          code: "agent_key_scope_violation",
-          scope: "notify_only",
-          method,
-          path: req.path,
-        }),
-      );
-      return;
-    }
-    next();
-  };
-}
-
-/**
- * Registers the actor-resolution + provenance-capture middleware pair on `app`
- * in the one order that works: `actorMiddleware` populates `req.actor`, then
- * `enforceBoardKeyScopeMiddleware` narrows a scoped board key's reachable
- * surface, then `actorProvenanceMiddleware` binds its credential provenance
- * into AsyncLocalStorage so `logActivity` records it centrally.
- *
- * Both `createApp` (production wiring) and the provenance regression test go
- * through this single function on purpose: dropping the provenance registration
- * here turns that test red instead of letting production silently write NULL
- * provenance forever — the failure mode an audit control cannot afford.
- */
-export function registerActorContext(app: Application, db: Db, opts: ActorMiddlewareOptions): void {
-  app.use(actorMiddleware(db, opts));
-  // Must run after actorMiddleware, which is what populates req.actor. Must
-  // run before route handlers so scoped-key requests never reach a route the
-  // scope does not permit.
-  app.use(enforceBoardKeyScopeMiddleware());
-  app.use(enforceAgentKeyScopeMiddleware());
-  app.use(actorProvenanceMiddleware());
-}
-
-/**
- * Whether the trusted-header actor being resolved should carry computed
- * instance-admin elevation: only the stack `owner` role elevates, and only
- * while `enableOwnerInstanceAdmin` is enabled. The flag is resolved through
- * the instance-settings service so the cloud managed-config overlay applies
- * (the harness can turn elevation off fleet-wide without touching tenant
- * DBs). Fails closed: a settings read error means no elevation.
- */
-async function resolveOwnerInstanceAdmin(
-  db: Db,
-  stackRole: "owner" | "admin" | "member" | "support",
-): Promise<boolean> {
-  if (stackRole !== "owner") return false;
-  try {
-    const experimental = await instanceSettingsService(db).getExperimental();
-    return experimental.enableOwnerInstanceAdmin === true;
-  } catch (err) {
-    logger.warn(
-      { err },
-      "Failed to resolve enableOwnerInstanceAdmin for cloud tenant owner; treating elevation as disabled",
-    );
-    return false;
-  }
 }
 
 /**
@@ -1188,6 +971,7 @@ async function resolveCloudTenantActorOnce(
     // company-scoped. Turning the flag off de-elevates on the next request —
     // there is no role row to clean up.
     isInstanceAdmin: await resolveOwnerInstanceAdmin(db, stackRole),
+    canManageExperimentalSettings: stackRole === "admin",
     source: "cloud_tenant",
   };
 }

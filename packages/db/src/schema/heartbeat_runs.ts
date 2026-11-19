@@ -111,6 +111,10 @@ export const heartbeatRuns = pgTable(
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (table) => ({
+    retainedRecoveryAdoptionIdx: index("heartbeat_runs_retained_recovery_adoption_idx")
+      .on(table.id).where(sql`${table.resultJson}->'workspaceRestoreRecovery'->>'schema' = 'paperclip.workspace-restore-recovery.v1'
+        and not (coalesce(${table.resultJson}, '{}'::jsonb) ? 'systemRecoveryAdoption')
+        and ${table.status} in ('failed', 'interrupted', 'timed_out', 'cancelled', 'succeeded')`),
     scopeBindingCheck: check(
       "heartbeat_runs_scope_binding_check",
       sql`(${table.scopeKind} = 'company' AND ${table.issueId} IS NULL)
@@ -189,23 +193,17 @@ export const heartbeatRuns = pgTable(
       sql`(${table.contextSnapshot} ->> 'taskKey')`,
       table.createdAt.desc(),
     ),
-    // Serves the `context_snapshot ->> 'issueId'` run-checkout predicate used by
-    // ~20 call sites in services/heartbeat.ts and services/recovery/service.ts.
-    // See migration 0229 for the indexed expression's cost history.
-    companyContextIssueIdx: index("heartbeat_runs_company_context_issue_idx").on(
-      table.companyId,
-      sql`(${table.contextSnapshot}->>'issueId')`,
-    ),
-    // Serves the retention prune's anti-join, which skips wakeup requests a
-    // surviving run still points at. See migration 0230.
-    wakeupRequestIdx: index("heartbeat_runs_wakeup_request_idx")
-      .on(table.wakeupRequestId)
-      .where(sql`${table.wakeupRequestId} IS NOT NULL`),
-    // Serves the retention prune scan. The partial predicate must stay in sync
-    // with TERMINAL_HEARTBEAT_RUN_STATUSES or the prune falls back to a Seq
-    // Scan; a test asserts the two match.
-    retentionIdx: index("heartbeat_runs_retention_idx")
-      .on(table.createdAt)
-      .where(sql`${table.status} IN ('succeeded', 'succeeded_dirty', 'failed', 'cancelled', 'timed_out')`),
+    companyCtxPaperclipIssueCreatedIdx: index("heartbeat_runs_company_ctx_paperclip_issue_created_idx")
+      .on(table.companyId, sql`(${table.contextSnapshot} -> 'paperclipIssue' ->> 'id')`, table.createdAt.desc())
+      .concurrently(),
+    // Match creation provenance precedence, including empty legacy IDs.
+    companyOriginIssueIdx: index("heartbeat_runs_company_origin_issue_idx")
+      .on(table.companyId, sql`coalesce(
+        ${table.nativeIssueId}::text,
+        nullif(${table.contextSnapshot}->>'issueId', ''),
+        nullif(${table.contextSnapshot}->>'taskId', ''),
+        nullif(${table.contextSnapshot}->>'taskKey', '')
+      )`)
+      .concurrently(),
   }),
 );

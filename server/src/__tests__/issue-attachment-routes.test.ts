@@ -2,7 +2,7 @@ import { Readable } from "node:stream";
 import type { IncomingMessage } from "node:http";
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StorageService } from "../storage/types.js";
 import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 
@@ -237,12 +237,20 @@ describe("MAX_ATTACHMENT_BYTES", () => {
 });
 
 describe("issue attachment routes", () => {
-  beforeEach(() => {
-    // Functional: the env-cap test below re-imports ../attachment-types.js and
-    // needs a fresh module evaluation to re-read the env var. Safe with the
-    // hoisted vi.mock above — resetModules clears the module registry, not the
-    // mock registry, so mocked services can never race back to real ones.
+  beforeAll(() => {
     vi.resetModules();
+    vi.doUnmock("@paperclipai/shared/telemetry");
+    vi.doUnmock("../telemetry.js");
+    vi.doUnmock("../services/issues.js");
+    vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/activity-log.js");
+    vi.doUnmock("../routes/issues.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../middleware/index.js");
+    registerRouteMocks();
+  });
+
+  beforeEach(() => {
     vi.clearAllMocks();
     mockAccessService.decide.mockResolvedValue({
       allowed: true,

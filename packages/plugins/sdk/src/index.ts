@@ -193,6 +193,8 @@ export type {
   PluginEnvironmentReleaseLeaseParams,
   PluginEnvironmentTerminationReceipt,
   PluginEnvironmentDestroyLeaseParams,
+  PluginEnvironmentInspectLeaseParams,
+  PluginEnvironmentLeaseObservation,
   PluginEnvironmentRealizeWorkspaceParams,
   PluginEnvironmentRealizeWorkspaceResult,
   PluginEnvironmentExecuteParams,
@@ -247,6 +249,7 @@ export type {
   PluginLocalFoldersClient,
   PluginEventsClient,
   ResourceLifecycleEvent,
+  ResourceLifecycleResult,
   PluginJobsClient,
   PluginLaunchersClient,
   PluginHttpClient,
@@ -282,6 +285,9 @@ export type {
   PluginIssueSubtree,
   PluginIssueSummariesClient,
   PluginAgentsClient,
+  PluginAgentRuntimeState,
+  PluginAgentConnectionAssignments,
+  PluginAgentRuntimeSkill,
   PluginAccessClient,
   PluginAccessMembersClient,
   PluginAccessInvitesClient,
@@ -471,4 +477,10 @@ export type { PluginEnvironmentSyncErrorDiagnostic } from "./environment-sync-er
 
 export type { AiConnectionPool, AiConnectionPoolConfig, AiConnectionPoolMember, AiConnectionRouterRequest, AiConnectionRouterResult, AiConnectionRouterSelection } from "@paperclipai/shared";
 
+export { environmentRunnerLaunchRequirementsSchema, environmentTaskOperationSchema, environmentTaskResultSchema, environmentTaskCredentialSchema, parseEnvironmentTaskResult } from "./environment-tasks.js";
+export type { PluginEnvironmentTaskOperation, PluginEnvironmentTaskParams, PluginEnvironmentTaskResult, PluginEnvironmentTaskCredential } from "./environment-tasks.js";
 export type { AgentLifecycleRequest, AgentLifecycleResult } from "@paperclipai/shared";
+
+export type { PluginEnvironmentRunnerLaunchRequirements, PluginEnvironmentPreparedLaunch } from "./environment-tasks.js";
+
+export * from "./workspace-provider.js";

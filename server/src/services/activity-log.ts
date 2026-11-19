@@ -1,3 +1,5 @@
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
+import { beginRunPhase } from "./execution-preparation-timing.js";
 import type { ActivityPublication } from "../types/activity-publication.js";
 export type { ActivityPublication } from "../types/activity-publication.js";
 import { randomUUID } from "node:crypto";
@@ -336,46 +338,24 @@ export async function resolveResponsibleUserIdForActivity(db: Db, input: LogActi
 }
 
 export function publishActivity(publication: ActivityPublication) {
+  const finish = beginRunPhase("execution.realtime");
+  try {
   publishLiveEvent({
     companyId: publication.companyId,
     type: "activity.logged",
     payload: publication.payload,
   });
   if (publication.pluginEvent) publishPluginDomainEvent(publication.pluginEvent);
+  } catch (error) {
+    finish(true);
+    throw error;
+  } finally { finish(); }
 }
 
 export async function persistActivity(db: Db, input: LogActivityInput) {
   const redactedDetails = await redactActivityDetails(db, input.details ?? null);
   const responsibleUserId = await resolveResponsibleUserIdForActivity(db, input);
-
-  // Provenance of the credential that authenticated this write, captured centrally
-  // from AsyncLocalStorage rather than at each of logActivity's ~179 call sites.
-  // Null for background work (heartbeats, plugin workers) that runs outside a
-  // request — which itself is meaningful: no request-scoped credential acted.
-  const provenance = getActorProvenance();
-  const actorSource = provenance?.source ?? null;
-  const actorKeyId = provenance?.keyId ?? null;
-
-  // AC4 alert: every activity_log write is a mutation (reads are not logged here),
-  // so a board_key-sourced write is exactly a board-key-authenticated write to a
-  // board-gated route. Surface it at warn with a stable `event` discriminator.
-  // Operators grep: `event=board_key_authenticated_write` (or the JSON key). The
-  // token value is never logged — keyId (a UUID) is the only credential id emitted.
-  if (actorSource === "board_key") {
-    logger.info(
-      {
-        event: "board_key_authenticated_write",
-        actorSource,
-        actorKeyId,
-        action: input.action,
-        entityType: input.entityType,
-        entityId: input.entityId,
-        companyId: input.companyId,
-      },
-      "board_key-authenticated write to a board-gated route",
-    );
-  }
-  const [activity] = await db.insert(activityLog).values({
+  const insert = (runner: Db) => runner.insert(activityLog).values({
     companyId: input.companyId,
     actorType: input.actorType,
     actorId: input.actorId,
@@ -389,6 +369,12 @@ export async function persistActivity(db: Db, input: LogActivityInput) {
     actorKeyId,
     details: redactedDetails,
   }).returning({ id: activityLog.id });
+  const [activity] = input.entityType === "issue"
+    ? await db.transaction(async tx => {
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, `task:${input.entityId}`);
+      return insert(tx as unknown as Db);
+    })
+    : await insert(db);
 
   const payload = {
     issueId: input.issueId ?? (input.entityType === "issue" ? input.entityId : null),

@@ -1,3 +1,4 @@
+import { EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
@@ -13,6 +14,9 @@ import {
   agentWakeupRequests,
   agents,
   companies,
+  authUsers,
+  companyMemberships,
+  companySkills,
   createDb,
   executionWorkspaces,
   heartbeatRunEvents,
@@ -158,6 +162,8 @@ async function seedRunTarget(db: Db, repoRoot: string) {
     createdAt: new Date(),
     updatedAt: new Date(),
   });
+  await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture user", email: "responsible-user@example.test", createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
+  await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
   await db.insert(projects).values({
     id: projectId,
     companyId,
@@ -257,7 +263,7 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   beforeAll(async () => {
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-finalize-branch-");
     db = createDb(tempDb.connectionString);
-  }, 20_000);
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
     adapterExecute.mockReset();
@@ -273,10 +279,27 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
       const root = tempRoots.pop();
       if (root) await rm(root, { recursive: true, force: true }).catch(() => undefined);
     }
-    // Wait for in-flight background heartbeat runs and wakeups to finish, then reset
-    // every table atomically (TRUNCATE ... CASCADE) so late writes cannot race the teardown.
-    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
-    await resetEmbeddedPostgresTestDatabase(db);
+    await db.delete(issuePlanDecompositions);
+    await db.delete(issueDocuments);
+    await db.delete(documentRevisions);
+    await db.delete(documents);
+    await db.delete(agentTaskSessions);
+    await db.delete(environmentLeases);
+    await db.delete(workspaceOperations);
+    await deleteHeartbeatRowsAfterActivityLogDrains(db);
+    await db.delete(issueComments);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(agentWakeupRequests);
+    await db.delete(agentRuntimeState);
+    await db.delete(agents);
+    await db.delete(environments);
+    await db.delete(companySkills);
+    await db.delete(companyMemberships);
+    await db.delete(companies);
+    await db.delete(authUsers).where(eq(authUsers.id, "responsible-user"));
   });
 
   afterAll(async () => {
