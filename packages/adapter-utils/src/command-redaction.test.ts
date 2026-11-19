@@ -1,5 +1,4 @@
 import { describe, expect, it } from "vitest";
-import { REDACTED_COMMAND_TEXT_VALUE, redactCommandText, redactDiagnosticText } from "./command-redaction.js";
 
 // Synthetic, shape-valid fixtures only — never real credentials.
 // Fine-grained PAT shape: `github_pat_` + 22 chars + `_` + 59 chars.
