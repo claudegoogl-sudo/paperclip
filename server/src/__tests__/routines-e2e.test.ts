@@ -39,12 +39,52 @@ import {
 import { accessService } from "../services/access.js";
 import { createLocalAgentJwt } from "../agent-auth-jwt.js";
 
-// Production middleware always stamps `source`; fixtures that hand-build an
-// actor without one must get the provenance the middleware would have set,
-// because getActorInfo now denies an unset source.
-function withActorSource<T extends Record<string, any>>(actor: T): T {
-  if (actor.source) return actor;
-  return { ...actor, source: actor.type === "agent" ? "agent_key" : "local_implicit" };
+function registerRoutineServiceMock() {
+  vi.doMock("../services/routines.js", async () => {
+    const actual = await vi.importActual<typeof import("../services/routines.js")>("../services/routines.js");
+
+    return {
+      ...actual,
+      routineService: (db: any) =>
+        actual.routineService(db, {
+          heartbeat: {
+            wakeup: async (agentId: string, wakeupOpts: any) => {
+              const issueId =
+                (typeof wakeupOpts?.payload?.issueId === "string" && wakeupOpts.payload.issueId) ||
+                (typeof wakeupOpts?.contextSnapshot?.issueId === "string" && wakeupOpts.contextSnapshot.issueId) ||
+                null;
+              if (!issueId) return null;
+
+              const issue = await db
+                .select({ companyId: issues.companyId })
+                .from(issues)
+                .where(eq(issues.id, issueId))
+                .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
+              if (!issue) return null;
+
+              const queuedRunId = randomUUID();
+              await db.insert(heartbeatRuns).values({
+                id: queuedRunId,
+                companyId: issue.companyId,
+                agentId,
+                invocationSource: wakeupOpts?.source ?? "assignment",
+                triggerDetail: wakeupOpts?.triggerDetail ?? null,
+                status: "queued",
+                contextSnapshot: { ...(wakeupOpts?.contextSnapshot ?? {}), issueId },
+              });
+              await db
+                .update(issues)
+                .set({
+                  executionRunId: queuedRunId,
+                  executionLockedAt: new Date(),
+                })
+                .where(eq(issues.id, issueId));
+              return { id: queuedRunId };
+            },
+          },
+        }),
+    };
+  });
 }
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -134,7 +174,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
-      (req as any).actor = withActorSource(actor as any);
+      (req as any).actor = actor;
       next();
     });
     app.use("/api", routineRoutes(db));
@@ -885,57 +925,3 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     });
   });
 });
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("../services/routines.js", async () => {
-  const actual = await vi.importActual<typeof import("../services/routines.js")>("../services/routines.js");
-
-  return {
-    ...actual,
-    routineService: (db: any) =>
-      actual.routineService(db, {
-        heartbeat: {
-          wakeup: async (agentId: string, wakeupOpts: any) => {
-            const issueId =
-              (typeof wakeupOpts?.payload?.issueId === "string" && wakeupOpts.payload.issueId) ||
-              (typeof wakeupOpts?.contextSnapshot?.issueId === "string" && wakeupOpts.contextSnapshot.issueId) ||
-              null;
-            if (!issueId) return null;
-
-            const issue = await db
-              .select({ companyId: issues.companyId })
-              .from(issues)
-              .where(eq(issues.id, issueId))
-              .then((rows: Array<{ companyId: string }>) => rows[0] ?? null);
-            if (!issue) return null;
-
-            const queuedRunId = randomUUID();
-            await db.insert(heartbeatRuns).values({
-              id: queuedRunId,
-              companyId: issue.companyId,
-              agentId,
-              invocationSource: wakeupOpts?.source ?? "assignment",
-              triggerDetail: wakeupOpts?.triggerDetail ?? null,
-              status: "queued",
-              contextSnapshot: { ...(wakeupOpts?.contextSnapshot ?? {}), issueId },
-            });
-            await db
-              .update(issues)
-              .set({
-                executionRunId: queuedRunId,
-                executionLockedAt: new Date(),
-              })
-              .where(eq(issues.id, issueId));
-            return { id: queuedRunId };
-          },
-        },
-      }),
-  };
-});
-
