@@ -1088,6 +1088,8 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     return batchRead(`run:${companyId}:${agentId}:${runId}`, async () => {
       if (!runId) return null;
+      // Caller-controlled header: malformed value is treated as missing (avoids UUID cast 500).
+      if (!isUuidLike(runId)) return null;
       const row = readSnapshot?.runs.has(runId) ? readSnapshot.runs.get(runId) : await db
         .select({
           id: heartbeatRuns.id,
@@ -1104,7 +1106,6 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
         : null;
     });
-
   }
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {

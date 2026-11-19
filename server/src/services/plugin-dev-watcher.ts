@@ -182,8 +182,13 @@ export function createPluginDevWatcher(
   lifecycle: PluginLifecycleManager,
   resolvePluginPackagePath?: ResolvePluginPackagePath,
   fsDeps?: PluginDevWatcherFsDeps,
-  options: { unwatchedRoots?: readonly string[] } = {},
+  options: {
+    /** Restart implementation used on file change. Defaults to `lifecycle.restartWorker`. */
+    restartWorker?: (pluginId: string) => Promise<void>;
+    unwatchedRoots?: readonly string[];
+  } = {},
 ): PluginDevWatcher {
+  const restartWorker = options.restartWorker ?? ((pluginId: string) => lifecycle.restartWorker(pluginId));
   const watchers = new Map<string, { watcher: FSWatcher; packagePath: string }>();
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const pendingRegistrations = new Map<string, number>();
@@ -327,9 +332,8 @@ export function createPluginDevWatcher(
     if (pluginWatcher) {
       void pluginWatcher.watcher.close();
       watchers.delete(pluginId);
-      watchedPaths.delete(pluginId);
       log.info(
-        { pluginId, packagePath },
+        { pluginId, packagePath: pluginWatcher.packagePath },
         "plugin-dev-watcher: unwatched local plugin",
       );
     }

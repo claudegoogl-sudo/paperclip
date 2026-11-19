@@ -115,6 +115,13 @@ export async function observeCrossIssueInfluence(
     // rejecting these writes as run-less left live heartbeat runs unable to
     // comment or update any task at all.
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    // A run row that exists and matches company+agent but has no source issue
+    // in its snapshot is a legitimate run shape (timer, manual/on-demand, and
+    // retry wakes only enrich the snapshot when the wake payload carries the
+    // issue), not an attribution failure. The cap is a rate backstop, not a
+    // permission decision, so the write proceeds under the shared per-run cap.
+    // No source-issue exemption exists for such runs by definition: there is
+    // no source issue to exempt, so every guarded write counts toward the cap.
     if (
       sourceIssueId !== null &&
       (sourceIssueId === input.targetIssueId ||

@@ -1,3 +1,4 @@
+import { createHostRunAdmission } from "./host-admission.js";
 import { authorizationService } from "../authorization.js";
 import { assertTaskRetryConversationAllowed, readTaskRetryIntent, retireSupersededTaskRetry } from "../task-retry.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
@@ -165,6 +166,7 @@ import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
 import type { issueService } from "../issues.js";
+import { ACTOR_PROVENANCE_PAYLOAD_KEY, captureActorProvenance } from "../../middleware/actor-context.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
 import type { instanceSettingsService } from "../instance-settings.js";
@@ -201,9 +203,11 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   isSameTaskScope: (left: string | null, right: string | null) => boolean;
   runTaskKey: (run: HeartbeatRun) => string | null;
   filterZombieCoalesceTarget: <T extends { id: string; status: string }>(run: T | null, live: { has(id: string): boolean }) => T | null;
+  isAdmissionBlocked?: () => Promise<boolean>;
   getSchedulingSuppression: () => Promise<{ suppressed: boolean; reason: "worktree_instance" | "database_restore_in_progress" | "task_drain" | null }>;
   canStartNewExternalBotWork: (agent: typeof agents.$inferSelect) => Promise<boolean>;
-  executeRun: (runId: string) => Promise<void>;
+  executeRun: (runId: string, options?: { hostReservationHeld?: boolean }) => Promise<void>;
+  hostRunAdmission?: ReturnType<typeof import("./host-admission.js").createHostRunAdmission>;
   releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
   applyWakeQueuePostCommitEffects: (effects: WakeQueuePostCommitEffect[]) => Promise<void>;
   publishRunLifecyclePluginEvent: (run: HeartbeatRun) => void;
@@ -371,6 +375,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     isHeartbeatRunTerminalStatus,
     liveRunExecutions,
     getSchedulingSuppression,
+    isAdmissionBlocked,
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
     resumeQueuedCommentInterrupt,
@@ -395,6 +400,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     runTaskKey,
     filterZombieCoalesceTarget,
   } = dependencies;
+  // Callers that do not wire host admission (unit harnesses) get a standalone one; production
+  // passes the shared instance so reservations and the observable state are one.
+  const hostRunAdmission = dependencies.hostRunAdmission ?? createHostRunAdmission({
+    db,
+    runtimeEnv: process.env,
+    runOccupiesHostSlot: () => false,
+  });
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
@@ -1945,6 +1957,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
+    // Single admission choke point for every wake source: instance-wide usage-limit park
+    // and operator admission hold. Queued runs stay queued and start once the gate lifts.
+    if (isAdmissionBlocked && (await isAdmissionBlocked())) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.
@@ -2057,13 +2072,47 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      // Fairness: the per-agent cap stays the primary gate, but when the host ceiling is the
+      // scarce resource an agent may take at most an equal share of it per dispatch pass. With
+      // more contenders than slots this degrades to exactly one run each, which is when
+      // starvation actually matters; with a single contender it is a no-op.
+      const contendingAgentCount = await hostRunAdmission.countAgentsWithQueuedRuns();
+      const fairShareSlots = Math.max(1, Math.floor(hostRunAdmission.hostRunCeiling.value / Math.max(1, contendingAgentCount)));
+      const grantedSlots = Math.min(availableSlots, fairShareSlots);
+
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+      let visitedRunCount = 0;
+      let hostCeilingDeferred = false;
       for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
+        if (claimedRuns.length >= grantedSlots) break;
+        const reservation = await hostRunAdmission.reserve();
+        if (!reservation.granted) {
+          hostCeilingDeferred = true;
+          hostRunAdmission.recordDeferral(
+            agentId,
+            {
+              companyId: agent.companyId,
+              hostRunningCount: reservation.hostRunningCount,
+              queuedRunCount: prioritizedRuns.length,
+              claimedRunCount: claimedRuns.length,
+              contendingAgentCount,
+              fairShareSlots,
+              ...hostRunAdmission.memoryPressureDeferralDetails(reservation),
+            },
+            reservation.reason === "memory_pressure"
+              ? { message: "heartbeat dispatch deferred by cgroup memory pressure" }
+              : undefined,
+          );
+          break;
+        }
+        visitedRunCount += 1;
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
           claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);
         } catch (err) {
+          // The reservation is only handed to `executeRun` on a successful claim, so a throw
+          // or rejection here frees the slot rather than leaking it.
+          hostRunAdmission.release();
           if (isPermanentClaimRejection(err)) {
             rejectedClaims.push({ run: queuedRun, err });
             continue;
@@ -2075,12 +2124,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           );
           continue;
         }
-        if (claimed) claimedRuns.push(claimed);
+        if (claimed) {
+          claimedRuns.push(claimed);
+          // Keep the reservation held: a just-claimed run is `running` in the DB but has no
+          // process yet, so the host-wide running count does not include it. The reservation is
+          // transferred to `executeRun`, which releases it once the run registers in-process.
+        } else {
+          // No run was claimed (cancelled/blocked/stale); free the slot immediately.
+          hostRunAdmission.release();
+        }
       }
+      // Work left behind because the fair share truncated this pass is throttled by host-wide
+      // scarcity just like an outright deferral, so it must be re-offered when a slot frees.
+      const fairShareThrottled = !hostCeilingDeferred
+        && grantedSlots < availableSlots
+        && visitedRunCount < prioritizedRuns.length;
+      if (fairShareThrottled) hostRunAdmission.deferredAgentIds.add(agentId);
+      else if (!hostCeilingDeferred) hostRunAdmission.deferredAgentIds.delete(agentId);
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
-        const execution = executeRun(claimedRun.id).catch((err) => {
+        const execution = executeRun(claimedRun.id, { hostReservationHeld: true }).catch((err) => {
           logger.error(
             { err, runId: claimedRun.id },
             "queued heartbeat execution failed",
@@ -2136,6 +2200,12 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     };
     const reason = opts.reason ?? null;
     let payload = opts.payload ? { ...opts.payload } : null;
+    // Reserved provenance key is always stripped from caller input so it cannot be forged.
+    if (payload) delete payload[ACTOR_PROVENANCE_PAYLOAD_KEY];
+    // Persist the enqueuing request's credential provenance ({source, keyId} only) so a later
+    // timer drain (outside the request ALS) can restore it. No request context => no key.
+    const enqueueProvenance = captureActorProvenance();
+    if (enqueueProvenance) payload = { ...payload, [ACTOR_PROVENANCE_PAYLOAD_KEY]: enqueueProvenance };
     // Only the board queue route can record interruption authority on an
     // existing receipt. Never accept this internal marker from a wake caller.
     if (payload) {

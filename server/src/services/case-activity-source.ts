@@ -38,6 +38,8 @@ export function caseAwareActivitySource(db: Db, companyId: string) {
       agentId: caseEvents.actorAgentId,
       runId: caseEvents.runId,
       responsibleUserId: sql<string | null>`null::text`.as("responsible_user_id"),
+      actorSource: sql<string | null>`null::text`.as("actor_source"),
+      actorKeyId: sql<string | null>`null::uuid`.as("actor_key_id"),
       details: caseEvents.payload,
       createdAt: caseEvents.createdAt,
     }).from(caseEvents).where(and(

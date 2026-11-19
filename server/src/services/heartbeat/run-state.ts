@@ -52,6 +52,7 @@ import {
 import { isUuidLike } from "@paperclipai/shared";
 import { HEARTBEAT_RUN_LIST_DEFAULT_LIMIT, HEARTBEAT_RUN_LIST_MAX_LIMIT } from "@paperclipai/shared";
 import { isUnsafeSessionWorkspaceCwd } from "../session-workspace-cwd.js";
+import { stripPaperclipSessionMetadataFromSessionParams } from "./workspaces.js";
 
 export const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON =
   "execution_review_participant_recovery";
@@ -1796,7 +1797,11 @@ export function createHeartbeatRunState(db: Db) {
         ...ensured,
         sessionDisplayId:
           latestTaskSession?.sessionDisplayId ?? ensured.sessionId,
-        sessionParamsJson: latestTaskSession?.sessionParamsJson ?? null,
+        // Internal __paperclip* session-reset bookkeeping never leaves the
+        // service; DB rows keep it (fork patch, re-ported after upstream sync).
+        sessionParamsJson: stripPaperclipSessionMetadataFromSessionParams(
+          latestTaskSession?.sessionParamsJson ?? null,
+        ),
       };
     },
 
@@ -1804,7 +1809,7 @@ export function createHeartbeatRunState(db: Db) {
       const agent = await getAgent(agentId);
       if (!agent) throw notFound("Agent not found");
 
-      return db
+      const sessions = await db
         .select()
         .from(agentTaskSessions)
         .where(
@@ -1817,6 +1822,11 @@ export function createHeartbeatRunState(db: Db) {
           desc(agentTaskSessions.updatedAt),
           desc(agentTaskSessions.createdAt),
         );
+      // Same egress rule as getRuntimeStateWithSessions.
+      return sessions.map((session) => ({
+        ...session,
+        sessionParamsJson: stripPaperclipSessionMetadataFromSessionParams(session.sessionParamsJson ?? null),
+      }));
     },
 
     resetRuntimeSession: async (

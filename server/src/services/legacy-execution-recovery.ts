@@ -37,6 +37,11 @@ export function legacyExecutionNeedsReconciliation(
   if (run.errorCode === "adapter_failed" && typeof run.error === "string" &&
       /^(No API key for provider|spawn E2BIG)/.test(run.error) &&
       !(run.resultJson as Record<string, unknown> | null | undefined)?.toolCallCount) return false;
+  // Fork carryover: our own shutdown (SIGTERM wave) killed the process; the restart
+  // retry ladder owns recovery, not an action-outcome hold.
+  if (run.status === "interrupted" && run.errorCode === "server_shutdown_interrupted" &&
+      typeof run.error === "string" && run.error.includes("process lost across the shutdown boundary") &&
+      !(run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson))) return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
   // A fresh conversation turn lets the agent decide what remains. The retry
@@ -77,8 +82,14 @@ export function legacyExecutionNeedsReconciliation(
 /** Admission-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
+  // The synchronous stale-gate exemption (fork #706) trusts the receipt alone. With a
+  // DB available, the exemption must come from verified evidence (review or execution
+  // wait predicate), so conflicting or incomplete evidence keeps the hold.
+  const staleGateReceipt = run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
+    !run.startedAt && !run.processPid && !run.processGroupId;
+  const classified = staleGateReceipt ? { ...run, startedAt: new Date(0) } : run;
   return await hasUnrestoredRemoteWorkspace(db, run) ||
-    (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
+    (legacyExecutionNeedsReconciliation(classified) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run)));
 }
 

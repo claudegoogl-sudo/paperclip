@@ -271,7 +271,8 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(await queue.startNextQueuedRunForAgent(agent.id)).toEqual([]);
     deps.canStartNewExternalBotWork.mockResolvedValue(true);
     expect(await queue.startNextQueuedRunForAgent(agent.id)).toEqual([expect.objectContaining({ id: run.id, status: "running" })]);
-    expect(deps.executeRun).toHaveBeenCalledExactlyOnceWith(run.id);
+    // A claimed run is handed to executeRun still holding its host-admission reservation.
+    expect(deps.executeRun).toHaveBeenCalledExactlyOnceWith(run.id, { hostReservationHeld: true });
   });
 
   it("rechecks the connection hold when Stop races the queue scan", async () => {

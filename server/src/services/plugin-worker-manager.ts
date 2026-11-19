@@ -4193,6 +4193,8 @@ export function createPluginWorkerHandle(
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
     executeLogSink?: ExecuteLogSink,
+    meterDuplexWrite = false,
+    onRequestId?: (id: number) => void,
     onWorkerSettled?: () => void,
   ): Promise<HostToWorkerMethods[M][1]> {
     const rpcPromise = new Promise<HostToWorkerMethods[M][1]>((resolve, reject) => {
@@ -4397,7 +4399,7 @@ export function createPluginWorkerHandle(
           ),
         );
       }
-      return callInternal(method, params, timeoutMs, executeLogSink, onWorkerSettled);
+      return callInternal(method, params, timeoutMs, executeLogSink, false, undefined, onWorkerSettled);
     },
 
     openLoginPtySession(input: LoginPtyOpenInput) {
