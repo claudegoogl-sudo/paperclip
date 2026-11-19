@@ -19,13 +19,9 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Router } from "express";
-<<<<<<< fork
-import type { Db } from "@paperclipai/db";
-=======
 import { companies, type Db } from "@paperclipai/db";
 import { adapterSettingsService } from "../services/adapter-settings.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../services/activity-log.js";
->>>>>>> upstream
 import {
   listServerAdapters,
   findServerAdapter,
@@ -56,12 +52,8 @@ import { badRequest, forbidden, HttpError } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { assertExternalAdapterCodeAllowed } from "../services/adapter-code-policy.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
-<<<<<<< fork
-import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin } from "./authz.js";
-import { logInstanceActivity } from "./instance-activity.js";
-=======
 import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
->>>>>>> upstream
+import { logInstanceActivity } from "./instance-activity.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 import { agentRunnerAvailability, type RunnerTarget } from "../services/agent-runner-selection.js";
 import type { AgentRunnerAvailability } from "@paperclipai/shared";
@@ -259,11 +251,7 @@ function registerWithSessionManagement(adapter: ServerAdapterModule): void {
 // ---------------------------------------------------------------------------
 
 export function adapterRoutes(options: {
-<<<<<<< fork
-  db: Db;
-=======
   db?: Db;
->>>>>>> upstream
   getNativeRunnerEnabled?: () => Promise<boolean>;
   getOpenAiDotEnabled?: () => Promise<boolean>;
   resolveRunnerTarget?: (companyId: string, environmentId?: string) => Promise<RunnerTarget>;

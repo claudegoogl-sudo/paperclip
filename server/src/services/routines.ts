@@ -3,11 +3,8 @@ import { notifyApprovalWork } from "./approval-work-notifications.js";
 import { notifyDecisionTargetIssueRemoval } from "./decision-targets.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { verifyAppWebhook } from "./app-webhook.js";
-<<<<<<< fork
 import { stampSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
-=======
 import { authenticateWebhookCreationRun, validateCreationRun } from "./task-creation-provenance.js";
->>>>>>> upstream
 import crypto from "node:crypto";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, ne, not, or, sql } from "drizzle-orm";

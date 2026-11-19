@@ -2,12 +2,8 @@ import { Readable, type Stream } from "node:stream";
 import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-<<<<<<< fork
-import type { StorageService } from "../storage/types.js";
-import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
-=======
 import type { PutFileInput, StorageService } from "../storage/types.js";
->>>>>>> upstream
+import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),

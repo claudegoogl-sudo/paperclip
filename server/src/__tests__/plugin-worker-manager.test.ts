@@ -1,12 +1,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-<<<<<<< fork
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
-=======
-import { describe, expect, it, vi } from "vitest";
 import type { Company, PaperclipPluginManifestV1 } from "@paperclipai/shared";
->>>>>>> upstream
 import {
   createHostClientHandlers,
   JsonRpcCallError,

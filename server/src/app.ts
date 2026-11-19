@@ -206,11 +206,8 @@ import {
   resolveBundledPluginInstalls,
   resolveManagedBundledPluginKeys,
 } from "./services/bundled-plugins.js";
-<<<<<<< fork
 import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
-=======
 import { createBundledPluginPackageResolver } from "./services/bundled-plugin-package.js";
->>>>>>> upstream
 import { readDistributionPluginCatalog, distributionPluginActivationGuard } from "./services/distribution-plugin-catalog.js";
 import {
   createPluginStreamBus,

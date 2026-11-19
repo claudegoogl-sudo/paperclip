@@ -40,11 +40,8 @@
     "@dnd-kit/utilities": "^3.2.2",
     "@lexical/clipboard": "0.48.0",
     "@lexical/link": "0.48.0",
-<<<<<<< fork
     "@paperclipai/adapter-acpx-local": "workspace:*",
-=======
     "@lezer/highlight": "^1.2.3",
->>>>>>> upstream
     "@mdxeditor/editor": "^4.2.3",
     "@paperclipai/adapter-claude-local": "workspace:*",
     "@paperclipai/adapter-codex-local": "workspace:*",

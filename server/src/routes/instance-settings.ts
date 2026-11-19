@@ -9,12 +9,8 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-<<<<<<< fork
 import { badRequest, conflict, forbidden } from "../errors.js";
-=======
-import { conflict, forbidden } from "../errors.js";
 import { assertAgentsReadyForEnvironmentChange } from "../services/plugin-environment-driver.js";
->>>>>>> upstream
 import {
   cloudTenantPrimaryCompanyId,
   getCloudStackContext,

@@ -1,15 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { Readable } from "node:stream";
-<<<<<<< fork
-import type { StorageService, StorageProvider, PutFileInput, PutFileResult } from "./types.js";
-import { forbidden, unprocessable } from "../errors.js";
-import { assertObjectKeyReadable } from "./object-key.js";
-=======
 import type { StorageService, StorageProvider, PutFileInput, PutFileResult, PutObjectReceipt } from "./types.js";
 import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { assertObjectKeyReadable } from "./object-key.js";
 import { cleanupStorageFailure } from "./failure-cleanup.js";
->>>>>>> upstream
 
 const MAX_SEGMENT_LENGTH = 120;
 

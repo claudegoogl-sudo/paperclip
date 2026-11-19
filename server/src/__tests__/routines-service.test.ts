@@ -2,11 +2,7 @@ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database
 import { subscribeDatabaseWork } from "@paperclipai/db";
 import { DELIVERY_QUEUES } from "../services/delivery-work-notifications.js";
 import { createHmac, randomUUID } from "node:crypto";
-<<<<<<< fork
-import { eq, sql as drizzleSql } from "drizzle-orm";
-=======
 import { eq, sql } from "drizzle-orm";
->>>>>>> upstream
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
