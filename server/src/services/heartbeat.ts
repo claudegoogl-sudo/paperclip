@@ -291,6 +291,7 @@ import {
 } from "./agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import {
+  recordNativeLocalProcessStop,
   recordNativeLocalProcessStopInTransaction,
   settleNativeRunProcess,
 } from "./native-local-process-stop.js";

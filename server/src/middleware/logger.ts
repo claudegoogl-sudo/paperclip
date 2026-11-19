@@ -263,40 +263,6 @@ export function createHttpLogger(baseLogger: Logger) {
           }
         : value;
     },
-    customProps(req, res) {
-      if (res.statusCode >= 400) {
-        const ctx = (res as any).__errorContext;
-        if (/^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
-          return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
-        }
-        if (isPrivateWebhook(req) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
-          // Omit, rather than recursively redact, the entire provider payload.
-          // This applies equally before/after parsing and with/without context.
-          return {
-            reqBody: "[REDACTED]",
-            ...(ctx || (res as any).err
-              ? { errorContext: { name: "Error" } }
-              : {}),
-          };
-        }
-        if (ctx) {
-          const secretSensitiveRoute = isSecretSensitiveHttpRequest(
-            req.method,
-            requestClassificationUrl(req),
-          );
-          return {
-            // Provider SDK and validation errors sometimes echo the supplied
-            // credential in their prose. Keep only a non-sensitive type marker
-            // for setup routes; the status, route, and redacted body remain.
-            errorContext: secretSensitiveRoute
-              ? { name: "Error" }
-              : redactSensitive(ctx.error),
-            reqBody: redactSensitive(ctx.reqBody),
-            reqParams: redactSensitive(ctx.reqParams),
-          };
-        }
-      : value;
-  },
   customProps(req, res) {
     if (res.statusCode >= 400 && /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
       const ctx = (res as any).__errorContext;

@@ -204,7 +204,11 @@ export async function terminalizeLegacyExecution(input: {
     if (!current || (current.runtimeMode !== "legacy" && !(input.recordRestoreFailureOnly && current.runtimeMode === "native")) ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
     // Recheck under the run lock: a concurrent request may have committed the handoff.
-    if (input.dropHandoffPending && (current.resultJson as Record<string, unknown> | null)?.handoffCommitted) return current;
+    if (input.dropHandoffPending && (current.resultJson as Record<string, unknown> | null)?.handoffCommitted) {
+      const [committed] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+      return committed ?? null;
+    }
     if (input.dropHandoffPending) {
       const { handoffPending: _p, ...locked } = (current.resultJson ?? {}) as Record<string, unknown>;
       patch = { ...patch, resultJson: locked };
