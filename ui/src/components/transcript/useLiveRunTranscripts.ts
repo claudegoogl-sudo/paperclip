@@ -4,11 +4,7 @@ import { usePageVisibility } from "../../lib/page-visibility";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { readTranscriptRequest } from "./read-transcript-request";
 import { useQuery } from "@tanstack/react-query";
-import {
-  isSuccessfulHeartbeatRunStatus,
-  isTerminalHeartbeatRunStatus,
-  type LiveEvent,
-} from "@paperclipai/shared";
+import type { LiveEvent } from "@paperclipai/shared";
 import { ApiError } from "../../api/client";
 import { instanceSettingsApi } from "../../api/instanceSettings";
 import { heartbeatsApi } from "../../api/heartbeats";
@@ -72,8 +68,12 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function isTerminalStatus(status: string): boolean {
+  return status === "failed" || status === "timed_out" || status === "cancelled" || status === "interrupted" || status === "succeeded";
+}
+
 function canReadPersistedLog(run: RunTranscriptSource): boolean {
-  return run.status === "running" || isTerminalHeartbeatRunStatus(run.status);
+  return run.status === "running" || isTerminalStatus(run.status);
 }
 
 function runKnownLogBytes(run: RunTranscriptSource): number | null {
@@ -218,7 +218,7 @@ export function useLiveRunTranscripts({
 
   const runById = useMemo(() => new Map(normalizedRuns.map((run) => [run.id, run])), [normalizedRuns]);
   const activeRunIds = useMemo(
-    () => new Set(normalizedRuns.filter((run) => !isTerminalHeartbeatRunStatus(run.status)).map((run) => run.id)),
+    () => new Set(normalizedRuns.filter((run) => run.status === "running").map((run) => run.id)),
     [normalizedRuns],
   );
   const runIdsKey = useMemo(
@@ -556,81 +556,6 @@ export function useLiveRunTranscripts({
     };
   }, [visible, enableRealtimeUpdates, logPollIntervalMs, logReadLimitBytes, normalizedRuns, runIdsKey, retryGeneration, enabled, companyId, stream.healthy, stream.epoch]);
 
-        if (event.type === "heartbeat.run.log") {
-          const chunk = readString(payload["chunk"]);
-          if (!chunk) return;
-          const ts = readString(payload["ts"]) ?? event.createdAt;
-          const stream =
-            readString(payload["stream"]) === "stderr"
-              ? "stderr"
-              : readString(payload["stream"]) === "system"
-                ? "system"
-                : "stdout";
-          appendChunks(runId, [{
-            ts,
-            stream,
-            chunk,
-            seq: readChunkSeq(payload["seq"]),
-            dedupeKey: `log:${runId}:${ts}:${stream}:${chunk}`,
-          }]);
-          return;
-        }
-
-        if (event.type === "heartbeat.run.event") {
-          const seq = typeof payload["seq"] === "number" ? payload["seq"] : null;
-          const eventType = readString(payload["eventType"]) ?? "event";
-          const messageText = readString(payload["message"]) ?? eventType;
-          appendChunks(runId, [{
-            ts: event.createdAt,
-            stream: eventType === "error" ? "stderr" : "system",
-            chunk: messageText,
-            dedupeKey: `socket:event:${runId}:${seq ?? `${eventType}:${messageText}:${event.createdAt}`}`,
-          }]);
-          return;
-        }
-
-        if (event.type === "heartbeat.run.status") {
-          const status = readString(payload["status"]) ?? "updated";
-          appendChunks(runId, [{
-            ts: event.createdAt,
-            stream: isTerminalHeartbeatRunStatus(status) && !isSuccessfulHeartbeatRunStatus(status) ? "stderr" : "system",
-            chunk: `run ${status}`,
-            dedupeKey: `socket:status:${runId}:${status}:${readString(payload["finishedAt"]) ?? ""}`,
-          }]);
-        }
-      };
-
-      socket.onerror = () => {
-        socket?.close();
-      };
-
-      socket.onclose = () => {
-        scheduleReconnect();
-      };
-    };
-
-    connect();
-
-    return () => {
-      closed = true;
-      if (reconnectTimer !== null) window.clearTimeout(reconnectTimer);
-      if (socket) {
-        socket.onmessage = null;
-        socket.onerror = null;
-        socket.onclose = null;
-        if (socket.readyState === SOCKET_CONNECTING) {
-          // Defer the close until the handshake completes so the browser
-          // does not emit a noisy "closed before the connection is established"
-          // warning during rapid run teardown.
-          socket.onopen = () => {
-            socket?.close(1000, "live_run_transcripts_unmount");
-          };
-        } else if (socket.readyState === SOCKET_OPEN) {
-          socket.close(1000, "live_run_transcripts_unmount");
-        }
-      }
-    };
-  }, [visible, activeRunIds, companyId, enableRealtimeUpdates, runById]);
 
   const transcriptByRun = useMemo(() => {
     const next = new Map<string, TranscriptEntry[]>();
