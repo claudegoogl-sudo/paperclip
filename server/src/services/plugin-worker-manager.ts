@@ -21,7 +21,8 @@ import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.
  * @see PLUGIN_SPEC.md §13 — Host-Worker Protocol
  */
 
-import { fork, type ChildProcess } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { beginIdleTrackedWork, readTaskDrain, trackIdleWork } from "./task-admission.js";
 import { EventEmitter } from "node:events";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";
@@ -67,6 +68,17 @@ import {
   type LoginCommandKey,
 } from "./login-command.js";
 import { logger } from "../middleware/logger.js";
+import {
+  getActorProvenance,
+  runWithActorProvenance,
+  runWithoutActorProvenance,
+  type ActorProvenance,
+} from "../middleware/actor-context.js";
+import type { PluginRunContextRegistry } from "./plugin-run-context-registry.js";
+import { clearRunSecretValues } from "../run-secret-registry.js";
+import { redactSensitiveText } from "../redaction.js";
+import { redactSecretsForLog } from "../secret-patterns.js";
+import { sanitiseMeta } from "./plugin-host-services.js";
 import { measureRunPhase } from "./execution-preparation-timing.js";
 import { context as otelContext } from "@opentelemetry/api";
 import { traceparentFromContextToken } from "../instrumentation.js";
@@ -1152,6 +1164,7 @@ export interface PluginWorkerHandleDeps {
 export function createPluginWorkerHandle(
   pluginId: string,
   options: WorkerStartOptions,
+  deps: PluginWorkerHandleDeps = {},
   onStartupWorkChanged?: () => void,
 ): PluginWorkerHandle {
   const log = logger.child({ service: "plugin-worker", pluginId });
@@ -1364,6 +1377,51 @@ export function createPluginWorkerHandle(
   let backoffTimer: ReturnType<typeof setTimeout> | null = null;
   let nextRestartAt: number | null = null;
 
+  // SECURITY-CRITICAL: tenant pin for stream channels. Maps channel → companyId.
+  // A pin is captured ONLY from a host-validated invocation scope: either a
+  // `streams.open` (or an in-dispatch `streams.emit`) whose echoed
+  // `paperclipInvocationId` resolves to an active host-minted invocation, with
+  // the notification's claimed companyId equal to that scope's companyId. Once
+  // pinned, out-of-dispatch `streams.emit`/`streams.close` notifications for
+  // the channel are tenant-verified against the pin per emit — the
+  // worker can never attribute a channel to a company it was not dispatched
+  // by, because the pin's value comes from the dispatch scope, never from the
+  // worker's claim. Pins live until `streams.close`, eviction under the
+  // per-worker cap (`MAX_PINNED_STREAM_CHANNELS`, least-recently captured
+  // first), or worker exit (crash emits a synthetic close and clears them
+  // below). An evicted channel keeps streaming in-dispatch — only its
+  // out-of-dispatch attribution and exit cleanup are given up.
+  const pinnedStreamChannels = new Map<string, string>();
+
+  /**
+   * Capture a host-verified channel pin, evicting the least-recently captured
+   * pin when the worker is over `MAX_PINNED_STREAM_CHANNELS`.
+   *
+   * Recency: re-capturing an already-pinned channel moves it to newest, so a
+   * channel the worker is actively (re-)opening is never the eviction
+   * candidate. Every eviction is reported twice — never silently: a
+   * `streams.dropped` notification tells the PLUGIN its pin was evicted (so
+   * it knows out-of-dispatch emits for that channel will now fail closed),
+   * and the host warn log records it for querying.
+   */
+  function captureStreamPin(channel: string, companyId: string, sourceMethod: string): void {
+    pinnedStreamChannels.delete(channel);
+    pinnedStreamChannels.set(channel, companyId);
+    while (pinnedStreamChannels.size > MAX_PINNED_STREAM_CHANNELS) {
+      const oldest = pinnedStreamChannels.keys().next();
+      if (oldest.done) break;
+      const evictedChannel = oldest.value;
+      const evictedCompanyId = pinnedStreamChannels.get(evictedChannel) ?? "";
+      pinnedStreamChannels.delete(evictedChannel);
+      dropStreamNotification(
+        sourceMethod,
+        evictedChannel,
+        evictedCompanyId,
+        "pin_cap_exceeded",
+        "evicted plugin stream channel pin: worker exceeded the per-worker pinned-channel cap",
+      );
+    }
+  }
   // Fail-closed retirement tracking. A retirement kills the current process
   // because the host cannot prove one of its routes is gone. The exit that
   // follows replaces the process with a fresh one, bounded by
@@ -1381,6 +1439,7 @@ export function createPluginWorkerHandle(
 
   const rpcTimeoutMs = options.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
   const autoRestart = options.autoRestart ?? true;
+  const maxIpcFrameBytes = resolveMaxIpcFrameBytes(options.maxIpcFrameBytes);
   const minBackoffMs = options.crashRecovery?.minBackoffMs ?? MIN_BACKOFF_MS;
   const maxConsecutiveRetirements =
     options.crashRecovery?.maxConsecutiveRetirements ?? MAX_CONSECUTIVE_RETIREMENTS;
@@ -1584,7 +1643,31 @@ export function createPluginWorkerHandle(
     return null;
   }
 
-  function registerInvocation(scope: PluginInvocationScope, ttlMs?: number): PluginInvocationContext {
+  function registerInvocation(
+    scope: PluginInvocationScope,
+    ttlMs?: number,
+    method?: HostToWorkerMethodName | string,
+  ): PluginInvocationContext {
+    // SECURITY-CRITICAL: for a background dispatch carrying a triggering company (and no
+    // dispatching agent runId of its own), mint a per-dispatch company-scoped
+    // run-context and surface its runId on the scope. The worker echoes it on
+    // its `secrets.resolve` callback (or the host back-fills it from this
+    // scope), so the resolve is company-scoped instead of falling through to
+    // the company-agnostic worker-lifetime service path.
+    let effectiveScope = scope;
+    let backgroundRunId: string | undefined;
+    if (
+      method !== undefined &&
+      BACKGROUND_DISPATCH_METHODS.has(method) &&
+      scope.companyId &&
+      !scope.runId &&
+      runContextRegistry
+    ) {
+      backgroundRunId = randomUUID();
+      effectiveScope = { ...scope, runId: backgroundRunId };
+      runContextRegistry.registerBackground(pluginId, backgroundRunId, scope.companyId);
+    }
+
     // Keep the owning operation's parent host-side; workspace/runtime operations
     // use the same per-invocation contract as measured provider startup.
     const activeStep = getActiveStepContext();
@@ -1602,10 +1685,10 @@ export function createPluginWorkerHandle(
       scope: effectiveScope,
       traceparent,
       backgroundRunId,
+      providerSpanBudget: { remaining: 256 },
       ...(provenance ? { provenance } : {}),
       ...(method !== undefined ? { method } : {}),
     };
-    const entry: ActiveInvocation = { scope, traceparent, providerSpanBudget:{remaining:256} };
     if (ttlMs !== undefined) {
       entry.timer = setTimeout(() => {
         activeInvocations.delete(invocation.id);
@@ -3256,7 +3339,30 @@ export function createPluginWorkerHandle(
     }
     const entry = activeInvocations.get(invocationId);
     if (!entry) return { invalidInvocationScope: true };
-    return { invocationScope: entry.scope, traceparent: entry.traceparent, providerSpanBudget:entry.providerSpanBudget };
+    if (echoesInvocationId) echoObserved = true;
+    return {
+      invocationScope: entry.scope,
+      traceparent: entry.traceparent,
+      providerSpanBudget: entry.providerSpanBudget,
+      ...(entry.method ? { invocationDispatchMethod: entry.method } : {}),
+    };
+  }
+
+  /**
+   * Credential provenance for a worker→host request. Positive evidence only:
+   * resolved solely from an echoed, host-minted `paperclipInvocationId` that
+   * hits a live entry. SECURITY: the `singleInFlightScope` heuristic and every
+   * id-less path are deliberately NOT used — a global worker's id-less call
+   * may belong to no dispatch at all (timer, poll loop, job), and stamping it
+   * with whichever request is mid-flight would forge `board_key` attribution.
+   * `null` (recorded as NULL) is the correct answer when the id is absent.
+   */
+  function provenanceForWorkerRequest(message: JsonRpcRequest): ActorProvenance | null {
+    const invocationId = readNonEmptyString(
+      (message as { paperclipInvocationId?: unknown }).paperclipInvocationId,
+    );
+    if (!invocationId) return null;
+    return activeInvocations.get(invocationId)?.provenance ?? null;
   }
 
   /**
@@ -4162,6 +4268,19 @@ export function createPluginWorkerHandle(
     });
   }
 
+  /**
+   * SECURITY-CRITICAL: SIGKILL a worker that sent an oversized IPC frame. Deliberately
+   * does NOT set `intentionalStop`, so {@link handleProcessExit} treats the
+   * death as a crash and the normal exponential-backoff / consecutive-crash
+   * ceiling applies — a worker that keeps emitting oversized frames is
+   * eventually abandoned rather than restarted forever.
+   */
+  function terminateForOversizeFrame(): void {
+    if (!childProcess) return;
+    try {
+      childProcess.kill("SIGKILL");
+    } catch {
+      // Process may already be dead.
   // Retire the current process on a fail-closed route violation. Unlike
   // `killProcess`, this is not a deliberate stop: the exit replaces the process
   // with a fresh one. A deliberate stop already in progress wins, so a plugin
@@ -4288,7 +4407,7 @@ export function createPluginWorkerHandle(
     startupContextId?: string,
     observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
   ): Promise<HostToWorkerMethods[M][1]> {
-    const dispatched = measureRunPhase("execution.plugin_dispatch", () => callInternalRaw(method, params, timeoutMs, executeLogSink, onWorkerSettled, startupContextId, observeResult));
+    const dispatched = measureRunPhase("execution.plugin_dispatch", () => callInternalRaw(method, params, timeoutMs, executeLogSink, meterDuplexWrite, onRequestId, onWorkerSettled, startupContextId, observeResult));
     // Tracing wraps the RPC in a new promise. Guard the promise handed to the
     // caller as well, without swallowing its eventual rejection for that caller.
     void dispatched.catch(() => undefined);
@@ -4300,6 +4419,8 @@ export function createPluginWorkerHandle(
     params: HostToWorkerMethods[M][0],
     timeoutMs?: number,
     executeLogSink?: ExecuteLogSink,
+    meterDuplexWrite = false,
+    onRequestId?: (id: number) => void,
     onWorkerSettled?: () => void,
     startupContextId?: string,
     observeResult?: (result: HostToWorkerMethods[M][1]) => Promise<void>,
@@ -4373,7 +4494,7 @@ export function createPluginWorkerHandle(
       }
       const timeout = resolveRpcCallTimeoutMs(timeoutMs, rpcTimeoutMs);
       const invocationScope = deriveInvocationScope(method, params);
-      const invocation = invocationScope ? registerInvocation(invocationScope) : null;
+      const invocation = invocationScope ? registerInvocation(invocationScope, undefined, method) : null;
       if (invocation && startupContextId) activeInvocations.get(invocation.id)!.startupContextId = startupContextId;
       // Register the host-owned execute route only for an execute call that
       // carries a log sink. The company id comes from the host-derived
@@ -4572,7 +4693,7 @@ export function createPluginWorkerHandle(
             message: `Cannot call "${method}" — worker for "${pluginId}" is ${status}` }),
         );
       }
-      return callInternal(method, params, timeoutMs, executeLogSink, onWorkerSettled, startupContextId, observeResult);
+      return callInternal(method, params, timeoutMs, executeLogSink, false, undefined, onWorkerSettled, startupContextId, observeResult);
     },
 
     openLoginPtySession(input: LoginPtyOpenInput) {
@@ -4902,6 +5023,19 @@ export function createPluginWorkerManager(
         // caller already supplied its own (a test may inject its own).
         duplexRouteSlots,
         ...options,
+        // Stamp the emitting pluginId on stream notifications fanned out at the
+        // manager level, unless the caller supplied its own per-worker callback.
+        onStreamNotification:
+          options.onStreamNotification ??
+          (managerOptions?.onStreamNotification
+            ? (method, params) => {
+                const notify = managerOptions.onStreamNotification;
+                if (notify) notify({ pluginId, method, params });
+              }
+            : undefined),
+      }, {
+        runContextRegistry: managerOptions?.runContextRegistry,
+        workerLogPersist: managerOptions?.workerLogPersist,
       }, () => pruneStartupWorker(handle));
       idleWorkerManifests.set(handle, pluginIdleManifestGeneration(options.manifest));
       if (existing) retainStartupWorker(existing);
@@ -4980,6 +5114,12 @@ export function createPluginWorkerManager(
 
       log.info({ pluginId }, "stopping plugin worker");
       await trackIdleWork(handle.stop());
+      managerOptions?.runContextRegistry?.deregister(pluginId, handle.serviceRunId);
+      // SECURITY-CRITICAL: the service runId is TTL-exempt in the redaction map,
+      // so without this its resolved plaintext would linger for the process
+      // lifetime (lazy prune only). Clear it on stop.
+      clearRunSecretValues(handle.serviceRunId);
+      workers.delete(pluginId);
       retainStartupWorker(handle);
       if (workers.get(pluginId) === handle) workers.delete(pluginId);
     },
