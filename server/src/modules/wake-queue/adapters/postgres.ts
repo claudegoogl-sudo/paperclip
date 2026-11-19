@@ -1391,8 +1391,22 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
-        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot,
-          recoveryOnly: recoveryOnly && !handoffAssigneeAgentId, ...(handoffAssigneeAgentId ? { handoffAssigneeAgentId } : {}) };
+        const locked: LockedIssueExecution = {
+          primaryIssue: toIssueSnapshot(issueRow),
+          // Sibling issues lock-cleared in this same transaction (context-issue
+          // selection above only picks the drain primary; the fork's
+          // sibling-promotion fix drains deferred wakes on these too).
+          siblingIssues: candidateIssues
+            .filter((candidate) => candidate.id !== issueRow?.id)
+            // A sibling whose execution lock already moved to a different
+            // (live retry) run is executing under that run; draining its
+            // deferred wakes here would steal the issue from under it.
+            .filter((candidate) => !candidate.executionRunId || candidate.executionRunId === run.id)
+            .map(toIssueSnapshot),
+          run: runSnapshot,
+          recoveryOnly: recoveryOnly && !handoffAssigneeAgentId,
+          ...(handoffAssigneeAgentId ? { handoffAssigneeAgentId } : {}),
+        };
         const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy

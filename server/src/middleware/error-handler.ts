@@ -6,13 +6,14 @@ import { HttpError } from "../errors.js";
 import { trackErrorHandlerCrash } from "@paperclipai/shared/telemetry";
 import { getTelemetryClient } from "../telemetry.js";
 import { captureException } from "../sentry.js";
-import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 import { logger } from "./logger.js";
 import {
   isSecretSensitiveHttpRequest,
   secretSensitiveRouteFamily,
 } from "./http-log-policy.js";
 import { SecretSensitiveRequestError } from "./secret-sensitive-request-error.js";
+import { redactSecretsForLog } from "../secret-patterns.js";
+import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 import {
   collectSensitiveStringValues,
   redactSensitiveValueOccurrences,
@@ -92,6 +93,18 @@ function sanitizeSecretSensitiveResponse(
     value,
     collectSensitiveStringValues(req.body),
   );
+}
+
+function extractNumericStatus(err: unknown): number | undefined {
+  if (!err || typeof err !== "object") return undefined;
+  const anyErr = err as { status?: unknown; statusCode?: unknown };
+  if (typeof anyErr.status === "number" && Number.isFinite(anyErr.status)) {
+    return anyErr.status;
+  }
+  if (typeof anyErr.statusCode === "number" && Number.isFinite(anyErr.statusCode)) {
+    return anyErr.statusCode;
+  }
+  return undefined;
 }
 
 /** Report a server-side crash to every error sink. */
@@ -287,6 +300,55 @@ export function errorHandler(
     return;
   }
 
+  // Surface generic errors (e.g. body-parser PayloadTooLargeError) that carry
+  // a numeric status in the 4xx range with that status instead of flattening
+  // to 500. 5xx numerics fall through to the telemetry/attach branch below.
+  const numericStatus = extractNumericStatus(err);
+  // Parser failures that are not the exact malformed-JSON shape handled above
+  // stay server errors: their messages can quote request bytes.
+  const isParseFailure =
+    typeof (err as { type?: unknown } | null)?.type === "string" &&
+    ((err as { type: string }).type).endsWith(".parse.failed");
+  if (!isParseFailure && typeof numericStatus === "number" && numericStatus >= 400 && numericStatus < 500) {
+    const errLike = err as Error & {
+      status?: number;
+      statusCode?: number;
+      type?: string;
+      limit?: number;
+    };
+    const contentLengthHeader = req.headers["content-length"];
+    const contentLength =
+      typeof contentLengthHeader === "string" ? Number(contentLengthHeader) : undefined;
+
+    if (numericStatus === 413) {
+      logger.warn(
+        {
+          // SECURITY-CRITICAL: Direct logger.* call: NOT covered by pino-http `redact.paths`
+          // (those only cover req.url/req.query/req.headers), so scrub the URL
+          // here — a `?token=<secret>` on an oversized request would otherwise
+          // land in server.log cleartext.
+          route: redactSecretsForLog(req.originalUrl),
+          method: req.method,
+          contentLength: Number.isFinite(contentLength) ? contentLength : null,
+          limit: typeof errLike.limit === "number" ? errLike.limit : null,
+          type: errLike.type ?? null,
+        },
+        "request entity too large",
+      );
+      res.status(413).json({
+        error: "Request entity too large",
+        code: errLike.type ?? "entity.too.large",
+        ...(typeof errLike.limit === "number" ? { limit: errLike.limit } : {}),
+      });
+      return;
+    }
+
+    res.status(numericStatus).json({
+      error: errLike.message || `HTTP ${numericStatus}`,
+      ...(errLike.type ? { code: errLike.type } : {}),
+    });
+    return;
+  }
   const rootError = err instanceof Error ? err : new Error(String(err));
 
   // The client tore down the connection mid-request (closed tab, dropped

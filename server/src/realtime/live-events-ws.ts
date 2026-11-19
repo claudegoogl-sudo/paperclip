@@ -7,8 +7,9 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles, heartbeatRuns, projects } from "@paperclipai/db";
-import { issueActivityChangesTaskIdentity, type DeploymentMode, type LiveEvent } from "@paperclipai/shared";
+import { isAgentApiKeyExpired, issueActivityChangesTaskIdentity, type DeploymentMode, type LiveEvent } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
+import { auditAgentKeyExpired } from "../middleware/auth.js";
 import { logger } from "../middleware/logger.js";
 import { activityToastIdentity } from "./activity-toast-identity.js";
 import { taskToastEligible } from "./task-toast-eligibility.js";
@@ -147,9 +148,10 @@ async function authorizeUpgrade(
     resolveCloudActor?: (req: IncomingMessage) => Promise<CloudUpgradeActor | null>;
   },
 ): Promise<UpgradeContext | null> {
-  const queryToken = url.searchParams.get("token")?.trim() ?? "";
-  const authToken = parseBearerToken(req.headers.authorization);
-  const token = authToken ?? (queryToken.length > 0 ? queryToken : null);
+  // Agent keys are accepted ONLY via `Authorization: Bearer`. A `?token=` query
+  // param is deliberately ignored: URLs leak into proxy logs / Referer / history
+  // and WS upgrades bypass HTTP request-log redaction.
+  const token = parseBearerToken(req.headers.authorization);
 
   // Browser board context has no bearer token in local_trusted and authenticated modes.
   if (!token) {
@@ -227,6 +229,30 @@ async function authorizeUpgrade(
     .then((rows) => rows[0] ?? null);
 
   if (!key || key.companyId !== companyId || key.scopeConfig) {
+    return null;
+  }
+
+  // Fail-closed expiry backstop: reject a key past `expiresAt` on the
+  // live-events socket the same way the HTTP resolver does, independent of
+  // `revokedAt`.
+  if (isAgentApiKeyExpired(key.expiresAt)) {
+    logger.warn(
+      { keyId: key.id, agentId: key.agentId, companyId: key.companyId, expiresAt: key.expiresAt },
+      "Rejected expired agent API key on live-events socket",
+    );
+    // Detection parity with the HTTP resolver (middleware/auth.ts): emit the
+    // same `auth.agent_key_expired` activity_log row so forensics see expired-key
+    // rejections regardless of whether they arrive over HTTP or the WS upgrade.
+    // Use `url.pathname` (not `req.url`) so no query string ever lands in
+    // the audit row.
+    await auditAgentKeyExpired(db, {
+      companyId: key.companyId,
+      agentId: key.agentId,
+      keyId: key.id,
+      expiresAt: key.expiresAt ?? null,
+      method: req.method ?? "GET",
+      url: url.pathname,
+    });
     return null;
   }
 
