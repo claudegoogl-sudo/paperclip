@@ -171,7 +171,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -8094,6 +8094,28 @@ export function issueService(db: Db) {
       if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status))
         return null;
 
+      // the issue's executionRunId can be held unexpired by a
+      // not-yet-started scheduled_retry run reserved for this same agent
+      // (see the handover in heartbeat.ts's scheduleTransientHeartbeatRetry).
+      // Re-read + lock that holder row inside this transaction — never trust
+      // a pre-transaction read — because the retry can become due
+      // concurrently between the caller's lookup and this adoption.
+      let yieldedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      if (lockedIssue.executionRunId != null && lockedIssue.executionRunId !== input.actorRunId) {
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${lockedIssue.executionRunId} for update`,
+        );
+        const holderRun = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, lockedIssue.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        if (!isYieldableExecutionLockHolder(holderRun, input.actorAgentId, lockedIssue.assigneeAgentId)) {
+          return null;
+        }
+        yieldedRun = holderRun;
+      }
+
       await notifyStatusCardIssueChange(tx, actorRun.companyId);
       const now = new Date();
       const adopted = await tx
@@ -12883,31 +12905,22 @@ export function issueService(db: Db) {
           checkoutRunId,
         ))
       ) {
-        const adopted = await db.transaction(async tx => {
-          await notifyStatusCardIssueChange(tx, issueCompany.companyId);
-          return tx
-          .update(issues)
-          .set({
-            checkoutRunId,
-            executionRunId: checkoutRunId,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issues.id, id),
-              eq(issues.status, "in_progress"),
-              eq(issues.assigneeAgentId, agentId),
-              isNull(issues.checkoutRunId),
-              or(
-                isNull(issues.executionRunId),
-                eq(issues.executionRunId, checkoutRunId),
-              ),
-            ),
-          )
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        // route through the same transactional, re-verified-under-lock
+        // adoption used by assertCheckoutOwner (PATCH/release) so a yieldable
+        // scheduled_retry holder is reclaimed here too, instead of
+        // falling through to "Issue checkout conflict" for a lock the ownership
+        // layer would have let this same run take a moment later.
+        const adopted = await adoptUnownedCheckoutRun({
+          issueId: id,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
         });
-        if (adopted) return adopted;
+        if (adopted) {
+          const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+          if (!row) throw notFound("Issue not found");
+          const [enriched] = await withIssueLabels(db, [row]);
+          return enriched;
+        }
       }
 
       if (

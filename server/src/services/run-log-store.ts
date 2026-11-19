@@ -7,6 +7,7 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
+import { redactSensitiveText } from "../redaction.js";
 import type { ObjectJournalIOPriority } from "./object-byte-journal.js";
 import { createObjectRunLogStore } from "./object-run-log-store.js";
 import { resolveRunEvidenceStorage } from "./run-evidence-storage.js";

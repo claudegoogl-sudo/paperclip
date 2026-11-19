@@ -398,7 +398,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy
+  if (stages.length === 0 && !monitor && !standbyWakeTarget && !reviewPreset && !authorizationPolicy
     && parsed.data.maxReviewRounds == null && !parsed.data.requiredQualityReview) return null;
 
   return {

@@ -394,6 +394,26 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
   const gitRestorePointRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS", 90));
   const gitRestorePointTerminalDelayDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS", 3);
   const gitRestorePointIdleDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS", 7);
+  const boardApiKeyAuthEventRetentionEnabled =
+    process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
+  // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
+  // motivated the log (the credential-abuse investigation that drove it needed
+  // ~3 months of history) without letting the table drift toward activity_log's
+  // scale.
+  const boardApiKeyAuthEventRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_DAYS) || 90,
+  );
+  // Load-bearing size bound: one row per source-minute under a sustained
+  // distributed attempt still has to stop somewhere. 500k rows is tens of MB.
+  const boardApiKeyAuthEventMaxRows = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_MAX_ROWS) || 500_000,
+  );
+  const boardApiKeyAuthEventRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_INTERVAL_MINUTES) || 60,
+  );
   const taskDirectoryOrphanGraceDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_TASK_DIRECTORY_ORPHAN_GRACE_DAYS", 7));
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,

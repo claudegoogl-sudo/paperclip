@@ -54,6 +54,7 @@ import type { PluginToolDispatcher } from "./plugin-tool-dispatcher.js";
 import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
+import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
 import { managedPluginWorkerEnvGrant } from "./managed-plugin-worker-env.js";
 
 const execFileAsync = promisify(execFile);
@@ -1777,6 +1778,7 @@ export function pluginLoader(
     enableNpmDiscovery = true,
     escalationGateway,
     assertPackageActivation,
+    installCapabilityAllowlist = [],
     resolvePackageRoot,
     prebuiltOnly = false,
   } = options;
@@ -2133,7 +2135,7 @@ export function pluginLoader(
     }
 
     assertPackageActivation?.({ packageRoot, installedPackagePath: plugin.packagePath, pluginKey: plugin.pluginKey, manifest, previousManifest: plugin.manifestJson });
-    if (isDeepStrictEqual(manifest, plugin.manifestJson)) {
+    if (canonicalJson(manifest) === canonicalJson(plugin.manifestJson)) {
       return plugin;
     }
 
@@ -2701,12 +2703,8 @@ export function pluginLoader(
     async upgradePlugin(
       pluginId: string,
       upgradeOptions: Omit<PluginInstallOptions, "installDir">,
-    ): Promise<{
-      oldManifest: PaperclipPluginManifestV1;
-      newManifest: PaperclipPluginManifestV1;
-      discovered: DiscoveredPlugin;
-    }> {
-      const plugin = await registry.getById(pluginId);
+    ): Promise<UpgradePluginResult> {
+      const plugin = (await registry.getById(pluginId)) as PluginRecord | null;
       if (!plugin) throw new Error(`Plugin not found: ${pluginId}`);
 
       const oldManifest = plugin.manifestJson;

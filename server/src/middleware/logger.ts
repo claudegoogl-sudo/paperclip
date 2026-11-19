@@ -149,12 +149,19 @@ function requestLogUrl(req: {
     : stripSecretBearingUrlParts(typeof req.url === "string" ? req.url : "");
 }
 
+/**
+ * Factory form of the HTTP logger (upstream contract): mount the fork's
+ * redacting middleware against a caller-supplied base logger, so tests and
+ * embedders can observe exactly what would be written. The singletons below
+ * use the shared `logger`. Combines upstream's private-webhook closed
+ * projections with the fork's secret-pattern redaction.
+ */
 function abortedRequestMessage(req: IncomingMessage, res: ServerResponse) {
   if (!req.readableAborted && res.writableFinished) return null;
   return `${req.method} ${requestLogUrl(req)} — request aborted${res.headersSent ? " during response" : " before response"}`;
 }
 
-export function createHttpLogger(baseLogger: Logger) {
+export function createHttpLogger(baseLogger: pino.Logger) {
   return pinoHttp({
     logger: baseLogger,
   // SECURITY-CRITICAL: Log-time secret-pattern redaction (§1–§2). The matched substring
@@ -217,103 +224,71 @@ export function createHttpLogger(baseLogger: Logger) {
           : res;
       },
     },
-    customLogLevel(_req, res, err) {
-      if (err || (res as ServerResponse & { err?: unknown }).err || res.statusCode >= 500) return "error";
-      if (_req.readableAborted || !res.writableFinished) return "warn";
-      if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
-        return "silent";
-      }
-      if (res.statusCode >= 400) return "warn";
-      return "info";
-    },
-    customSuccessMessage(req, res) {
-      return abortedRequestMessage(req, res) ?? `${req.method} ${requestLogUrl(req)} ${res.statusCode}`;
-    },
-    customErrorMessage(req, res, err) {
-      const abortedMessage = abortedRequestMessage(req, res);
-      if (abortedMessage) return abortedMessage;
-      if (
-        isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))
-      ) {
-        return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
-      }
+  customLogLevel(_req, res, err) {
+    if (err || (res as any).err || res.statusCode >= 500) return "error";
+    if (_req.readableAborted || !res.writableFinished) return "warn";
+    if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
+      return "silent";
+    }
+    if (res.statusCode >= 400) return "warn";
+    return "info";
+  },
+  customSuccessMessage(req, res) {
+    const abortedSuccess = abortedRequestMessage(req, res);
+    if (abortedSuccess) return redactSecretsForLog(abortedSuccess);
+    // The request line keeps the webhook placeholder for private webhook
+    // routes and drops secret-bearing URL parts otherwise; the fork's
+    // pattern redaction wraps both (a workspace login handoff ticket is a
+    // bearer credential that rides in the query string).
+    return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode}`);
+  },
+  customErrorMessage(req, res, err) {
+    const abortedMessage = abortedRequestMessage(req, res);
+    if (abortedMessage) return redactSecretsForLog(abortedMessage);
+    if (isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))) {
+      return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`);
+    }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
+    }
+    const ctx = (res as any).__errorContext;
+    const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
+    return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — ${errMsg}`);
+  },
+  customErrorObject(req, _res, _err, value) {
+    if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
+    }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "External agent request failed" } };
+    }
+    if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Feedback request failed" } };
+    }
+    // pino-http serializes res.err independently of customProps/errorContext.
+    // Do not rely on a particular error handler having sanitized an SDK Error.
+    return isPrivateWebhook(req)
+      ? {
+          ...value,
+          err: { type: "Error", message: "Chat webhook request failed" },
+        }
+      : value;
+  },
+  customProps(req, res) {
+    if (res.statusCode >= 400 && /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
       const ctx = (res as any).__errorContext;
-      const errMsg =
-        ctx?.error?.message ||
-        err?.message ||
-        (res as any).err?.message ||
-        "unknown error";
-      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
-    },
-    customErrorObject(req, _res, _err, value) {
-      if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
-        return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
-      }
-      if(isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req)))return {...value,err:{type:"Error",message:"Dot principal request failed"}};
-      if (isPrivateMuseHttpRequest(requestClassificationUrl(req)))return {...value,err:{type:"Error",message:"External agent request failed"}};
-      if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
-        return { ...value, err: { type: "Error", message: "Feedback request failed" } };
-      }
-      // pino-http serializes res.err independently of customProps/errorContext.
-      // Do not rely on a particular error handler having sanitized an SDK Error.
-      return isPrivateWebhook(req)
-        ? {
-            ...value,
-            err: { type: "Error", message: "Chat webhook request failed" },
-          }
-        : value;
-    },
-    customProps(req, res) {
-      if (res.statusCode >= 400) {
-        const ctx = (res as any).__errorContext;
-        if (/^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
-          return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
-        }
-        if (isPrivateWebhook(req) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
-          // Omit, rather than recursively redact, the entire provider payload.
-          // This applies equally before/after parsing and with/without context.
-          return {
-            reqBody: "[REDACTED]",
-            ...(ctx || (res as any).err
-              ? { errorContext: { name: "Error" } }
-              : {}),
-          };
-        }
-        if (ctx) {
-          const secretSensitiveRoute = isSecretSensitiveHttpRequest(
-            req.method,
-            requestClassificationUrl(req),
-          );
-          return {
-            // Provider SDK and validation errors sometimes echo the supplied
-            // credential in their prose. Keep only a non-sensitive type marker
-            // for setup routes; the status, route, and redacted body remain.
-            errorContext: secretSensitiveRoute
-              ? { name: "Error" }
-              : redactSensitive(ctx.error),
-            reqBody: redactSensitive(ctx.reqBody),
-            reqParams: redactSensitive(ctx.reqParams),
-          };
-        }
-        const props: Record<string, unknown> = {};
-        const { body, params } = req as any;
-        if (body && typeof body === "object" && Object.keys(body).length > 0) {
-          props.reqBody = redactSensitive(body);
-        }
-        if (
-          params &&
-          typeof params === "object" &&
-          Object.keys(params).length > 0
-        ) {
-          props.reqParams = redactSensitive(params);
-        }
-        if ((req as any).route?.path) {
-          props.routePath = (req as any).route.path;
-        }
-        return props;
-      }
-      return {};
-    },
+      return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
+    }
+    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
+      // Omit, rather than recursively redact, the entire provider payload —
+      // before/after parsing, with or without error context.
+      return {
+        reqBody: "[REDACTED]",
+        ...((res as any).__errorContext || (res as any).err ? { errorContext: { name: "Error" } } : {}),
+      };
+    }
+    return redactSecretsDeepForLog(buildHttpLogProps(req, res));
+  },
   });
 }
 

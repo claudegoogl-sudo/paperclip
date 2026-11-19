@@ -149,6 +149,12 @@ export async function releaseFailedHandoffHold(db: Db, run: Run) {
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   if (await isInterruptedNativePreparation(db, run)) return false;
+  // The synchronous stale-gate exemption (fork #706) trusts the receipt alone. With a
+  // DB available, the exemption must come from verified evidence (review or execution
+  // wait predicate), so conflicting or incomplete evidence keeps the hold.
+  const staleGateReceipt = run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
+    !run.startedAt && !run.processPid && !run.processGroupId;
+  const classified = staleGateReceipt ? { ...run, startedAt: new Date(0) } : run;
   return await hasUnrestoredRemoteWorkspace(db, run) ||
     (legacyExecutionNeedsReconciliation(classified) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run)));
@@ -198,7 +204,11 @@ export async function terminalizeLegacyExecution(input: {
     if (!current || (current.runtimeMode !== "legacy" && !(input.recordRestoreFailureOnly && current.runtimeMode === "native")) ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
     // Recheck under the run lock: a concurrent request may have committed the handoff.
-    if (input.dropHandoffPending && (current.resultJson as Record<string, unknown> | null)?.handoffCommitted) return current;
+    if (input.dropHandoffPending && (current.resultJson as Record<string, unknown> | null)?.handoffCommitted) {
+      const [committed] = await tx.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+      return committed ?? null;
+    }
     if (input.dropHandoffPending) {
       const { handoffPending: _p, ...locked } = (current.resultJson ?? {}) as Record<string, unknown>;
       patch = { ...patch, resultJson: locked };

@@ -3,6 +3,7 @@ import { notifyApprovalWork } from "./approval-work-notifications.js";
 import { notifyDecisionTargetIssueRemoval } from "./decision-targets.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { verifyAppWebhook } from "./app-webhook.js";
+import { stampSecretBindingAuditActor } from "./secret-binding-audit-actor.js";
 import { authenticateWebhookCreationRun, validateCreationRun } from "./task-creation-provenance.js";
 import crypto from "node:crypto";
 import { verifyFirefliesWebhook } from "./fireflies-webhook.js";
@@ -2131,6 +2132,8 @@ export function routineService(
       title,
       description,
     });
+    // Boxed so the assignment inside the transaction callback survives control-flow narrowing.
+    const stalePinRelease: { value: StalePinRelease | null } = { value: null };
     const idempotentRunId = input.routineIdempotency && input.idempotencyKey
       ? routineScopedRunId(input.routine.id, input.source, input.idempotencyKey) : null;
     let reusedExistingRun = false;
@@ -2228,11 +2231,30 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-        const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-          kind: issueOriginKind,
-          id: issueOriginId,
-          allowLegacyDefault: !creationRunFingerprint,
-        });
+        let activeIssue: typeof issues.$inferSelect | null = await findLiveExecutionIssue(
+          input.routine,
+          txDb,
+          dispatchFingerprint,
+          { kind: issueOriginKind, id: issueOriginId, allowLegacyDefault: !creationRunFingerprint },
+        );
+        let pinningRuns: PinningRun[] = [];
+        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
+          pinningRuns = await loadPinningRuns(activeIssue, txDb);
+          const deadRuns = findDeadExecutionPinRuns(pinningRuns, triggeredAt, nextRunAt);
+          if (deadRuns) {
+            const released = await releaseDeadExecutionPin({
+              routine: input.routine,
+              issue: activeIssue,
+              deadRuns,
+              now: triggeredAt,
+              executor: txDb,
+            });
+            if (released) {
+              stalePinRelease.value = { issueId: activeIssue.id, ...released };
+              activeIssue = null;
+            }
+          }
+        }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           const pinDescription = describePinningRuns(pinningRuns, triggeredAt);
@@ -2255,32 +2277,17 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-        try {
-          createdIssue = await issueSvc.create(input.routine.companyId, {
-            projectId,
-            projectWorkspaceId,
-            goalId: input.routine.goalId,
-            parentId: input.routine.parentIssueId,
-            // A routine's parent is configured, not chosen per run. Human-configured
-            // routines keep any depth; agent-authored ones follow the agent limit.
-            parentDepthPolicy: input.routine.createdByAgentId ? "flatten" : "allow_nested",
-            title,
-            description,
-            status: "todo",
-            priority: input.routine.priority,
-            assigneeAgentId,
-            createdByAgentId: input.source === "manual" ? input.actor?.agentId ?? null : null,
-            createdByUserId: manualRunnerUserId,
-            responsibleUserId,
-            trustExplicitResponsibleUserId: true,
-            originKind: issueOriginKind,
-            originId: issueOriginId,
-            originRunId: createdRun.id,
-            originFingerprint: dispatchFingerprint,
-            billingCode: issueBillingCode,
-            executionWorkspaceId: input.executionWorkspaceId ?? null,
-            executionWorkspacePreference: input.executionWorkspacePreference ?? null,
-            executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+        // Nothing live is pinning us, but an earlier execution issue can still be sitting open
+        // with every one of its runs terminal — the shape a killed agent leaves
+        // behind. It is invisible to findLiveExecutionIssue (which inner-joins live runs), so the
+        // tick sails past the skip branch, and it does NOT collide on this insert either: a new
+        // issue has a null execution_run_id and the unique index only covers non-null ones. The
+        // collision lands later, when the assignment wakeup checks the issue out and sets
+        // execution_run_id — far from here, and it fails the whole dispatch. So reap it up front.
+        if (input.routine.concurrencyPolicy !== "always_enqueue") {
+          const runlessIssue = await findRunlessExecutionIssue(input.routine, txDb, dispatchFingerprint, {
+            kind: issueOriginKind,
+            id: issueOriginId,
           });
           if (runlessIssue) {
             const released = await releaseRunlessExecutionIssue({
@@ -2297,6 +2304,7 @@ export function routineService(
           projectWorkspaceId,
           goalId: input.routine.goalId,
           parentId: input.routine.parentIssueId,
+          parentDepthPolicy: input.routine.createdByAgentId ? ("flatten" as const) : ("allow_nested" as const),
           title,
           description,
           status: "todo" as const,

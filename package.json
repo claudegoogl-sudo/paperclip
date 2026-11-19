@@ -102,6 +102,7 @@
     "test:lifecycle-baseline": "node tests/lifecycle-baseline/run.mjs",
     "test:lifecycle-baseline:support": "node --test tests/lifecycle-baseline/report.test.mjs",
     "test:lifecycle-baseline:typecheck": "node scripts/typecheck-test-projects.mjs tests/lifecycle-baseline",
+    "test:fork-drift": "node --test scripts/fork-release/commit-stamp.test.mjs scripts/fork-release/drift-check.test.mjs scripts/fork-release/drift-sweep.test.mjs",
     "verify": "node --import ./cli/node_modules/tsx/dist/loader.mjs scripts/ensure-workspace-package-links.ts && node scripts/local-verify.mjs"
   },
   "devDependencies": {

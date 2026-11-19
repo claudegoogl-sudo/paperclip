@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomBytes, randomUUID } from "node:crypto";
 import { githubLauncherSource } from "./github-launcher.js";
+import type { AgentGitIdentityInput } from "./git-identity.js";
 import { ACP_PROCESS_TERMINAL_SIGNALS, type ACP_PROCESS_TERMINAL_SOURCES } from "./acpx-engine/constants.js";
 import type { SshRemoteExecutionSpec } from "./ssh.js";
 import {

@@ -33,6 +33,29 @@ it("stops persistent contention after fifty delays", async () => {
   expect(vi.getTimerCount()).toBe(0);
 });
 
+it("sleeps a bounded, varying jittered delay between attempts", async () => {
+  const error = new Error("query failed", { cause: { code: "55P03" } });
+  const attempt = vi.fn().mockRejectedValue(error);
+  const delays: number[] = [];
+  const draws = [0, 0.25, 0.5, 0.75, 0.999999];
+  let draw = 0;
+  await expect(
+    retryChatControlAdmission(attempt, {
+      random: () => draws[draw++ % draws.length]!,
+      sleep: async (ms) => {
+        delays.push(ms);
+      },
+    }),
+  ).rejects.toBe(error);
+  expect(delays).toHaveLength(50);
+  for (const delay of delays) {
+    expect(delay).toBeGreaterThanOrEqual(50);
+    expect(delay).toBeLessThanOrEqual(150);
+  }
+  expect(new Set(delays).size).toBeGreaterThan(1);
+  expect(delays.slice(0, 5)).toEqual([50, 75, 100, 125, 150]);
+});
+
 it("bounds typed chat-presentation contention with the same fifty delays", async () => {
   vi.useFakeTimers();
   const error = new NativeChatReviewPresentationContentionError();

@@ -122,6 +122,14 @@ import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
+import {
+  isPidAlive,
+  isProcessGroupAlive,
+  terminateLocalService,
+  verifyProcessStartIdentity,
+} from "../local-service-supervisor.js";
+import { redactCurrentUserText } from "../../log-redaction.js";
+import { getRunLogStore } from "../run-log-store.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
 import {
@@ -960,6 +968,71 @@ function isRepeatedProductiveContinuationRecovery(
   );
 }
 
+/**
+ * Write an `issue.recovery_skipped` activity row at most once per quiet period.
+ *
+ * The stranded-issue sweep re-evaluates parked issues every tick and the skip
+ * decision is (correctly) repeated each time. Logging it each time wrote one
+ * identical row per sweep (~every 30 s) for every parked issue. Suppress the
+ * write when the latest skip row for this issue carries the same details and
+ * is not older than the issue's `updatedAt` (which comments, status, assignee
+ * and execution-policy changes all bump).
+ */
+async function logRecoverySkippedOnceWithDb(
+  db: Db,
+  issue: { id: string; companyId: string; updatedAt: Date | string | null },
+  details: Record<string, unknown>,
+) {
+  // Stamp the issue version this skip was decided against; an unchanged
+  // stamp + unchanged reason means nothing new to record.
+  const stamped: Record<string, unknown> = {
+    ...details,
+    issueUpdatedAt: issue.updatedAt ? new Date(issue.updatedAt).toISOString() : null,
+  };
+  const [latest] = await db
+    .select({ details: activityLog.details })
+    .from(activityLog)
+    .where(
+      and(
+        eq(activityLog.companyId, issue.companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issue.id),
+        eq(activityLog.action, "issue.recovery_skipped"),
+      ),
+    )
+    .orderBy(desc(activityLog.createdAt))
+    .limit(1);
+  if (latest) {
+    const prev = (latest.details ?? {}) as Record<string, unknown>;
+    const same = Object.keys(stamped).every((k) => prev[k] === stamped[k]);
+    if (same) {
+      logger.debug(
+        { issueId: issue.id, reason: details.reason },
+        "recovery skip row deduped (issue unchanged since last skip row)",
+      );
+      return false;
+    }
+  }
+  await logActivity(db, {
+    companyId: issue.companyId,
+    actorType: "system",
+    actorId: "system",
+    agentId: null,
+    runId: null,
+    action: "issue.recovery_skipped",
+    entityType: "issue",
+    entityId: issue.id,
+    details: stamped,
+  });
+  return true;
+}
+
+const CANCELLED_BLOCKER_NOTICE_MARKER = "paperclip:cancelled-blocker-notice";
+
+type IssueDependencyReadinessLike = {
+  isDependencyReady: boolean;
+  unresolvedBlockerIssueIds: string[];
+};
 type RecoveryIssue = Omit<typeof issues.$inferSelect, "description">;
 
 const { description: _unusedIssueDescription, ...recoveryIssueFields } = getTableColumns(issues);
@@ -992,6 +1065,23 @@ export function recoveryService(
      */
     settleLostRunProcess?: (scope: { companyId: string; runId: string; onDeferredDeadline?: (at: number) => void }) => Promise<unknown>;
     beforeOrphanedRunTerminalWrite?: (runId: string) => Promise<void>;
+    /**
+     * Resolved host run ceiling (from the heartbeat service). When absent, the
+     * replay cap derives from the env ceiling the same way the heartbeat does.
+     */
+    hostCeilingValue?: number;
+    /** Raw `PAPERCLIP_RECOVERY_REPLAY_MAX_CONCURRENT` value; falls back to process env. */
+    replayMaxConcurrentEnvValue?: unknown;
+    /** Timing overrides for tests; production uses the >= 2s jittered defaults. */
+    replayPacing?: {
+      minDelayMs?: number;
+      jitterSpanMs?: number;
+      random?: () => number;
+      now?: () => number;
+      setTimeoutImpl?: (ms: number) => Promise<void>;
+      /** Test spy for the pacer's `recovery_replay_pacing` log line. */
+      logger?: { info: (obj: Record<string, unknown>, msg?: string) => void };
+    };
     beforeStaleLockClear?: (issueId: string) => Promise<void>;
   },
 ) {
@@ -1051,30 +1141,14 @@ export function recoveryService(
     companyId: string,
     issueId: string,
   ): Promise<LatestIssueRun> {
-    return db
-      .select({
-        id: heartbeatRuns.id,
-        agentId: heartbeatRuns.agentId,
-        status: heartbeatRuns.status,
-        error: heartbeatRuns.error,
-        errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: recoveryRunContextColumn,
-        rowVersion: recoveryRunVersionColumn,
-        livenessState: heartbeatRuns.livenessState,
-        resultJson: recoveryRunResultColumn,
-        startedAt: heartbeatRuns.startedAt,
-        createdAt: heartbeatRuns.createdAt,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.companyId, companyId),
-          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-        ),
-      )
-      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
+    // The issue's own latest run is the recovery anchor. A descendant's run may
+    // belong to another agent/issue, which makes chat-control ancestry proof
+    // unresolved and silently blocks the lead's continuation. Fall back to the
+    // descendant tree only when the issue has no run of its own.
+    const own = await getLatestIssueRunAmong(companyId, [issueId]);
+    if (own) return own;
+    const issueIds = await collectIssueAndDescendantIds(companyId, issueId);
+    return getLatestIssueRunAmong(companyId, issueIds);
   }
 
   async function getLatestIssueRunAmong(
@@ -1149,9 +1223,10 @@ export function recoveryService(
         status: heartbeatRuns.status,
         error: heartbeatRuns.error,
         errorCode: heartbeatRuns.errorCode,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
+        contextSnapshot: recoveryRunContextColumn,
+        rowVersion: recoveryRunVersionColumn,
         livenessState: heartbeatRuns.livenessState,
-        resultJson: heartbeatRuns.resultJson,
+        resultJson: recoveryRunResultColumn,
         startedAt: heartbeatRuns.startedAt,
         createdAt: heartbeatRuns.createdAt,
       })
@@ -7308,6 +7383,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     registerActiveRunSilenceWork: watchdog.registerSilenceWork,
     reconcileStrandedAssignedIssues,
+    hasActiveExecutionPath,
     reconcileUnassignedBlockingIssues,
     reconcileActiveRecoveryActions,
     reconcileLegacyContinuation,

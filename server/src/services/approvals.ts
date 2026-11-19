@@ -1,3 +1,4 @@
+import { dispatchCapabilityEscalationResolution } from "./plugin-capability-escalation.js";
 import { notifyToolReviewChange } from "./tool-review-work-notifications.js";
 import { writeApprovalChange } from "./approval-work-notifications.js";
 import { approvalResolutionRecords, resolvableApprovalStatuses as resolvableStatuses } from "../lib/approval-records.js";

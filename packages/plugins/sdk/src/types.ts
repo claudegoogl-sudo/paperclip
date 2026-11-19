@@ -270,10 +270,156 @@ export interface ToolRunContext {
   /** UUID of the company the run belongs to. */
   companyId: string;
   /**
-   * UUID of the project the run belongs to, or an empty string when the run
-   * has no project. Check the value before you use it as a project ID.
+   * UUID of the project the run belongs to. Absent when the run is not
+   * project-scoped — the host omits the field rather than substituting a
+   * placeholder, so `undefined` means "unknown", never "any project".
    */
-  projectId: string;
+  projectId?: string;
+  /**
+   * Cross-tenant artifact fetch client. The host authorizes on behalf of
+   * the dispatching agent identified by `agentId` + `companyId`, not on
+   * behalf of the plugin worker's tenant. Use this from inside a tool
+   * handler to read attachments uploaded by an agent in another company.
+   *
+   * Injected by the worker RPC host when a tool handler runs; the
+   * wire-format runContext carries identity fields only, so host-side
+   * producers legitimately omit this field.
+   *
+   * @see {@link ToolRunContextArtifactsClient}
+   */
+  artifacts?: ToolRunContextArtifactsClient;
+}
+
+/**
+ * Resolved artifact (attachment) bytes returned by
+ * {@link ToolRunContextArtifactsClient.fetch}.
+ */
+export interface ToolRunContextArtifact {
+  /** Raw attachment bytes. */
+  bytes: Uint8Array;
+  /** Original filename if known, otherwise `"attachment"`. */
+  filename: string;
+  /** MIME content type. */
+  contentType: string;
+  /** Total size in bytes. */
+  byteSize: number;
+}
+
+/**
+ * `runCtx.artifacts` — fetch attachment bytes on behalf of the dispatching
+ * agent during a tool call.
+ *
+ * Authorization is performed against the **dispatching agent** (the agent
+ * identified by this `ToolRunContext`), not against the plugin worker's own
+ * tenant. The attachment is fetchable iff the dispatching agent has read
+ * access to the attachment-owning company. This enables a Platform-tenant
+ * worker to resolve a DPR-tenant attachment when a DPR agent dispatched the
+ * tool call.
+ *
+ * The host validates the runContext server-side before returning bytes,
+ * rate-limits per dispatching agent, and writes a six-field audit log entry
+ * on every call (success or deny).
+ */
+export interface ToolRunContextArtifactsClient {
+  /**
+   * Fetch attachment bytes by ID.
+   *
+   * Returns `{ bytes, filename, contentType, byteSize }` on success.
+   *
+   * Throws on failure with a typed error code surfaced via JsonRpcCallError:
+   * - `runcontext_invalid` — the runContext was not server-validated or has
+   *   expired. Also surfaces if a worker tries to forge a runId.
+   * - `forbidden` — the dispatching agent does not have read access to the
+   *   attachment-owning company.
+   * - `not_found` — the attachment does not exist OR the dispatching agent
+   *   cannot see it (collapsed to a single error shape to prevent
+   *   enumeration via timing/error-shape oracles).
+   * - `rate_limited` — too many fetches from this dispatching agent (host
+   *   enforces both a global per-agent ceiling and a per-(agent, attachment
+   *   company) sub-bucket).
+   *
+   * @param attachmentId - The attachment UUID to fetch.
+   * @returns Attachment bytes + metadata.
+   */
+  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
+
+  /**
+   * Store inbound bytes as a company-scoped Paperclip asset (the
+   * inverse of {@link fetch}). Returns `{ attachmentId }` — the asset id, which
+   * you pass to `issues.createComment`'s `attachmentIds` to surface the bytes
+   * on a comment.
+   *
+   * Requires the `issue.attachments.create` capability (default-deny; declare
+   * it in the manifest). The host:
+   * - authorizes `companyId` against the dispatching/service scope (rejects
+   *   cross-tenant writes with `forbidden`),
+   * - enforces the human-upload size ceiling and a MIME allowlist (images,
+   *   common documents, audio/voice); disallowed types throw `forbidden`,
+   * - dedupes on `(companyId, sha256)` so retries converge (idempotent).
+   *
+   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
+   * `too_large`, `rate_limited`.
+   *
+   * @param input - target company, filename, MIME type, and raw bytes.
+   * @returns `{ attachmentId }` — the created (or deduped) asset id.
+   */
+  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
+}
+
+/**
+ * Input to {@link ToolRunContextArtifactsClient.create}.
+ */
+export interface ToolRunContextArtifactCreateInput {
+  /** Target company UUID. Must match the dispatching/service scope. */
+  companyId: string;
+  /** Original filename (used for the stored asset's display name). */
+  filename: string;
+  /** MIME type; must be in the host's plugin-artifact allowlist. */
+  mimeType: string;
+  /** Raw bytes to store. */
+  bytes: Uint8Array;
+}
+
+/**
+ * `ctx.artifacts` — worker-level attachment client available on the full
+ * {@link PluginContext}, not only inside a tool handler.
+ *
+ * Same method shape as {@link ToolRunContextArtifactsClient}, but reachable
+ * from **service/background** code — a `setup()`-started loop (e.g. a
+ * `getUpdates` long-poll), `onWebhook`, `onEvent`, or `runJob` — as well as
+ * from tool dispatch. It takes no `runId`: the host backfills the active
+ * run-context from the worker→host `paperclipInvocationId`
+ * (`serviceScope` / `singleInFlightScope`), exactly as
+ * {@link PluginSecretsClient.resolve} already does from these contexts.
+ *
+ * @see worker-ctx artifacts surface
+ * @see messenger inbound media relay (the unblocked consumer)
+ */
+export interface PluginArtifactsClient {
+  /**
+   * Store inbound bytes as a company-scoped Paperclip asset, returning
+   * `{ attachmentId }` for use in {@link PluginIssuesClient.createComment}'s
+   * `attachmentIds`. Requires the `issue.attachments.create` capability
+   * (default-deny). Host gates match {@link ToolRunContextArtifactsClient.create}:
+   * company scope (cross-tenant writes throw `forbidden`), MIME allowlist, size
+   * ceiling, and `(companyId, sha256)` dedupe (idempotent). Authorized from
+   * `service`/`background` contexts (Gate 2) as well as tool dispatch.
+   *
+   * Typed error codes via JsonRpcCallError: `runcontext_invalid`, `forbidden`,
+   * `too_large`, `rate_limited`.
+   */
+  create(input: ToolRunContextArtifactCreateInput): Promise<{ attachmentId: string }>;
+
+  /**
+   * Fetch attachment bytes by ID on behalf of the dispatching run-context.
+   *
+   * Works today from a **tool-dispatch** context. From a `service`/`background`
+   * context the host currently rejects reads with `runcontext_invalid` — reads
+   * are scoped to the dispatching agent; widening this is a separately
+   * security-reviewed host change. This SDK surface is already correct
+   * for both: no further SDK change is needed once that host change lands.
+   */
+  fetch(attachmentId: string): Promise<ToolRunContextArtifact>;
 }
 
 /**

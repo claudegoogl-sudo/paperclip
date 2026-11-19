@@ -30,7 +30,7 @@ import { adapterExecutionControls, createAdapterExecutionControl } from "./adapt
 import { CONVERSATION_CONTINUATION_POLICY } from "./conversation-continuation.js";
 import { buildExecutionContinuation } from "./execution-continuation.js";
 import { verifiedWorkspaceRepairReceipt } from "./workspace-recovery-receipt.js";
-import { heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
+import { BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS, heartbeatService, persistHeartbeatRunProcessMetadata, type HeartbeatEnvironmentRuntime } from "./heartbeat.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { createDurableChatWakeupRequest } from "./durable-chat-wakeup.js";
 import { recordNativeFinalizationFailure } from "./native-runtime/native-run-finalizer.js";

@@ -332,26 +332,11 @@ jobs:
   # repository gate moves back onto publish_canary so the fork never publishes an
   # npm canary. The guard workflow fails any PR/push that drops this delta.
   verify_canary:
-    name: Reuse exact-source verification
-    if: github.repository == 'paperclipai/paperclip' && github.repository_id == '1170821064' && github.event_name == 'push' && github.ref == 'refs/heads/master'
-    runs-on: ubuntu-latest
-    timeout-minutes: 70
-    permissions:
-      contents: read
-      actions: write # restart only an exact-source push deferred before admission
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.sha }}
-          persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
-        with:
-          node-version: 24
-      - name: Require successful source checks for this exact master push
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          SOURCE_SHA: ${{ github.sha }}
-        run: node scripts/cloud-source-verification.mjs "$SOURCE_SHA"
+    name: Verify master push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      ref: ${{ github.sha }}
 
   release_runner_source:
     needs: [verify_canary, select_nightly, select_beta, preflight_stable]

@@ -3,6 +3,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 import type { StorageService, StorageProvider, PutFileInput, PutFileResult, PutObjectReceipt } from "./types.js";
 import { badRequest, forbidden, unprocessable } from "../errors.js";
+import { assertObjectKeyReadable } from "./object-key.js";
 import { cleanupStorageFailure } from "./failure-cleanup.js";
 
 const MAX_SEGMENT_LENGTH = 120;

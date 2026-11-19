@@ -12,6 +12,8 @@ import {
   secretSensitiveRouteFamily,
 } from "./http-log-policy.js";
 import { SecretSensitiveRequestError } from "./secret-sensitive-request-error.js";
+import { redactSecretsForLog } from "../secret-patterns.js";
+import { COMPANY_IMPORT_API_PATH } from "../routes/company-import-paths.js";
 import {
   collectSensitiveStringValues,
   redactSensitiveValueOccurrences,

@@ -9,7 +9,7 @@ import {
   patchInstanceGeneralSettingsSchema,
   startTaskDrainRequestSchema,
 } from "@paperclipai/shared";
-import { conflict, forbidden } from "../errors.js";
+import { badRequest, conflict, forbidden } from "../errors.js";
 import { assertAgentsReadyForEnvironmentChange } from "../services/plugin-environment-driver.js";
 import {
   cloudTenantPrimaryCompanyId,

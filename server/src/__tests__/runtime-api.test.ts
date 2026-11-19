@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import { once } from "node:events";
 import {
   buildRuntimeApiCandidateUrls,
+  chooseAgentApiUrl,
   chooseLocalRuntimeApiUrl,
+  isInsecureNonLoopbackApiUrl,
   choosePrimaryRuntimeApiUrl,
   collectReachableInterfaceHosts,
   resolveLocalRuntimeApiUrl,

@@ -2295,6 +2295,30 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       });
     }
 
+    if (input.actor.keyScope?.kind === "notify_only") {
+      // Defense in depth behind enforceAgentKeyScopeMiddleware: a notify_only
+      // key may only read its allow-listed issues. Interaction create is
+      // authorized in the route by the same allow-list; everything else denies.
+      const allowedIssueIds = new Set(input.actor.keyScope.issueIds.map((id) => id.toLowerCase()));
+      if (
+        input.action === "issue:read" &&
+        input.resource.type === "issue" &&
+        typeof input.resource.issueId === "string" &&
+        allowedIssueIds.has(input.resource.issueId.toLowerCase())
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed for an issue on the notify_only key allow-list.",
+        });
+      }
+      return deny({
+        action: input.action,
+        reason: "deny_scope",
+        explanation: "notify_only keys can only read allow-listed issues and create interactions on them.",
+      });
+    }
+
     if (isConnectionManagementAction(input.action) &&
         (input.actor.keyScope?.kind === "skill_test" || input.actor.keyScope?.kind === "task_bridge")) {
       return deny({ action: input.action, reason: "deny_scope", explanation: "Scoped test and task bridge credentials cannot administer connections." });

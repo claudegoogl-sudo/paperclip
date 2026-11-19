@@ -1,3 +1,4 @@
+import { MAX_ATTACHMENT_BYTES } from "../../attachment-types.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";

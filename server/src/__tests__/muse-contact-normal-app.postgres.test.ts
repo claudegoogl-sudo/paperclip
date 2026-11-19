@@ -110,7 +110,8 @@ describe.skipIf(!databaseUrl)("normal Muse contact verification failure, durable
     await initializeAdapterSettings(owner);
     await initializeCloudRuntimeConfig(owner);
     observeBroker?.(owner);
-    const { createApp } = await import("../app.js");
+    const { createApp: createAppWithDispatcher } = await import("../app.js");
+    const createApp = async (...args: Parameters<typeof createAppWithDispatcher>) => (await createAppWithDispatcher(...args)).app;
     app = await createApp(owner, {
       uiMode: "none", serverPort: 3100,
       storageService: createStorageService(createLocalDiskStorageProvider(path.join(home, "objects"))),

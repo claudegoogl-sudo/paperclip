@@ -109,47 +109,6 @@ const [{ agentRoutes }, { errorHandler }] = await Promise.all([
 
 const refreshableAdapterType = "refreshable_adapter_route_test";
 
-// Hoisted module mocks, not per-test vi.doMock + vi.resetModules: the mock
-// registry must be in place before ANY import of the routes module, in every
-// test. createApp concurrently imports middleware and route modules whose
-// graphs both contain services/index.js. With doMock-registered mocks that
-// first evaluation could race the registry under load and bind the REAL
-// services module, rejecting the request under test with a 500 (observed on
-// CI in the serialized shard; see PRs #381/#383). A hoisted vi.mock applies
-// to every import graph deterministically.
-vi.mock("@paperclipai/adapter-opencode-local/server", async () => {
-  const actual = await vi.importActual<typeof import("@paperclipai/adapter-opencode-local/server")>("@paperclipai/adapter-opencode-local/server");
-  return {
-    ...actual,
-    listOpenCodeModels: mockListOpenCodeModels,
-  };
-});
-
-vi.mock("../services/index.js", () => ({
-  agentService: () => ({}),
-  agentInstructionsService: () => mockAgentInstructionsService,
-  accessService: () => mockAccessService,
-  approvalService: () => mockApprovalService,
-  builtInAgentService: () => ({ ensureCompanyDefaultAgentGrants: vi.fn() }),
-  companySkillService: () => mockCompanySkillService,
-  budgetService: () => mockBudgetService,
-  heartbeatService: () => mockHeartbeatService,
-  issueApprovalService: () => mockIssueApprovalService,
-  issueService: () => ({}),
-  logActivity: mockLogActivity,
-  secretService: () => mockSecretService,
-  syncInstructionsBundleConfigFromFilePath: vi.fn((_agent, config) => config),
-  workspaceOperationService: () => ({}),
-}));
-
-vi.mock("../services/instance-settings.js", () => ({
-  instanceSettingsService: () => mockInstanceSettingsService,
-}));
-
-vi.mock("../services/environments.js", () => ({
-  environmentService: () => mockEnvironmentService,
-}));
-
 async function createApp() {
   const app = express();
   app.use(express.json());

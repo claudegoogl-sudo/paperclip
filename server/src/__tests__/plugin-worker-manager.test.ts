@@ -1,6 +1,6 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Company, PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import {
   createHostClientHandlers,

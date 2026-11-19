@@ -86,6 +86,8 @@ describeEmbeddedPostgres("issue queued-comment routes", () => {
   });
 
   afterAll(async () => {
+    if (previousHostCeiling === undefined) delete process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST;
+    else process.env.PAPERCLIP_MAX_CONCURRENT_RUNS_HOST = previousHostCeiling;
     await db?.$client.end();
     await tempDb?.cleanup();
   });

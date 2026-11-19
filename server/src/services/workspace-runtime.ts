@@ -3217,8 +3217,8 @@ function isGitConfigLockFailure(result: { code: number | null; stderr: string })
   return result.code !== 0 && /could not lock config file/i.test(result.stderr);
 }
 
-async function executeGitCommand(args: string[], cwd: string) {
-  if (args[0] !== "worktree" || args[1] !== "add") return executeProcess({ command: "git", args, cwd });
+async function executeGitCommand(args: string[], cwd: string, env?: NodeJS.ProcessEnv) {
+  if (args[0] !== "worktree" || args[1] !== "add") return executeProcess({ command: "git", args, cwd, env });
   return withRepositoryWorktreeLock(cwd, async () => {
     const branchIndex = args.indexOf("-b");
     const branch = branchIndex > 0 ? args[branchIndex + 1] : undefined;
@@ -3227,7 +3227,7 @@ async function executeGitCommand(args: string[], cwd: string) {
       args: ["rev-parse", "--verify", "--quiet", `${startPoint}^{commit}`], cwd }).then(result => result.code === 0 ? result.stdout.trim() : null)
       .catch(() => null) : null;
     for (let attempt = 0; ; attempt += 1) {
-      const result = await executeProcess({ command: "git", args, cwd, timeoutMs: worktreeCreateLimits.timeoutMs });
+      const result = await executeProcess({ command: "git", args, cwd, env, timeoutMs: worktreeCreateLimits.timeoutMs });
       if (!isGitConfigLockFailure(result)) return result;
       // `worktree add -b` creates the branch, then fails writing its upstream,
       // and adds no worktree. The branch did not exist before (otherwise git
@@ -3260,7 +3260,7 @@ async function recordGitOperation(
   },
 ): Promise<string> {
   if (!recorder) {
-    const result = await executeGitCommand(input.args, input.cwd);
+    const result = await executeGitCommand(input.args, input.cwd, input.env ?? undefined);
     if (result.code !== 0) throw new Error(result.stderr.trim() || result.stdout.trim() || `git ${input.args.join(" ")} failed`);
     return result.stdout.trim();
   }
@@ -3274,7 +3274,7 @@ async function recordGitOperation(
     cwd: input.cwd,
     metadata: input.metadata ?? null,
     run: async () => {
-      const result = await executeGitCommand(input.args, input.cwd);
+      const result = await executeGitCommand(input.args, input.cwd, input.env ?? undefined);
       stdout = result.stdout;
       stderr = result.stderr;
       code = result.code;

@@ -1,4 +1,5 @@
 import os from "node:os";
+import { classifyEgressIp } from "./services/plugin-egress-ip-classifier.js";
 import type { Server } from "node:http";
 import { isIP } from "node:net";
 

@@ -7,7 +7,7 @@ import type { Duplex } from "node:stream";
 import { and, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { agentApiKeys, companyMemberships, instanceUserRoles, heartbeatRuns, projects } from "@paperclipai/db";
-import { issueActivityChangesTaskIdentity, type DeploymentMode, type LiveEvent } from "@paperclipai/shared";
+import { isAgentApiKeyExpired, issueActivityChangesTaskIdentity, type DeploymentMode, type LiveEvent } from "@paperclipai/shared";
 import type { BetterAuthSessionResult } from "../auth/better-auth.js";
 import { auditAgentKeyExpired } from "../middleware/auth.js";
 import { logger } from "../middleware/logger.js";

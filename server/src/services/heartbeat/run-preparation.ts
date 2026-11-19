@@ -70,6 +70,9 @@ import {
   toolProfiles,
 } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
+import { logger } from "../../middleware/logger.js";
+import { formatBridgeKeyRefusalLine, type BridgeKeyRefusal, type BridgeKeyVerifyResult } from "@paperclipai/shared";
+import { SANCTIONED_BRIDGE_ENV_KEY } from "../task-bridge-keys.js";
 import { isAiConnectionIncompatible } from "../ai-connection-runtime.js";
 import { ReviewedChatBindingNotReadyError, type ReviewedChatBindingDenialReason } from "../reviewed-chat-binding-diagnostics.js";
 import { filterResolvedGitHubConnectionsForRun } from "../git-credentials.js";
@@ -249,6 +252,7 @@ const FORBIDDEN_ENV_BINDING_KEYS = new Set([
   "PAPERCLIP_RUNNER_NETWORK_ROOTS",
   "PAPERCLIP_RUNNER_PREPARED_HARNESS_HOME",
   "PAPERCLIP_API_KEY",
+  SANCTIONED_BRIDGE_ENV_KEY,
   "PAPERCLIP_GITHUB_AUTH_MODE",
   "PAPERCLIP_GITHUB_HOST_HOME",
   "PAPERCLIP_GIT_METADATA_ROOTS",

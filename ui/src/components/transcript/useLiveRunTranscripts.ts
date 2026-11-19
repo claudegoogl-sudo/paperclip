@@ -4,11 +4,7 @@ import { usePageVisibility } from "../../lib/page-visibility";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { readTranscriptRequest } from "./read-transcript-request";
 import { useQuery } from "@tanstack/react-query";
-import {
-  isSuccessfulHeartbeatRunStatus,
-  isTerminalHeartbeatRunStatus,
-  type LiveEvent,
-} from "@paperclipai/shared";
+import type { LiveEvent } from "@paperclipai/shared";
 import { ApiError } from "../../api/client";
 import { instanceSettingsApi } from "../../api/instanceSettings";
 import { heartbeatsApi } from "../../api/heartbeats";
@@ -72,8 +68,12 @@ function readString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
+function isTerminalStatus(status: string): boolean {
+  return status === "failed" || status === "timed_out" || status === "cancelled" || status === "interrupted" || status === "succeeded";
+}
+
 function canReadPersistedLog(run: RunTranscriptSource): boolean {
-  return run.status === "running" || isTerminalHeartbeatRunStatus(run.status);
+  return run.status === "running" || isTerminalStatus(run.status);
 }
 
 function runKnownLogBytes(run: RunTranscriptSource): number | null {
@@ -218,7 +218,7 @@ export function useLiveRunTranscripts({
 
   const runById = useMemo(() => new Map(normalizedRuns.map((run) => [run.id, run])), [normalizedRuns]);
   const activeRunIds = useMemo(
-    () => new Set(normalizedRuns.filter((run) => !isTerminalHeartbeatRunStatus(run.status)).map((run) => run.id)),
+    () => new Set(normalizedRuns.filter((run) => run.status === "running").map((run) => run.id)),
     [normalizedRuns],
   );
   const runIdsKey = useMemo(
@@ -403,7 +403,7 @@ export function useLiveRunTranscripts({
           if (isTerminalStatus(status)) refreshByRunRef.current.get(runId)?.(true);
           appendChunks(runId, [{
             ts: event.createdAt,
-            stream: isTerminalHeartbeatRunStatus(status) && !isSuccessfulHeartbeatRunStatus(status) ? "stderr" : "system",
+            stream: isTerminalStatus(status) && status !== "succeeded" ? "stderr" : "system",
             chunk: `run ${status}`,
             dedupeKey: `socket:status:${runId}:${status}:${readString(payload["finishedAt"]) ?? ""}`,
           }]);

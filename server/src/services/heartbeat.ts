@@ -291,6 +291,7 @@ import {
 } from "./agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import {
+  recordNativeLocalProcessStop,
   recordNativeLocalProcessStopInTransaction,
   settleNativeRunProcess,
 } from "./native-local-process-stop.js";
@@ -1000,6 +1001,10 @@ export function heartbeatService(
     }
     return cachedWorktreeRunExecutionOverride;
   };
+  const usageLimitPark = usageLimitParkService(db);
+  const instanceAdmissionHold = instanceAdmissionHoldService(db);
+  const isAdmissionBlocked = async () =>
+    (await usageLimitPark.isParked()) || (await instanceAdmissionHold.isHeld());
   const getSchedulingSuppression = async (fresh = false) => {
     const override = await resolveWorktreeRunExecutionOverride(fresh);
     return resolveHeartbeatSchedulingSuppression(runtimeEnv, {
@@ -1112,6 +1117,7 @@ export function heartbeatService(
     reapOrphanedRuns,
     sweepOrphanedActiveLeases,
     drainRunningRunsForShutdown,
+    enqueueProcessLossRetry,
     registerScheduledRetryCancellationWork,
     registerRetainedNativeSessionCleanupWork,
     registerNativeWorkspaceFinalizationWork,
@@ -1374,6 +1380,7 @@ export function heartbeatService(
     isHeartbeatRunTerminalStatus,
     liveRunExecutions,
     getSchedulingSuppression,
+    isAdmissionBlocked,
     isRunAdmissionClosed: () => shutdownInProgress || isProcessRunAdmissionClosed(),
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
@@ -1926,6 +1933,7 @@ export function heartbeatService(
     runOptions: {
       nativeLeaseOwner?: string;
       nativeRestartRecovery?: NativeRestartRecoveryClaim;
+      hostReservationHeld?: boolean;
       onNativeExecutionLeaseAcquired?: () => Promise<void>;
     } = {},
   ) {
@@ -1960,7 +1968,7 @@ export function heartbeatService(
 
   async function executeRunAttempt(
     runId: string,
-    runOptions: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim; onNativeExecutionLeaseAcquired?: () => Promise<void> },
+    runOptions: { nativeLeaseOwner?: string; nativeRestartRecovery?: NativeRestartRecoveryClaim; hostReservationHeld?: boolean; onNativeExecutionLeaseAcquired?: () => Promise<void> },
   ) {
     const attemptStartedAtMs = Date.now();
     let attestedQuestionResponseAtMs: number | null = null;
@@ -2032,44 +2040,46 @@ export function heartbeatService(
         }
         prologueRun = claimed;
       }
-      runningProcesses.delete(run.id);
-      if (run.processPid || run.processGroupId || run.processStartedAt) {
-        const cleared = await db.transaction(async tx => {
-          const cleared = await tx
-            .update(heartbeatRuns)
-            .set({
-              processPid: null,
-              processGroupId: null,
-              processStartedAt: null,
-              updatedAt: new Date(),
-            })
-            .where(
-              and(
-                eq(heartbeatRuns.id, run.id),
-                eq(heartbeatRuns.runtimeMode, "native"),
-                run.processPid === null
-                  ? isNull(heartbeatRuns.processPid)
-                  : eq(heartbeatRuns.processPid, run.processPid),
-                run.processGroupId === null
-                  ? isNull(heartbeatRuns.processGroupId)
-                  : eq(heartbeatRuns.processGroupId, run.processGroupId),
-                run.processStartedAt === null
-                  ? isNull(heartbeatRuns.processStartedAt)
-                  : eq(heartbeatRuns.processStartedAt, run.processStartedAt),
-              ),
-            )
-            .returning()
-            .then((rows) => rows[0] ?? null);
-          if (cleared) await recordNativeLocalProcessStopInTransaction(tx as unknown as Db, run);
-          return cleared;
-        });
-        if (!cleared) {
-          const current = await getRun(run.id);
-          if (current) {
-            await markNativeOwnershipUnverified(current, {
-              reason: "live_process_identifier",
-            });
-          }
+
+      if (
+        runOptions.nativeLeaseOwner &&
+        prologueRun.runtimeMode === "native" &&
+        runOptions.nativeRestartRecovery?.kind !== "reattach_existing_runner" &&
+        runOptions.nativeRestartRecovery?.kind !== "reattach_remote_runner"
+      ) {
+        // A numeric PID or process-group ID is a liveness signal, never an
+        // ownership capability: the OS may have recycled it after the service
+        // restart. A still-active in-memory child handle is also insufficient to
+        // authorize recovery to kill it. Any live or active-looking process
+        // therefore blocks replacement recovery without receiving a signal.
+        const tracked = runningProcesses.get(prologueRun.id);
+        const trackedChildIsActive =
+          !!tracked &&
+          tracked.child.exitCode === null &&
+          tracked.child.signalCode === null;
+        const trackedPid = tracked?.child.pid ?? null;
+        const trackedProcessGroupId = tracked?.processGroupId ?? null;
+        const trackedPidAlive = trackedPid ? isProcessAlive(trackedPid) : false;
+        const trackedProcessGroupAlive = trackedProcessGroupId
+          ? isProcessGroupAlive(trackedProcessGroupId)
+          : false;
+        const persistedPidAlive =
+          !!prologueRun.processPid && isProcessAlive(prologueRun.processPid);
+        const persistedProcessGroupAlive =
+          !!prologueRun.processGroupId && isProcessGroupAlive(prologueRun.processGroupId);
+        if (
+          trackedChildIsActive ||
+          trackedPidAlive ||
+          trackedProcessGroupAlive ||
+          persistedPidAlive ||
+          persistedProcessGroupAlive
+        ) {
+          await markNativeOwnershipUnverified(prologueRun, {
+            reason: "live_process_identifier",
+            processPidAlive: trackedPidAlive || persistedPidAlive,
+            processGroupAlive:
+              trackedProcessGroupAlive || persistedProcessGroupAlive,
+          });
           throw new Error(NATIVE_OWNERSHIP_UNVERIFIED_ERROR_CODE);
         }
         runningProcesses.delete(prologueRun.id);

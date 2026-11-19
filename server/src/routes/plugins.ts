@@ -1312,12 +1312,6 @@ export function pluginRoutes(
       return;
     }
 
-    const body = (req.body as PluginToolExecuteRequest | undefined);
-    if (!body) {
-      res.status(400).json({ error: "Request body is required" });
-      return;
-    }
-
     const { tool, parameters, runContext: requestedRunContext } = body;
 
     // Validate required fields

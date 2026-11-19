@@ -3,6 +3,7 @@ import express from "express";
 import request from "supertest";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PutFileInput, StorageService } from "../storage/types.js";
+import { formatAttachmentSize, MAX_ATTACHMENT_BYTES } from "../attachment-types.js";
 
 const mockIssueService = vi.hoisted(() => ({
   getById: vi.fn(),

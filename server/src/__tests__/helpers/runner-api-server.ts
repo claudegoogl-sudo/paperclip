@@ -41,7 +41,7 @@ export async function startRunnerApiTestServer(options: {
     authPublicBaseUrl: origin, authDisableSignUp: true,
   } as Config, [origin]) : undefined;
   const humanCookies = new Map<string, string>();
-  const app = await createApp(db, {
+  const created = await createApp(db, {
     uiMode: "none", serverPort: 0, storageService: storage,
     deploymentMode: options.deploymentMode ?? "authenticated", deploymentExposure: "private",
     allowedHostnames: ["127.0.0.1"], bindHost: "127.0.0.1", authReady: true,

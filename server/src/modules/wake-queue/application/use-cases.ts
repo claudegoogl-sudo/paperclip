@@ -329,6 +329,16 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  return null;
+  };
+
+  const primaryResult = await drainIssueDeferredWakes(issue);
+  // Fork sibling promotion: drain deferred wakes on sibling issues too (one per issue).
+  for (const sibling of locked.siblingIssues ?? []) {
+    await drainIssueDeferredWakes(sibling);
+  }
+  if (primaryResult) return primaryResult;
+
   // A stopped run never plans recovery for itself, including after a handoff.
   if (locked.handoffAssigneeAgentId) return { outcome: { kind: "released" }, postCommitEffects };
 

@@ -5948,7 +5948,7 @@ export function issueThreadInteractionService(
         throw conflict("Interaction has already been resolved");
       }
 
-      await touchIssue(db, issue.id);
+      await touchIssue(db, issue.id, issue.companyId);
       return hydrateInteraction(updated);
     },
   };

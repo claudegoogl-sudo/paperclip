@@ -118,7 +118,7 @@ export async function createCostEventInTransaction(db: Db, companyId: string, da
   }
   // Server-derived attribution stays outside the immutable receipt fingerprint;
   // replaying a receipt must not depend on later account metadata changes.
-  const [inserted] = await db.insert(costEvents).values({ ...values, subscriptionId, costCents: sql`${values.costCents}::numeric`, reportedCostCents: values.costCents, id: data.id, companyId, receiptHash })
+  const [inserted] = await db.insert(costEvents).values({ ...values, subscriptionId, costCents: sql`${values.costCents}::numeric`, reportedCostCents: values.costCents, id: data.id, companyId, receiptHash, runIdentifier: (values as { runIdentifier?: string | null }).runIdentifier ?? values.heartbeatRunId ?? randomUUID() })
     .onConflictDoNothing().returning();
   if (!inserted) {
     const [winner] = values.idempotencyKey ? await db.select().from(costEvents).where(and(

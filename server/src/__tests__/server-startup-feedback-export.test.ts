@@ -128,7 +128,7 @@ const {
       },
       toolActionDeliveries: { hasPending: vi.fn(async () => false), sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
     },
-  }) as never }));
+  }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({
     select: vi.fn(() => ({

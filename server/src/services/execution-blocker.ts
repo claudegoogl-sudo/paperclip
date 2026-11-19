@@ -267,6 +267,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
+    // A standing inbox only relays operator messages. A settled automatic no-replay
+    // disposition must not freeze it; active/escalated and unsafe-workspace holds still block.
+    conversation?.standbyWakeTarget ? inArray(issueRecoveryActions.status, ["active", "escalated"]) : undefined,
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate()) : undefined,
   )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);

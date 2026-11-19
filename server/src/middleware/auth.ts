@@ -499,6 +499,9 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
             runId: runIdHeader || undefined,
             source: "board_key",
           };
+          if (isCloudManagedInstance() && (access.isInstanceAdmin || access.companyIds.length)) {
+            _res.once("finish", () => { if (_res.statusCode >= 200 && _res.statusCode < 400) idleApiActivity.record(); });
+          }
           next();
           return;
         }
@@ -508,14 +511,10 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       } else {
         await recordBoardApiKeyAuthEvent(db, {
           keyId: boardKey.id,
-          runId: runIdHeader || undefined,
-          source: "board_key",
-        };
-        if (isCloudManagedInstance() && (access.isInstanceAdmin || access.companyIds.length)) {
-          _res.once("finish", () => { if (_res.statusCode >= 200 && _res.statusCode < 400) idleApiActivity.record(); });
-        }
-        next();
-        return;
+          outcome: boardKeyLookup.outcome,
+          req,
+          trustedProxies: opts.authEventTrustedProxies,
+        });
       }
     } else if (token.startsWith("pcp_board_")) {
       // Only log bad_key for tokens shaped like board keys -- other bearer

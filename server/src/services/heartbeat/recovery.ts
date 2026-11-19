@@ -2887,6 +2887,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       );
     }
 
+    if (lastShutdownBoundary) {
+      // Boundary consumed by this reap; later periodic reaps must see none so fresh
+      // orphans keep the genuine process_lost classification.
+      try {
+        await clearLastServerShutdownBoundary();
+      } catch (err) {
+        logger.warn({ err }, "failed to clear server shutdown boundary marker");
+      }
+    }
+
     return reaped;
   }
 

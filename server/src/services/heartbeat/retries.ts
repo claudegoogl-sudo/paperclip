@@ -629,7 +629,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     );
     const noOpDispatchRetry = resolveNoOpDispatchRetry({ run, retryReason });
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);
-    const nextAttempt = consumedAttempts + 1;
+    const nextAttempt = consumedAttempts + (noOpDispatchRetry.active ? 0 : 1);
     // An interrupted preparation never spends failures, but it never revives
     // a chain whose real failures already spent the failure budget either.
     const failureBudgetSpent = interruptedPreparationLane && opts?.maxAttempts == null
@@ -1426,7 +1426,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           }
         }
 
-        if (issueId) {
+        // The lock hand-off is guarded by `executionRunId = run.id`, so a legacy
+        // contextSnapshot issueId is safe here (fork behavior; no FK binding is created).
+        const lockIssueId = issueId ?? readNonEmptyString(contextSnapshot.issueId);
+        if (lockIssueId) {
           await notifyStatusCardIssueChange(tx, run.companyId);
           await tx
             .update(issues)

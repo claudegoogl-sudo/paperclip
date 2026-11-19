@@ -89,7 +89,7 @@ export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 export const updateRoutineSchema = objectWithoutDefaults(createRoutineSchema).partial().extend({
   baseRevisionId: z.string().guid().optional().nullable(),
   responsibleUserId: z.string().trim().min(1).optional(),
-});
+}).strict();
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 
 export const routineRevisionSnapshotRoutineV1Schema = z.object({

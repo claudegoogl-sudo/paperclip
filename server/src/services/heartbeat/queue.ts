@@ -1,3 +1,5 @@
+import { createHostRunAdmission } from "./host-admission.js";
+import { authorizationService } from "../authorization.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed } from "./run-admission.js";
@@ -190,6 +192,7 @@ import type { createHeartbeatRunState } from "./run-state.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
 import type { HeartbeatRetryDependencies } from "./retries.js";
 import type { HeartbeatRecoveryDependencies, createHeartbeatRecovery } from "./recovery.js";
+import { ACTOR_PROVENANCE_PAYLOAD_KEY, captureActorProvenance } from "../../middleware/actor-context.js";
 import { executeIssuePostCommitActions, type IssuePostCommitAction, type issueService } from "../issues.js";
 import type { issueTreeControlService } from "../issue-tree-control.js";
 import type { budgetService } from "../budgets.js";
@@ -417,6 +420,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     isHeartbeatRunTerminalStatus,
     liveRunExecutions,
     getSchedulingSuppression,
+    isAdmissionBlocked,
     isRunAdmissionClosed = isProcessRunAdmissionClosed,
     resumeExecutionWaitComments,
     getWorktreeExecutionCutoff,
@@ -2105,6 +2109,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   async function startNextQueuedRunForAgent(agentId: string) {
     if (isRunAdmissionClosed() || (await getSchedulingSuppression()).suppressed) return [];
+    // Single admission choke point for every wake source: instance-wide usage-limit park
+    // and operator admission hold. Queued runs stay queued and start once the gate lifts.
+    if (isAdmissionBlocked && (await isAdmissionBlocked())) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
     // agent's next queued run, which takes this same lock.

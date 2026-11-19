@@ -301,6 +301,10 @@ export type PluginRpcErrorCode =
  */
 export interface PluginInvocationScope {
   companyId: string;
+  /** Run UUID of the dispatching agent's heartbeat run. Optional. */
+  runId?: string;
+  /** UUID of the dispatching agent. Optional. */
+  agentId?: string;
   projectGit?: { projectId: string; workspaceId?: string; runId?: string; agentId?: string; operation?: "prepare" | "inspect" | "remove" };
 }
 
