@@ -53,7 +53,6 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { assertExternalAdapterCodeAllowed } from "../services/adapter-code-policy.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
-import { logInstanceActivity } from "./instance-activity.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 import { agentRunnerAvailability, type RunnerTarget } from "../services/agent-runner-selection.js";
 import type { AgentRunnerAvailability } from "@paperclipai/shared";
