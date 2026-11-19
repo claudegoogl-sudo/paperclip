@@ -54,6 +54,7 @@ import { aiConnectionRoutes } from "./routes/ai-connections.js";
 import { taskWorkspaceRoutes } from "./routes/task-workspaces.js";
 import { projectToolRoutes } from "./routes/project-tools.js";
 import { emailChannelService } from "./services/email-channels.js";
+import { createSingleFlight } from "./services/single-flight.js";
 import { emailRoutes, emailWebhookRoutes } from "./routes/email.js";
 import { toolActionDeliveryService } from "./services/tool-action-delivery.js";
 import { registerAssignedMcpGateway } from "./services/native-runtime/assigned-mcp-tools.js";
@@ -73,9 +74,9 @@ import {
 } from "@paperclipai/shared";
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
-import { httpLogger, errorHandler } from "./middleware/index.js";
+import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
+import { actorMiddleware, registerActorContext } from "./middleware/auth.js";
 import { skillAccessRequestContext } from "./services/skill-access.js";
-import { actorMiddleware } from "./middleware/auth.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
   privateHostnameGuard,
@@ -140,6 +141,8 @@ import {
   chatWebhookRoutes,
 } from "./routes/chat-channels.js";
 import { smokeLabRoutes } from "./routes/smoke-lab.js";
+import { pluginConfigEgressRoutes } from "./routes/plugin-config-egress.js";
+import { pluginPrivateEgressRoutes } from "./routes/plugin-private-egress.js";
 import { costRoutes } from "./routes/costs.js";
 import { agentCommentaryRoutes } from "./routes/agent-commentary.js";
 import { agentChatMessageRoutes } from "./routes/agent-chat-messages.js";
@@ -189,6 +192,7 @@ import { staticUiCacheControl } from "./static-ui-cache.js";
 import { staticUiCompression } from "./middleware/static-ui-compression.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
+import { logActivity } from "./services/activity-log.js";
 import {
   DEFAULT_LOCAL_PLUGIN_DIR,
   pluginLoader,
@@ -202,16 +206,25 @@ import {
   resolveBundledPluginInstalls,
   resolveManagedBundledPluginKeys,
 } from "./services/bundled-plugins.js";
+<<<<<<< fork
+import { createPluginWorkerManager, type PluginWorkerManager } from "./services/plugin-worker-manager.js";
+=======
 import { createBundledPluginPackageResolver } from "./services/bundled-plugin-package.js";
+>>>>>>> upstream
 import { readDistributionPluginCatalog, distributionPluginActivationGuard } from "./services/distribution-plugin-catalog.js";
 import {
-  createPluginWorkerManager,
-  type PluginWorkerManager,
-} from "./services/plugin-worker-manager.js";
+  createPluginStreamBus,
+  publishWorkerStreamNotification,
+  type PluginStreamBus,
+} from "./services/plugin-stream-bus.js";
 import { createPluginJobScheduler } from "./services/plugin-job-scheduler.js";
 import { pluginJobStore } from "./services/plugin-job-store.js";
 import { createPluginToolDispatcher } from "./services/plugin-tool-dispatcher.js";
 import { createToolGatewayService } from "./services/tool-gateway.js";
+import {
+  createPluginRunContextRegistry,
+  type PluginRunContextRegistry,
+} from "./services/plugin-run-context-registry.js";
 import { toolAccessService } from "./services/tool-access.js";
 import { chatChannelService } from "./services/chat-channels.js";
 import type { BudgetResumeDelivery } from "./services/budget-resume-continuation.js";
@@ -225,23 +238,32 @@ import { pluginLifecycleManager } from "./services/plugin-lifecycle.js";
 import { registerPluginLifecycleDelivery } from "./services/plugin-lifecycle-delivery.js";
 import { createPluginJobCoordinator } from "./services/plugin-job-coordinator.js";
 import {
+  bufferPluginLogEntry,
   buildHostServices,
   flushPluginLogBuffer,
 } from "./services/plugin-host-services.js";
 import { createPluginEventBus } from "./services/plugin-event-bus.js";
 import { setPluginEventBus } from "./services/activity-log.js";
-import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
+import { createPluginDevWatcher, isPluginDevWatchEnabled } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
+import { createEventRelayProbe } from "./services/plugin-event-relay-probe.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
+import { approvalService } from "./services/approvals.js";
+import {
+  createApprovalsCapabilityEscalationGateway,
+  registerCapabilityEscalationResolver,
+} from "./services/plugin-capability-escalation.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 import { createCachedViteHtmlRenderer } from "./vite-html-renderer.js";
 import {
   DEFAULT_JSON_BODY_LIMIT,
   PORTABLE_JSON_BODY_LIMIT,
+  WEBHOOK_JSON_BODY_LIMIT,
 } from "./http/body-limits.js";
 import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
+import { PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN } from "./routes/plugin-webhook-paths.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
 
@@ -265,6 +287,15 @@ const VITE_DEV_STATIC_PATHS = new Set([
   "/site.webmanifest",
   "/sw.js",
 ]);
+
+/**
+ * Parse the operator allowlist of plugin keys that may use
+ * `companies.cross-read`. Comma/whitespace separated; empty or absent = none.
+ */
+export function parsePluginCrossCompanyReadAllowlist(raw: string | undefined): string[] {
+  if (!raw) return [];
+  return [...new Set(raw.split(/[\s,]+/).map((s) => s.trim()).filter(Boolean))];
+}
 
 export function isDatabaseConnectionUnavailableError(err: unknown): boolean {
   const error = err as { code?: unknown; message?: unknown; cause?: unknown };
@@ -465,8 +496,28 @@ export async function createApp(
     hostVersion?: string;
     localPluginDir?: string;
     pluginMigrationDb?: Db;
+    /**
+     * Company the host files plugin capability-escalation board approvals
+     * against. A plugin capability escalation is instance-wide but
+     * approvals are company-scoped, so the host files against this single
+     * configured "platform" company. When omitted, no escalation gateway is
+     * wired and the loader keeps failing closed on a cap-escalating upgrade —
+     * preserving the pre-existing production default.
+     */
+    escalationApprovalCompanyId?: string;
     pluginWorkerManager?: PluginWorkerManager;
+    // Stream bus wired to the SAME worker manager instance passed above: the
+    // manager publishes verified worker stream notifications here and the
+    // plugin SSE bridge subscribes on it. When app builds its own manager it
+    // also builds the bus and wires the two; an injected manager must come
+    // with its bus (index.ts wires both) or the SSE bridge has no publisher.
+    pluginStreamBus?: PluginStreamBus;
     decisionServiceOptions: DecisionServiceOptions;
+    // The run-context registry the injected pluginWorkerManager was
+    // built with. MUST be the same instance, so a worker's host-minted service
+    // run-context (registered by the manager on worker start) is visible to the
+    // secrets host-handler's Gate 1 lookup. When omitted, app creates its own.
+    pluginRunContextRegistry?: PluginRunContextRegistry;
     betterAuthHandler?: express.RequestHandler;
     resolveSession?: (
       req: ExpressRequest,
@@ -478,6 +529,12 @@ export async function createApp(
      * bundled catalog fail-to-start (see services/bundled-plugins.ts).
      */
     managedPluginAutoInstall?: readonly string[] | null;
+    /**
+     * Plugin keys the operator allows to use `companies.cross-read`. Default
+     * (absent) reads `PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST`
+     * (comma-separated plugin keys); empty = no plugin may cross-read.
+     */
+    pluginCrossCompanyReadAllowlist?: readonly string[] | null;
     /** Test override for the bundled plugin catalog root. */
     bundledPluginCatalogRoot?: string;
   },
@@ -516,6 +573,17 @@ export async function createApp(
       verify: captureRawBody,
     }),
   );
+  // Ahead of the generic parser so the anonymous plugin webhook ingestion
+  // route gets a tighter ceiling. `verify: captureRawBody` is mandatory here:
+  // the route reads `req.rawBody` to HMAC-verify the exact bytes the provider
+  // signed.
+  app.use(
+    PLUGIN_WEBHOOK_INGESTION_PATH_PATTERN,
+    express.json({
+      limit: WEBHOOK_JSON_BODY_LIMIT,
+      verify: captureRawBody,
+    }),
+  );
   // Chat providers sign the exact request bytes. Capture every webhook media
   // type before the global JSON parser so JSON events and form-encoded action
   // callbacks are verified against the provider's original body.
@@ -532,6 +600,10 @@ export async function createApp(
   app.use((req, res, next) => (dotPrincipalHttp.matchesPost(req) || ["/mcp/files/upload", "/mcp/runner/files/upload"].includes(req.path)) ? next() : jsonBodyParser(req, res, next));
   app.use("/api", apiCompression());
   app.use(httpLogger);
+  // Ahead of every DB-touching middleware (actor resolution included) so a
+  // client that hangs up releases the whole request's queries, not just the
+  // route handler's.
+  app.use(requestQueryCancellation);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
     deploymentMode: opts.deploymentMode,
     deploymentExposure: opts.deploymentExposure,
@@ -574,6 +646,43 @@ export async function createApp(
   app.use(runtimeConnectionIntentRoutes(db));
   app.use(nativeRunMcpRoutes());
   const hostServicesDisposers = new Map<string, () => void>();
+<<<<<<< fork
+  // pluginId -> pluginKey, populated as each plugin's host handlers are
+  // built. Lets the event-relay probe resolve the bus key (which is the plugin
+  // key) for the running workers reported by the worker manager.
+  // Shared run-context registry tying the dispatching agent's
+  // identity to (pluginDbId, runId) for the duration of each tool call, so the
+  // worker's `artifacts.fetch`/`secrets.resolve` callbacks can be authorized
+  // server-side. Also holds each worker's worker-lifetime service
+  // run-context (system actor) for background secret resolution — created
+  // before the worker manager so the manager can register on worker start.
+  // When the caller injects a pre-built pluginWorkerManager (index.ts
+  // does, so it can also drive heartbeat/routine services), it MUST inject the
+  // registry that manager was built with. Otherwise app would create a second,
+  // disjoint registry: the manager's registerService would write to its own
+  // registry while the secrets host-handler reads this one, so service/setup()
+  // run-contexts would never be found (Gate 1 → runcontext_invalid).
+  const pluginRunContextRegistry =
+    opts.pluginRunContextRegistry ?? createPluginRunContextRegistry();
+  // The SSE bridge needs BOTH halves wired to the same manager — a
+  // publisher (manager onStreamNotification → bus) and the bus itself
+  // (bridgeDeps.streamBus). Build the bus here and wire the internal-manager
+  // path; an injected manager must pair with the bus it publishes to.
+  const pluginStreamBus = opts.pluginStreamBus ?? createPluginStreamBus();
+  const workerManager =
+    opts.pluginWorkerManager ??
+    createPluginWorkerManager({
+      runContextRegistry: pluginRunContextRegistry,
+      // Worker ctx.logger notifications persist to plugin_logs on the same
+      // buffered path as the logger.log host service (§26.1), so the operator
+      // logs panel can show plugin errors.
+      workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+      onStreamNotification: ({ pluginId, method, params }) => {
+        publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      },
+    });
+=======
+>>>>>>> upstream
   let lifecyclePluginsReady = false;
   const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
   const connectionIntentHeartbeat = heartbeatService(db, {
@@ -608,7 +717,34 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
+<<<<<<< fork
+  // The dedicated proxy IP or CIDR allowlist for requests that arrive through
+  // a TLS-terminating proxy. The global `TRUST_PROXY` setting never satisfies
+  // anything that reads this list; an operator sets it to the real
+  // TLS-terminating proxy addresses. An empty value keeps the confidential
+  // setup-token login responses on direct TLS (or a `local_trusted` loopback
+  // peer) only, and keeps board-key auth-event rows pinned to the immediate
+  // socket peer. Declared here, before both consumers (the actor middleware
+  // and the setup-token login transport).
+  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+  // Resolve the acting credential (req.actor) and bind its provenance into
+  // AsyncLocalStorage so logActivity records it centrally. The provenance
+  // regression test drives the same registerActorContext, so removing the
+  // provenance registration turns that test red instead of silently logging NULL.
+  registerActorContext(app, db, {
+    deploymentMode: opts.deploymentMode,
+    resolveSession: opts.resolveSession,
+    // Same dedicated operator allowlist the confidential-transport guard uses
+    // (SR-7); the board-key auth-event log reads it only to derive
+    // source_ip. Never derived from the global TRUST_PROXY setting.
+    authEventTrustedProxies: setupTokenLoginProxyAllowlist,
+  });
+=======
   app.use(connectionEventWakeRoutes(db));
+>>>>>>> upstream
   app.use(skillAccessRequestContext);
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
@@ -616,6 +752,9 @@ export async function createApp(
   }
   app.use(llmRoutes(db));
 
+  // pluginId -> pluginKey, populated as each plugin's host handlers are
+  // built; lets the event-relay probe resolve the bus key.
+  const pluginKeyById = new Map<string, string>();
   // Provider-authenticated ingress is intentionally outside the board
   // mutation guard. The Chat SDK adapter verifies the provider signature
   // before Paperclip persists or acts on any event.
@@ -657,7 +796,21 @@ export async function createApp(
     res.set("Cache-Control", "no-store"); res.set("Referrer-Policy", "no-referrer");
     res.redirect(303, await chatChannels.githubWizard.identityCallback(String(req.query.state ?? ""), String(req.query.code ?? ""), req.actor));
   });
+<<<<<<< fork
+  const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
+  const crossCompanyReadAllowlist = new Set(
+    opts.pluginCrossCompanyReadAllowlist ??
+      parsePluginCrossCompanyReadAllowlist(process.env.PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST),
+  );
+  if (crossCompanyReadAllowlist.size > 0) {
+    logger.warn(
+      { pluginKeys: [...crossCompanyReadAllowlist] },
+      "plugin cross-company read allowlist is active",
+    );
+  }
+=======
   const managedAutoInstallKeys = resolveManagedBundledPluginKeys(opts.managedPluginAutoInstall);
+>>>>>>> upstream
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
@@ -713,17 +866,6 @@ export async function createApp(
   // back through the callback below, so the shutdown hook can cancel every live
   // session (SR-4).
   let setupTokenLoginService: SetupTokenSessionService | null = null;
-  // The dedicated proxy IP or CIDR allowlist for the confidential setup-token
-  // login responses (SR-7). The global `TRUST_PROXY` setting does not satisfy
-  // the guard; an operator sets this allowlist to the real TLS-terminating
-  // proxy addresses. An empty value keeps the confidential responses on direct
-  // TLS (or a `local_trusted` loopback peer) only.
-  const setupTokenLoginProxyAllowlist = (
-    process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? ""
-  )
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
   // The explicit operator declaration that a platform edge terminates TLS for
   // every client request (SR-7). This complements the allowlist for managed
   // platforms (Railway, Render, Fly, and the like) where the app socket is
@@ -837,9 +979,11 @@ export async function createApp(
     }),
   );
   const trustedLocalStdioRuntimeHost =
-    process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST ??
-    process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST ??
-    null;
+    process.env.PAPERCLIP_TRUSTED_MCP_RUNTIME_HOST
+    ?? process.env.PAPERCLIP_TOOL_RUNTIME_TRUSTED_HOST
+    ?? null;
+  api.use(pluginConfigEgressRoutes(db));
+  api.use(pluginPrivateEgressRoutes(db));
   api.use(costRoutes(db, { pluginWorkerManager: workerManager }));
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
@@ -859,13 +1003,13 @@ export async function createApp(
     input => resourceLifecycleDelivery.prepareForIdleSleep(input)));
   api.use(ephemeralEnrollmentRoutes(db));
   if (opts.databaseBackupService) {
-    api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService));
+    api.use(instanceDatabaseBackupRoutes(opts.databaseBackupService, db));
   }
   const pluginRegistry = pluginRegistryService(db);
   const eventBus = createPluginEventBus();
   setPluginEventBus(eventBus);
   const jobStore = pluginJobStore(db);
-  const lifecycle = pluginLifecycleManager(db, { workerManager });
+  const lifecycle = pluginLifecycleManager(db, { workerManager, eventBus });
   const scheduler = createPluginJobScheduler({
     isBackgroundWorkEnabled: () => !isWarmStandby() && !isIdleTaskDrainActive(),
     db,
@@ -876,6 +1020,7 @@ export async function createApp(
     workerManager,
     lifecycleManager: lifecycle,
     db,
+    runContextRegistry: pluginRunContextRegistry,
   });
   const gatewayOAuthAccess = toolAccessService(db, {
     deploymentMode: opts.deploymentMode,
@@ -918,6 +1063,9 @@ export async function createApp(
       deploymentExposure: opts.deploymentExposure,
       authPublicBaseUrl: opts.authPublicBaseUrl,
       trustedLocalStdioRuntimeHost,
+      // Plugin-backed connections report health via the plugin tool runtime
+      // instead of requiring a config.url their records never carry.
+      pluginToolRuntimeProbe: ({ pluginKey }) => toolDispatcher.toolCount(pluginKey),
       toolGateway,
       connectionIntentHeartbeat,
     }),
@@ -943,16 +1091,35 @@ export async function createApp(
     null;
   let viteDevServer: { close(): Promise<void> } | null = null;
   let viteHmrServer: HttpServer | null = null;
+  // Wire the capability-escalation gateway when a platform company is
+  // configured. Absent it, the loader receives no gateway and keeps failing
+  // closed on cap-escalating upgrades (pre-existing production default).
+  const escalationGateway = opts.escalationApprovalCompanyId
+    ? createApprovalsCapabilityEscalationGateway({
+        approvals: approvalService(db),
+        companyId: opts.escalationApprovalCompanyId,
+      })
+    : undefined;
   const loader = pluginLoader(
     db,
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
+<<<<<<< fork
+      escalationGateway,
+      assertPackageActivation: distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
+      // Capabilities a fresh install may declare without a board approval.
+      // Default empty: any capability parks a fresh install (gateway set only).
+      installCapabilityAllowlist: parsePluginCrossCompanyReadAllowlist(
+        process.env.PAPERCLIP_PLUGIN_INSTALL_CAPABILITY_ALLOWLIST,
+      ),
+=======
       assertPackageActivation: bundledPackageResolver?.assertActivation ?? distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
       resolvePackageRoot: bundledPackageResolver?.resolve,
       prebuiltOnly: managedAutoInstallKeys !== null,
       enableLocalFilesystem: managedAutoInstallKeys === null,
       enableNpmDiscovery: managedAutoInstallKeys === null,
+>>>>>>> upstream
     },
     {
       workerManager,
@@ -980,14 +1147,46 @@ export async function createApp(
           notifyWorker,
           {
             pluginWorkerManager: workerManager,
+            storageService: opts.storageService,
+            runContextRegistry: pluginRunContextRegistry,
             manifest,
           },
         );
         hostServicesDisposers.set(pluginId, () => services.dispose());
+        pluginKeyById.set(pluginId, manifest.id);
         return createHostClientHandlers({
           pluginId,
           capabilities: manifest.capabilities,
           services,
+          crossCompanyReadAllowed: crossCompanyReadAllowlist.has(manifest.id),
+          onCrossCompanyRead: (event) => {
+            logger.info(
+              { ...event, pluginKey: manifest.id },
+              "plugin.cross_company_read",
+            );
+            // Unfiltered companies.list ("*") is recorded on the caller's company.
+            const auditCompanyId =
+              event.targetCompanyId === "*" ? event.invocationCompanyId : event.targetCompanyId;
+            if (!auditCompanyId) return;
+            void logActivity(db, {
+              companyId: auditCompanyId,
+              actorType: "plugin",
+              actorId: pluginId,
+              action: "plugin.cross_company_read",
+              entityType: "company",
+              entityId: event.targetCompanyId,
+              agentId: event.agentId,
+              runId: event.runId,
+              details: {
+                pluginKey: manifest.id,
+                method: event.method,
+                targetCompanyId: event.targetCompanyId,
+                callerCompanyId: event.invocationCompanyId,
+              },
+            }).catch((err) => {
+              logger.warn({ err, pluginKey: manifest.id }, "cross-company read audit write failed");
+            });
+          },
         });
       },
     },
@@ -998,6 +1197,49 @@ export async function createApp(
     (session, run) => toolGateway.browserUseSessionAuthorized({ ...session, runId: run.heartbeatRunId, invocationId: run.invocationId }));
   api.use(browserUseRoutes(db, browserUse));
   api.use(toolGatewayRoutes(db, toolGateway));
+  // A lifecycle bound to the runtime-services + gateway loader, used
+  // only to apply board decisions to parked upgrades (complete/revert + worker
+  // re-activation). The approvals service dispatches resolved escalation
+  // approvals to this resolver via the module-level registry, breaking the
+  // approvals -> loader import cycle.
+  const upgradeLifecycle = pluginLifecycleManager(db, { loader, workerManager });
+  registerCapabilityEscalationResolver(async ({ payload, outcome }) => {
+    if (outcome === "approved") {
+      await upgradeLifecycle.completeUpgradeApproved(payload.pluginId);
+    } else {
+      await upgradeLifecycle.revertUpgradeRejected(payload.pluginId, { origin: payload.origin });
+    }
+  });
+  // Create the dev-watcher before the plugin routes so the routes can
+  // reconcile the local-plugin file watcher after each lifecycle mutation. The
+  // routes run against a route-local lifecycle instance whose domain events
+  // never reach this watcher's app-level subscription, so an explicit reconcile
+  // is the reliable re-arm/disarm path on install/enable/disable/uninstall.
+  // Resolve the watch target for a plugin: its local packagePath, but only
+  // while the plugin is active ('ready'). Gating on status means reconcile()
+  // disarms the watcher on disable/uninstall (status leaves 'ready') even
+  // though disable keeps packagePath in the DB.
+  // File-change restarts go through a lifecycle bound to the runtime-services
+  // loader so they take the full deactivate + activateReadyPlugin path
+  // (manifest re-read, migrations, fresh host handlers, startup config
+  // delivery). The shared `lifecycle` above is built without a loader (the
+  // loader needs it as a runtime service), so its restartWorker() would fall
+  // back to a bare process bounce. Lifecycle-event subscriptions stay on the
+  // shared `lifecycle`, which is where the loader emits them.
+  const devWatcherRestartLifecycle = pluginLifecycleManager(db, { loader, workerManager, eventBus });
+  // Defense in depth: hot reload re-activates plugins from on-disk code, so
+  // it is opt-in (PAPERCLIP_PLUGIN_DEV_WATCH=1) and off by default.
+  const devWatchEnabled = isPluginDevWatchEnabled(process.env);
+  logger.info({ devWatchEnabled }, "plugin dev watcher configuration");
+  const devWatcher = devWatchEnabled ? createPluginDevWatcher(
+    lifecycle,
+    async (pluginId) => {
+      const plugin = await pluginRegistry.getById(pluginId);
+      return plugin?.status === "ready" ? plugin.packagePath ?? null : null;
+    },
+    undefined,
+    { restartWorker: (pluginId) => devWatcherRestartLifecycle.restartWorker(pluginId), unwatchedRoots: [bundledCatalogRoot] },
+  ) : null;
   api.use(
     pluginRoutes(
       db,
@@ -1005,8 +1247,9 @@ export async function createApp(
       { scheduler, jobStore },
       { workerManager },
       { toolDispatcher },
-      { workerManager },
+      { workerManager, streamBus: pluginStreamBus },
       { toolGateway },
+      devWatcher ? { reconciler: devWatcher } : undefined,
     ),
   );
   api.use(
@@ -1311,6 +1554,8 @@ export async function createApp(
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
+<<<<<<< fork
+=======
   const devWatcher = managedAutoInstallKeys !== null ? null : createPluginDevWatcher(
     lifecycle,
     async (pluginId) =>
@@ -1318,6 +1563,7 @@ export async function createApp(
     undefined,
     { unwatchedRoots: [bundledCatalogRoot] },
   );
+>>>>>>> upstream
   // Auto-provision bundled plugins so their providers are registered for
   // agent runs. Bundles are excluded from the pnpm
   // workspace and built standalone into the image (see Dockerfile), then
@@ -1371,6 +1617,24 @@ export async function createApp(
     .catch((err) => {
       logger.error({ err }, "Failed to load ready plugins on startup");
     });
+
+  // Liveness probe that warns if a running plugin's board-event relay
+  // detaches (worker up, zero event-bus subscriptions). Belt-and-suspenders to
+  // the per-restart subscription-count log in plugin-lifecycle.
+  const eventRelayProbe = createEventRelayProbe({
+    listRunningPlugins: () =>
+      workerManager
+        .diagnostics()
+        .filter((d) => d.status === "running")
+        .map((d) => ({ pluginId: d.pluginId, pluginKey: pluginKeyById.get(d.pluginId) }))
+        .filter((p): p is { pluginId: string; pluginKey: string } => Boolean(p.pluginKey)),
+    subscriptionCount: (pluginKey) => eventBus.subscriptionCount(pluginKey),
+    log: {
+      warn: (obj, msg) => logger.warn({ service: "plugin-event-relay-probe", ...obj }, msg),
+      info: (obj, msg) => logger.info({ service: "plugin-event-relay-probe", ...obj }, msg),
+    },
+  });
+  eventRelayProbe.start();
   app.locals.bundledPluginsStartup = trackIdleWork(bundledPluginsStartup);
   // Manifest ids the managed auto-install list resolves to; the managed
   // environments bootstrap checks plugin entries against them.
@@ -1388,6 +1652,41 @@ export async function createApp(
       await publicMcpEvents?.stop();
       await dotMcpEvents?.stop();
       jobCoordinator.stop();
+<<<<<<< fork
+      resourceLifecycleDelivery.dispose();
+      await deliveryWork.stop();
+      eventRelayProbe.stop();
+      unsubscribeChatPublicationSignals();
+      chatReconciliation.stop();
+      if (chatPublicationTimer) {
+        clearInterval(chatPublicationTimer);
+        chatPublicationTimer = null;
+      }
+      await chatReconciliation.drain();
+      if (importTransferSweepTimer) {
+        clearInterval(importTransferSweepTimer);
+        importTransferSweepTimer = null;
+      }
+      devWatcher?.close();
+      viteHtmlRenderer?.dispose();
+      void viteDevServer?.close().catch(() => undefined);
+      viteHmrServer?.close();
+      hostServiceCleanup.disposeAll();
+      hostServiceCleanup.teardown();
+      pluginRunContextRegistry.dispose();
+      await stopMuseMaintenance();
+      await emailChannels.shutdown();
+      await chatChannels.shutdown();
+      // End the avatar worker pool, if a request ever started one, so no
+      // render outlives the HTTP teardown.
+      await agentAvatars.close();
+      // Cancel every live setup-token login session and AWAIT the cancellation,
+      // so each direct child stops and the server releases each lease before the
+      // caller stops the database and the provider. A lease release that
+      // fails stays a durable record for the startup reaper.
+      await setupTokenLoginService?.shutdown();
+    })();
+=======
       await finishServiceShutdown(() => resourceLifecycleDelivery.dispose(), async () => {
         importSpoolCleanup.unsubscribe();
         await deliveryWork.stop();
@@ -1410,6 +1709,7 @@ export async function createApp(
         await setupTokenLoginService?.shutdown();
       });
     });
+>>>>>>> upstream
     return appServicesShutdown;
   };
   app.locals.paperclipShutdown = shutdownAppServices;
@@ -1425,5 +1725,6 @@ export async function createApp(
   });
 
   trackIdleRequestHandlers(app);
-  return app;
+  // Exposed so the standalone tool-health sweep (index.ts) can probe plugin-backed connection health.
+  return { app, pluginToolDispatcher: toolDispatcher };
 }

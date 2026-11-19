@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import { once } from "node:events";
 import {
   buildRuntimeApiCandidateUrls,
+<<<<<<< fork
+  chooseAgentApiUrl,
+  isInsecureNonLoopbackApiUrl,
+=======
   chooseLocalRuntimeApiUrl,
+>>>>>>> upstream
   choosePrimaryRuntimeApiUrl,
   collectReachableInterfaceHosts,
   resolveLocalRuntimeApiUrl,
@@ -225,5 +230,61 @@ describe("runtime API discovery", () => {
         networkInterfacesMap: {},
       }),
     ).toEqual(["http://runtime-host.example.test:3102"]);
+  });
+});
+
+describe("collectReachableInterfaceHosts link-local classification", () => {
+  it("skips embedded-IPv4 link-local forms that a string prefix misses", () => {
+    const entry = (address: string, family: "IPv4" | "IPv6") =>
+      ({ address, family, internal: false, netmask: "", mac: "00:00:00:00:00:00", cidr: null }) as never;
+    expect(
+      collectReachableInterfaceHosts({
+        networkInterfacesMap: {
+          eth0: [
+            entry("::ffff:a9fe:a14", "IPv6"), // ::ffff:169.254.10.20
+            entry("fe81::1", "IPv6"),
+            entry("febf::2", "IPv6"),
+            entry("192.168.1.5", "IPv4"),
+            entry("2001:4860::5", "IPv6"),
+          ],
+        },
+      }),
+    ).toEqual(["192.168.1.5", "2001:4860::5"]);
+  });
+});
+
+describe("chooseAgentApiUrl", () => {
+  const publicBase = "https://paperclip.example.com";
+  it("defaults to the loopback listen origin for wildcard and loopback binds, not the public base", () => {
+    for (const bindHost of ["0.0.0.0", "127.0.0.1", "localhost", ""]) {
+      expect(chooseAgentApiUrl({ bindHost, port: 3100, fallbackApiUrl: publicBase })).toBe("http://127.0.0.1:3100");
+    }
+    for (const bindHost of ["::", "::1"]) {
+      expect(chooseAgentApiUrl({ bindHost, port: 3101, fallbackApiUrl: publicBase })).toBe("http://[::1]:3101");
+    }
+  });
+  it("keeps the runtime base when bound to a specific non-loopback host", () => {
+    expect(chooseAgentApiUrl({ bindHost: "10.0.0.5", port: 3100, fallbackApiUrl: publicBase })).toBe(publicBase);
+  });
+  it("honours an explicit PAPERCLIP_AGENT_API_URL override (origin only) and ignores malformed values", () => {
+    expect(
+      chooseAgentApiUrl({ explicitAgentApiUrl: "http://host.docker.internal:3100/api", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
+    ).toBe("http://host.docker.internal:3100");
+    expect(
+      chooseAgentApiUrl({ explicitAgentApiUrl: "not a url", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
+    ).toBe("http://127.0.0.1:3100");
+    expect(
+      chooseAgentApiUrl({ explicitAgentApiUrl: "file:///x", bindHost: "0.0.0.0", port: 3100, fallbackApiUrl: publicBase }),
+    ).toBe("http://127.0.0.1:3100");
+  });
+});
+
+describe("isInsecureNonLoopbackApiUrl", () => {
+  it("flags cleartext http to non-loopback hosts only", () => {
+    expect(isInsecureNonLoopbackApiUrl("http://10.0.0.5:3100")).toBe(true);
+    expect(isInsecureNonLoopbackApiUrl("http://127.0.0.1:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("http://[::1]:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("http://localhost:3100")).toBe(false);
+    expect(isInsecureNonLoopbackApiUrl("https://paperclip.example.com")).toBe(false);
   });
 });

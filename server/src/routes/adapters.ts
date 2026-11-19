@@ -19,9 +19,13 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Router } from "express";
+<<<<<<< fork
+import type { Db } from "@paperclipai/db";
+=======
 import { companies, type Db } from "@paperclipai/db";
 import { adapterSettingsService } from "../services/adapter-settings.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../services/activity-log.js";
+>>>>>>> upstream
 import {
   listServerAdapters,
   findServerAdapter,
@@ -52,7 +56,12 @@ import { badRequest, forbidden, HttpError } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { assertExternalAdapterCodeAllowed } from "../services/adapter-code-policy.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
+<<<<<<< fork
+import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin } from "./authz.js";
+import { logInstanceActivity } from "./instance-activity.js";
+=======
 import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
+>>>>>>> upstream
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 import { agentRunnerAvailability, type RunnerTarget } from "../services/agent-runner-selection.js";
 import type { AgentRunnerAvailability } from "@paperclipai/shared";
@@ -250,11 +259,16 @@ function registerWithSessionManagement(adapter: ServerAdapterModule): void {
 // ---------------------------------------------------------------------------
 
 export function adapterRoutes(options: {
+<<<<<<< fork
+  db: Db;
+=======
   db?: Db;
+>>>>>>> upstream
   getNativeRunnerEnabled?: () => Promise<boolean>;
   getOpenAiDotEnabled?: () => Promise<boolean>;
   resolveRunnerTarget?: (companyId: string, environmentId?: string) => Promise<RunnerTarget>;
-} = {}) {
+}) {
+  const { db } = options;
   const router = Router();
   const settings = adapterSettingsService(options.db);
 
@@ -343,10 +357,20 @@ export function adapterRoutes(options: {
     assertExternalAdapterCodeAllowed();
     assertAdapterManagementVisible();
 
-    const { packageName, isLocalPath = false, version } = req.body as AdapterInstallRequest;
+    const { packageName, isLocalPath = false, version } = (req.body ?? {}) as AdapterInstallRequest;
 
     if (!packageName || typeof packageName !== "string") {
       res.status(400).json({ error: "packageName is required and must be a string." });
+      return;
+    }
+
+    if (version !== undefined && typeof version !== "string") {
+      res.status(400).json({ error: "version must be a string if provided." });
+      return;
+    }
+
+    if (typeof isLocalPath !== "boolean") {
+      res.status(400).json({ error: "isLocalPath must be a boolean if provided." });
       return;
     }
 
@@ -443,6 +467,20 @@ export function adapterRoutes(options: {
         "External adapter installed and registered",
       );
 
+      // Audit: runtime install executes third-party code in this process, so
+      // the actor and resolved package identity are recorded even on success.
+      await logInstanceActivity(db, req, {
+        action: "instance.adapter.installed",
+        entityType: "adapter",
+        entityId: adapterModule.type,
+        details: {
+          packageName: canonicalName,
+          version: installedVersion ?? explicitVersion,
+          isLocalPath,
+          type: adapterModule.type,
+        },
+      });
+
       res.status(201).json({
         type: adapterModule.type,
         packageName: canonicalName,
@@ -453,6 +491,24 @@ export function adapterRoutes(options: {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error({ err, packageName }, "Failed to install external adapter");
+
+      // Audit: a failed install is still an attempted code execution — the
+      // responder needs the attempt and its failure reason even when the
+      // mutation never landed.
+      await logInstanceActivity(db, req, {
+        action: "instance.adapter.installed",
+        entityType: "adapter",
+        entityId: canonicalName,
+        details: {
+          packageName: canonicalName,
+          version: explicitVersion,
+          isLocalPath,
+          outcome: "failed",
+          failureReason: message,
+        },
+      }).catch((logErr) => {
+        logger.error({ logErr }, "Failed to write adapter install failure audit row");
+      });
 
       // Distinguish npm errors from load errors
       if (message.includes("npm") || message.includes("ERR!")) {
@@ -492,7 +548,7 @@ export function adapterRoutes(options: {
     assertAdapterManagementVisible();
 
     const adapterType = req.params.type;
-    const { disabled } = req.body as { disabled?: boolean };
+    const { disabled } = (req.body ?? {}) as { disabled?: boolean };
 
     if (typeof disabled !== "boolean") {
       res.status(400).json({ error: "Request body must include { \"disabled\": true|false }." });
@@ -533,6 +589,13 @@ export function adapterRoutes(options: {
       logger.info({ type: adapterType, disabled }, "Adapter enabled/disabled");
     }
 
+    await logInstanceActivity(db, req, {
+      action: "instance.adapter.disabled",
+      entityType: "adapter",
+      entityId: adapterType,
+      details: { type: adapterType, disabled, changed },
+    });
+
     res.json({ type: adapterType, disabled, changed });
   });
 
@@ -551,7 +614,7 @@ export function adapterRoutes(options: {
     assertAdapterManagementVisible();
 
     const adapterType = req.params.type;
-    const { paused } = req.body as { paused?: boolean };
+    const { paused } = (req.body ?? {}) as { paused?: boolean };
 
     if (typeof paused !== "boolean") {
       res.status(400).json({ error: "\"paused\" (boolean) is required in request body." });
@@ -566,6 +629,13 @@ export function adapterRoutes(options: {
     const changed = setOverridePaused(adapterType, paused);
 
     logger.info({ type: adapterType, paused, changed }, "Adapter override toggle");
+
+    await logInstanceActivity(db, req, {
+      action: "instance.adapter.overridden",
+      entityType: "adapter",
+      entityId: adapterType,
+      details: { type: adapterType, paused, changed },
+    });
 
     res.json({ type: adapterType, paused, changed });
   });
@@ -642,6 +712,13 @@ export function adapterRoutes(options: {
 
     logger.info({ type: adapterType }, "External adapter unregistered and removed");
 
+    await logInstanceActivity(db, req, {
+      action: "instance.adapter.uninstalled",
+      entityType: "adapter",
+      entityId: adapterType,
+      details: { type: adapterType, packageName: externalRecord.packageName },
+    });
+
     res.json({ type: adapterType, removed: true });
   });
 
@@ -693,10 +770,32 @@ export function adapterRoutes(options: {
 
       logger.info({ type, version: newVersion }, "External adapter reloaded at runtime");
 
+      await logInstanceActivity(db, req, {
+        action: "instance.adapter.reloaded",
+        entityType: "adapter",
+        entityId: type,
+        details: { type, version: newVersion },
+      });
+
       res.json({ type, version: newVersion, reloaded: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error({ err, type }, "Failed to reload external adapter");
+
+      // Audit: a failed reload is an attempted runtime code swap — record it.
+      await logInstanceActivity(db, req, {
+        action: "instance.adapter.reloaded",
+        entityType: "adapter",
+        entityId: type,
+        details: {
+          type,
+          outcome: "failed",
+          failureReason: message,
+        },
+      }).catch((logErr) => {
+        logger.error({ logErr }, "Failed to write adapter reload failure audit row");
+      });
+
       res.status(500).json({ error: `Failed to reload adapter: ${message}` });
     }
   });
@@ -763,10 +862,33 @@ export function adapterRoutes(options: {
 
       logger.info({ type, version: newVersion }, "Adapter reinstalled from npm");
 
+      await logInstanceActivity(db, req, {
+        action: "instance.adapter.reinstalled",
+        entityType: "adapter",
+        entityId: type,
+        details: { type, packageName: record.packageName, version: newVersion },
+      });
+
       res.json({ type, version: newVersion, reinstalled: true });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error({ err, type }, "Failed to reinstall adapter");
+
+      // Audit: a failed reinstall is a re-attempted code execution — record it.
+      await logInstanceActivity(db, req, {
+        action: "instance.adapter.reinstalled",
+        entityType: "adapter",
+        entityId: type,
+        details: {
+          type,
+          packageName: record.packageName,
+          outcome: "failed",
+          failureReason: message,
+        },
+      }).catch((logErr) => {
+        logger.error({ logErr }, "Failed to write adapter reinstall failure audit row");
+      });
+
       res.status(500).json({ error: `Reinstall failed: ${message}` });
     }
   });

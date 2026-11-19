@@ -35,7 +35,8 @@ import {
   UserRound,
   Users,
 } from "lucide-react";
-import { Link, useSearchParams } from "react-router-dom";
+import { Link } from "@/lib/router";
+import { useSearchParams } from "react-router-dom";
 import type {
   CompanySecret,
   CompanySecretUsageBinding,
@@ -125,6 +126,7 @@ import {
   type SecretPathFolder,
 } from "./secrets/secret-path";
 import { SetMyUserSecretDialog } from "./secrets/SetMyUserSecretDialog";
+import { EgressTab } from "./secrets/EgressTab";
 import {
   coverageSummaryLabel,
   UserSecretChip,
@@ -1923,7 +1925,16 @@ export function Secrets() {
                 <Folder className="mr-1 h-3.5 w-3.5" /> New folder
               </Button>
             ) : null}
+<<<<<<< fork
+            <Button asChild variant="outline" size="sm">
+              <Link to="/company/settings/secrets/egress">
+                <ShieldCheck className="h-3.5 w-3.5 mr-1" /> Egress bindings
+              </Link>
+            </Button>
+            <Button onClick={openCreateSecret} size="sm">
+=======
             <Button data-toolbar-primary onClick={openCreateSecret} size="sm">
+>>>>>>> upstream
               <Plus className="h-3.5 w-3.5 mr-1" /> New secret
             </Button>
           </div>
@@ -2348,6 +2359,7 @@ export function Secrets() {
                       { value: "details", label: "Details" },
                       { value: "usage", label: usageQuery.data ? `Usage (${usageQuery.data.bindings.length})` : "Usage" },
                       { value: "events", label: "Access events" },
+                      { value: "egress", label: "Egress" },
                     ]}
                     align="start"
                     value={secretDetailTab}
@@ -2377,6 +2389,12 @@ export function Secrets() {
                       loading={eventsQuery.isPending}
                       events={eventsQuery.data ?? []}
                       companyId={selectedCompanyId}
+                    />
+                  </TabsContent>
+                  <TabsContent value="egress">
+                    <EgressTab
+                      companyId={selectedCompanyId}
+                      secretId={selectedSecret.id}
                     />
                   </TabsContent>
                 </div>

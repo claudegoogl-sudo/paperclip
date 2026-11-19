@@ -77,12 +77,25 @@ export interface Config extends StorageConfig {
   databaseMode: DatabaseMode;
   databaseUrl: string | undefined;
   databaseMigrationUrl: string | undefined;
+  allowEmbeddedPostgresPublic: boolean;
   embeddedPostgresDataDir: string;
   embeddedPostgresPort: number;
   databaseBackupEnabled: boolean;
   databaseBackupIntervalMinutes: number;
   databaseBackupRetentionDays: number;
   databaseBackupDir: string;
+  runHistoryRetentionEnabled: boolean;
+  runHistoryRetentionDays: number;
+  runHistoryRetentionIntervalMinutes: number;
+  pluginWebhookDeliveryRetentionEnabled: boolean;
+  pluginWebhookDeliverySuccessRetentionDays: number;
+  pluginWebhookDeliveryFailedRetentionDays: number;
+  pluginWebhookDeliveryMaxRows: number;
+  pluginWebhookDeliveryRetentionIntervalMinutes: number;
+  boardApiKeyAuthEventRetentionEnabled: boolean;
+  boardApiKeyAuthEventRetentionDays: number;
+  boardApiKeyAuthEventMaxRows: number;
+  boardApiKeyAuthEventRetentionIntervalMinutes: number;
   gitCacheExpirationEnabled: boolean;
   gitBaseExpirationEnabled: boolean;
   gitCacheExpirationDryRun: boolean;
@@ -288,6 +301,45 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
       fileDatabaseBackup?.dir ??
       resolveDefaultBackupDir(),
   );
+  const runHistoryRetentionEnabled = process.env.PAPERCLIP_RUN_HISTORY_RETENTION_ENABLED !== "false";
+  // 14 days keeps roughly two weeks of run history -- long enough to debug any
+  // incident that is still being worked, short enough that the tables stop
+  // growing without bound.
+  const runHistoryRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_DAYS) || 14,
+  );
+  const runHistoryRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_RUN_HISTORY_RETENTION_INTERVAL_MINUTES) || 60,
+  );
+  const pluginWebhookDeliveryRetentionEnabled =
+    process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_ENABLED !== "false";
+  // Success rows: 3 days. A success row only proves the delivery reached the
+  // worker; once observed it has no diagnostic value. Three days covers a long
+  // weekend's "did we get it?" check without accumulating high-volume noise.
+  const pluginWebhookDeliverySuccessRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_SUCCESS_RETENTION_DAYS) || 3,
+  );
+  // Failed rows: 30 days. Failed deliveries are the incident audit trail
+  // for delivery / signature / dispatch investigations. 30 days outlives the
+  // typical on-call rotation.
+  const pluginWebhookDeliveryFailedRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_FAILED_RETENTION_DAYS) || 30,
+  );
+  // Max-rows cap. This is the load-bearing bound: age alone permits
+  // ~169 GB/day at the documented ingestion ceiling. 1,000,000 rows
+  // is roughly 1 GB on disk for the typical ~1 KB JSONB row.
+  const pluginWebhookDeliveryMaxRows = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_MAX_ROWS) || 1_000_000,
+  );
+  const pluginWebhookDeliveryRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_INTERVAL_MINUTES) || 60,
+  );
   // The terminal-workspace reaper waits this many days after an issue tree
   // becomes terminal before it archives the workspace. A person can reopen the
   // work inside this window. A value of 0 disables the cooldown and restores
@@ -342,7 +394,30 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
   const gitRestorePointRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS", 90));
   const gitRestorePointTerminalDelayDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS", 3);
   const gitRestorePointIdleDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS", 7);
+<<<<<<< fork
+  const boardApiKeyAuthEventRetentionEnabled =
+    process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
+  // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
+  // motivated the log (the credential-abuse investigation that drove it needed
+  // ~3 months of history) without letting the table drift toward activity_log's
+  // scale.
+  const boardApiKeyAuthEventRetentionDays = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_DAYS) || 90,
+  );
+  // Load-bearing size bound: one row per source-minute under a sustained
+  // distributed attempt still has to stop somewhere. 500k rows is tens of MB.
+  const boardApiKeyAuthEventMaxRows = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_MAX_ROWS) || 500_000,
+  );
+  const boardApiKeyAuthEventRetentionIntervalMinutes = Math.max(
+    1,
+    Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_INTERVAL_MINUTES) || 60,
+  );
+=======
   const taskDirectoryOrphanGraceDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_TASK_DIRECTORY_ORPHAN_GRACE_DAYS", 7));
+>>>>>>> upstream
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,
@@ -363,6 +438,14 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     throw new Error(resolvedBind.errors[0]);
   }
 
+  // Emit a warning when sign-up is open on an authenticated deployment
+  if (deploymentMode === "authenticated" && authDisableSignUp === false) {
+    console.warn(
+      "[paperclip] Open sign-up is enabled on an authenticated deployment. " +
+        "Set PAPERCLIP_AUTH_DISABLE_SIGN_UP=true to close sign-up and restrict access to invited users only."
+    );
+  }
+
   return {
     deploymentMode,
     deploymentExposure,
@@ -380,6 +463,11 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     databaseMode: fileDatabaseMode,
     databaseUrl: process.env.DATABASE_URL ?? fileDbUrl,
     databaseMigrationUrl: process.env.DATABASE_MIGRATION_URL,
+    // Permissive by default: authenticated+public deployments on embedded
+    // PostgreSQL warn-and-continue (preserves the live host's posture). Only an
+    // explicit PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC=false opts into the
+    // strict refuse-to-boot contract.
+    allowEmbeddedPostgresPublic: process.env.PAPERCLIP_ALLOW_EMBEDDED_POSTGRES_PUBLIC !== "false",
     embeddedPostgresDataDir: resolveHomeAwarePath(
       fileConfig?.database.embeddedPostgresDataDir ?? resolveDefaultEmbeddedPostgresDir(),
     ),
@@ -388,6 +476,18 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     databaseBackupIntervalMinutes,
     databaseBackupRetentionDays,
     databaseBackupDir,
+    runHistoryRetentionEnabled,
+    runHistoryRetentionDays,
+    runHistoryRetentionIntervalMinutes,
+    pluginWebhookDeliveryRetentionEnabled,
+    pluginWebhookDeliverySuccessRetentionDays,
+    pluginWebhookDeliveryFailedRetentionDays,
+    pluginWebhookDeliveryMaxRows,
+    pluginWebhookDeliveryRetentionIntervalMinutes,
+    boardApiKeyAuthEventRetentionEnabled,
+    boardApiKeyAuthEventRetentionDays,
+    boardApiKeyAuthEventMaxRows,
+    boardApiKeyAuthEventRetentionIntervalMinutes,
     gitCacheExpirationEnabled: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_ENABLED === "true",
     gitBaseExpirationEnabled: process.env.PAPERCLIP_GIT_BASE_EXPIRATION_ENABLED === "true",
     gitCacheExpirationDryRun: process.env.PAPERCLIP_GIT_CACHE_EXPIRATION_DRY_RUN !== "false",

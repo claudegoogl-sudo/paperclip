@@ -74,6 +74,7 @@ import {
   ADAPTER_AGNOSTIC_KEYS,
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
+  notifyOnlyAgentKeyExpiryError,
   createAgentHireSchema,
   createAgentSchema,
   deriveAgentUrlKey,
@@ -162,7 +163,7 @@ import type { AdapterAuthSignal, AdapterAuthSignalResponse, CodexAccountBindingC
 import { adapterSettingsService } from "../services/adapter-settings.js";
 import { skillVersionSelectionMap } from "../services/runtime-skill-selections.js";
 import { isFixedClaudeOAuthBinding, secretService } from "../services/secrets.js";
-import { authorizationDeniedDetails } from "../services/authorization.js";
+import { agentConfigUpdateScope, authorizationDeniedDetails } from "../services/authorization.js";
 import { providerTraceStore } from "../services/provider-trace-store.js";
 import {
   persistReprojectedWorkspaceDiffs,
@@ -597,6 +598,17 @@ export function agentRoutes(
     "agentsMdPath",
   ] as const;
   const KNOWN_INSTRUCTIONS_BUNDLE_KEY_SET: ReadonlySet<string> = new Set(KNOWN_INSTRUCTIONS_BUNDLE_KEYS);
+
+  // Adapter config keys that inject external file/context content into the
+  // agent prompt (adapter-side contextFiles path reads, injected context
+  // payloads). Agent-authenticated callers cannot set these on their own
+  // record — same primitive as the instructions-bundle keys above, so the
+  // agent-actor guard in assertNoAgentAdapterConfigMutation denies both
+  // lists together.
+  const KNOWN_CONTEXT_INJECTION_KEYS = [
+    "contextFiles",
+    "injectClaudeContext",
+  ] as const;
 
   const router = Router();
   const managementGuard = connectionManagementGuard(db, "ai");
@@ -1784,6 +1796,69 @@ export function agentRoutes(
   }
 
   /**
+<<<<<<< fork
+   * Requested scope for every `agent_config:update` decision. Always carries
+   * the target agent id so an `agents:configure` grant scoped to
+   * `{targetAgentIds:[...]}` can match; an unscoped grant (scope null) still
+   * matches any requested scope, so existing unscoped grants are unchanged.
+   */
+  // agentConfigUpdateScope() lives in services/authorization.ts (shared with routes/secrets.ts).
+
+  /**
+   * Agent callers that update ANOTHER agent may change only the model
+   * selection. Everything else (env, command, runtimeConfig, name, ...) and
+   * replaceAdapterConfig are rejected. Self-updates and board callers are
+   * not affected.
+   */
+  const CROSS_AGENT_ADAPTER_CONFIG_ALLOWED_KEYS = new Set(["model", "fallbackModel"]);
+  function assertAgentCrossAgentPatchIsModelOnly(
+    req: Request,
+    targetAgent: { id: string },
+    body: Record<string, unknown>,
+  ) {
+    if (req.actor.type !== "agent") return;
+    if (req.actor.agentId === targetAgent.id) return;
+    const rejected: string[] = [];
+    for (const key of Object.keys(body)) {
+      if (key !== "adapterConfig") rejected.push(key);
+    }
+    const adapterConfig = asRecord(body.adapterConfig);
+    if (hasOwn(body, "adapterConfig") && !adapterConfig) rejected.push("adapterConfig");
+    if (adapterConfig) {
+      for (const key of Object.keys(adapterConfig)) {
+        if (!CROSS_AGENT_ADAPTER_CONFIG_ALLOWED_KEYS.has(key)) rejected.push(`adapterConfig.${key}`);
+      }
+    }
+    if (rejected.length === 0) return;
+    logger.warn(
+      { actorAgentId: req.actor.agentId, targetAgentId: targetAgent.id, rejectedFields: rejected.sort() },
+      "agent.cross_agent_update.denied_fields",
+    );
+    throw forbidden(
+      `Agent callers may only change adapterConfig.model / adapterConfig.fallbackModel on another agent (rejected: ${rejected.join(", ")})`,
+    );
+  }
+
+  /**
+   * Cross-agent write guard. Agent callers may only change *another* agent through
+   * the model-only path of `PATCH /agents/:id` (see assertAgentCrossAgentPatchIsModelOnly).
+   * Every other agent-config write route (instructions, profile, skills sync,
+   * config rollback) is self-only for agent callers, even when an
+   * `agents:configure` grant (scoped or unscoped) would allow it. Board callers
+   * and self-updates are unaffected.
+   */
+  function assertNoCrossAgentAgentWrite(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    route: string,
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId === targetAgent.id) return;
+    logger.warn(
+      { actorAgentId: req.actor.agentId, targetAgentId: targetAgent.id, route },
+      "agent.cross_agent_write.denied",
+    );
+    throw forbidden(`Agent callers may not use ${route} on another agent`);
+=======
    * Terminating an agent is a board-only governed action. The denial gives
    * other actors a ready profile link, so they can send a person to the control.
    */
@@ -1793,6 +1868,7 @@ export function agentRoutes(
       .where(eq(companies.id, target.companyId));
     const profile = company?.issuePrefix ? `[the agent's profile](/${company.issuePrefix}/agents/${target.id})` : "the agent's profile";
     throw forbidden(`Board access required: only a board user can terminate an agent. Ask a person with board access to open ${profile} and choose Terminate from its actions menu.`);
+>>>>>>> upstream
   }
 
   async function assertCanUpdateAgent(req: Request, targetAgent: { id: string; companyId: string }) {
@@ -1804,6 +1880,7 @@ export function agentRoutes(
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
+      scope: agentConfigUpdateScope(targetAgent),
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
@@ -2547,7 +2624,8 @@ export function agentRoutes(
       throw notFound("Agent not found");
     }
     assertCompanyAccess(req, targetAgent.companyId);
-    const changeScope = { requiresChangeGrant: true };
+    assertNoCrossAgentAgentWrite(req, targetAgent, "protected agent change (instructions/profile)");
+    const changeScope = agentConfigUpdateScope(targetAgent, { requiresChangeGrant: true });
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",
@@ -2607,34 +2685,80 @@ export function agentRoutes(
     );
   }
 
+  function agentProtectedAdapterConfigKeys(
+    adapterConfig: Record<string, unknown>,
+    path: string,
+  ): string[] {
+    return [...KNOWN_INSTRUCTIONS_BUNDLE_KEYS, ...KNOWN_CONTEXT_INJECTION_KEYS]
+      .filter((key) => adapterConfig[key] !== undefined)
+      .map((key) => `${path}.${key}`);
+  }
+
+  function listRuntimeModelProfileAdapterConfigs(runtimeConfig: unknown): Array<{
+    profileKey: string;
+    profile: Record<string, unknown>;
+    adapterConfig: Record<string, unknown>;
+    path: string;
+  }> {
+    const runtimeRecord = asRecord(runtimeConfig);
+    const modelProfiles = asRecord(runtimeRecord?.modelProfiles);
+    if (!modelProfiles) return [];
+
+    const entries: Array<{
+      profileKey: string;
+      profile: Record<string, unknown>;
+      adapterConfig: Record<string, unknown>;
+      path: string;
+    }> = [];
+    for (const [profileKey, rawProfile] of Object.entries(modelProfiles)) {
+      const profile = asRecord(rawProfile);
+      const adapterConfig = asRecord(profile?.adapterConfig);
+      if (!profile || !adapterConfig) continue;
+      entries.push({
+        profileKey,
+        profile,
+        adapterConfig,
+        path: `runtimeConfig.modelProfiles.${profileKey}.adapterConfig`,
+      });
+    }
+    return entries;
+  }
+
+  function assertNoAgentRuntimeConfigAdapterConfigMutation(req: Request, runtimeConfig: unknown) {
+    for (const entry of listRuntimeModelProfileAdapterConfigs(runtimeConfig)) {
+      assertNoAgentProtectedAdapterConfigMutation(req, entry.adapterConfig, entry.path);
+    }
+  }
+
   async function assertCanResumeAgent(
     req: Request,
     targetAgent: { id: string; companyId: string },
   ) {
     if (req.actor.type !== "agent") return;
+    // Resume is intentionally NOT self-only: cross-agent resume with a direct
+    // agents:configure grant is an existing, tested feature and changes no
+    // configuration. It is now bound to the grant's target scope instead.
 
     const decision = await access.decide({
       actor: req.actor,
       action: "agent_config:update",
       resource: { type: "agent", companyId: targetAgent.companyId, agentId: targetAgent.id },
-      scope: { requiresChangeGrant: true },
+      scope: agentConfigUpdateScope(targetAgent, { requiresChangeGrant: true }),
     });
     if (decision.allowed) return;
     throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
   }
 
-  function assertNoAgentInstructionsConfigMutation(
+  function assertNoAgentProtectedAdapterConfigMutation(
     req: Request,
     adapterConfig: Record<string, unknown> | null | undefined,
     path = "adapterConfig",
   ) {
     if (req.actor.type !== "agent" || !adapterConfig) return;
-    const changedSensitiveKeys = KNOWN_INSTRUCTIONS_BUNDLE_KEYS
-      .filter((key) => adapterConfig[key] !== undefined)
-      .map((key) => `${path}.${key}`);
+    const changedSensitiveKeys = agentProtectedAdapterConfigKeys(adapterConfig, path);
     if (changedSensitiveKeys.length === 0) return;
     throw forbidden(
-      `Agent-authenticated callers cannot modify instructions path or bundle configuration (${changedSensitiveKeys.join(", ")})`,
+      `Agent-authenticated callers cannot modify instructions path, bundle, or context-injection configuration (${changedSensitiveKeys.join(", ")})`,
     );
   }
 
@@ -2656,11 +2780,11 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
   ) {
+    assertNoAgentProtectedAdapterConfigMutation(req, adapterConfig, path);
     if (req.actor.type === "agent" && hasOwn(adapterConfig, "homeMode"))
       throw forbidden("Only an operator can configure Runner homeMode.");
     if (req.actor.type === "agent" && ["dotAttachmentAccess", "dotWorkspaceAccess", "dotBindingId", "externalBindingId", "museBindingId", "museGeneration", "museConnection"].some(key => hasOwn(adapterConfig, key)))
       throw forbidden("Only an operator can configure external-agent pairing, attachment access, or workspace access.");
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
@@ -3907,6 +4031,7 @@ export function agentRoutes(
       const id = req.params.id as string;
       const agent = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
       if (!agent) return;
+      assertNoCrossAgentAgentWrite(req, agent, "POST /agents/:id/skills/sync");
       await assertCanUpdateAgent(req, agent);
 
       const requestedSkills = normalizeDesiredSkillSelections(req.body.desiredSkills);
@@ -4081,6 +4206,15 @@ export function agentRoutes(
       });
 
     res.json(items);
+  });
+
+  // Instance-wide usage-limit park state — lets the dashboard/recovery
+  // sweep tell "parked on purpose until the account-wide quota resets" apart from
+  // a stall, without inferring it from an absence of active runs.
+  router.get("/instance/usage-limit-park", async (req, res) => {
+    assertInstanceAdmin(req);
+    const state = await heartbeat.getUsageLimitParkState();
+    res.json(state);
   });
 
   router.get("/companies/:companyId/org", async (req, res) => {
@@ -4304,6 +4438,7 @@ export function agentRoutes(
     const revisionId = req.params.revisionId as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    assertNoCrossAgentAgentWrite(req, existing, "POST /agents/:id/config-revisions/:revisionId/rollback");
     await assertCanUpdateAgent(req, existing);
 
     const revision = await svc.getConfigRevision(id, revisionId);
@@ -5308,6 +5443,9 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
+    // Fork policy: instructions are self-only for agent callers even when a grant allows
+    // configuration; the 1005.0 revision path would otherwise skip the protected-change guard.
+    assertNoCrossAgentAgentWrite(req, existing, "PUT /agents/:id/instructions-bundle/file");
     const entryFile = deriveBundleState(existing).entryFile;
     if (instructionPath(req.body.path) === entryFile) {
       assertExternalInstructionsAdmin(req, existing);
@@ -5397,6 +5535,7 @@ export function agentRoutes(
   router.post("/agents/:id/instructions-bundle/candidates/:runId/resolve", validate(resolveAgentInstructionCandidateSchema), async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNoCrossAgentAgentWrite(req, existing, "POST /agents/:id/instructions-bundle/candidates/:runId/resolve");
     assertExternalInstructionsAdmin(req, existing);
     const runId = req.params.runId as string;
     if (!isUuidLike(runId)) throw unprocessable("Invalid instruction candidate run id");
@@ -5436,6 +5575,7 @@ export function agentRoutes(
   router.post("/agents/:id/instructions-bundle/restore", validate(restoreAgentInstructionSchema), async (req, res) => {
     const existing = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
     if (!existing) return;
+    assertNoCrossAgentAgentWrite(req, existing, "POST /agents/:id/instructions-bundle/restore");
     assertExternalInstructionsAdmin(req, existing);
     const receipt = await instructionRevisions.restore({ companyId: existing.companyId, agentId: existing.id,
       entryFile: req.body.path, baseRevisionId: req.body.baseRevisionId, revisionId: req.body.revisionId }, req.actor);
@@ -5529,6 +5669,8 @@ export function agentRoutes(
       return;
     }
 
+    assertAgentCrossAgentPatchIsModelOnly(req, existing, req.body as Record<string, unknown>);
+
     const runtimeSettings = req.body.runtimeSettings;
     if (runtimeSettings) await assertCanConfigureAgentSetup(req, existing);
     const patchData = runtimeSettings
@@ -5619,6 +5761,7 @@ export function agentRoutes(
         res.status(422).json({ error: "runtimeConfig must be an object" });
         return;
       }
+      assertNoAgentRuntimeConfigAdapterConfigMutation(req, runtimeConfig);
       assertProviderTraceSettingTransition(
         req,
         runtimeConfig,
@@ -6097,8 +6240,28 @@ export function agentRoutes(
     if (!agent) {
       return;
     }
+    if (req.body.scope?.kind === "notify_only") {
+      // Board-only mint (assertBoard above): an agent credential must never be
+      // able to mint itself a durable run-less key. The key must also expire.
+      const expiryError = notifyOnlyAgentKeyExpiryError({
+        ttlSeconds: req.body.ttlSeconds ?? null,
+        expiresAt: req.body.expiresAt ?? null,
+      });
+      if (expiryError) throw unprocessable(expiryError);
+      // Every allow-listed issue must exist in the agent's own company.
+      const requestedIds = [...new Set((req.body.scope.issueIds as string[]).map((v) => v.toLowerCase()))];
+      const found = await db
+        .select({ id: issuesTable.id })
+        .from(issuesTable)
+        .where(and(eq(issuesTable.companyId, agent.companyId), inArray(issuesTable.id, requestedIds)));
+      if (found.length !== requestedIds.length) {
+        throw unprocessable("notify_only issueIds must all be issues in the agent's company");
+      }
+    }
     const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
       responsibleUserId: req.actor.userId ?? null,
+      ttlSeconds: req.body.ttlSeconds ?? null,
+      expiresAt: req.body.expiresAt ?? null,
     });
 
     await logActivity(db, {
@@ -6113,6 +6276,9 @@ export function agentRoutes(
         name: key.name,
         scope: key.scope,
         responsibleUserId: key.responsibleUserId,
+        // Effective expiry after the cross-company ceiling is applied — records
+        // the actual lifetime granted, not the requested one.
+        expiresAt: key.expiresAt ? key.expiresAt.toISOString() : null,
       },
     });
 
@@ -7173,6 +7339,8 @@ export function agentRoutes(
       lastOutputStream: heartbeatRuns.lastOutputStream,
       lastOutputBytes: heartbeatRuns.lastOutputBytes,
       processStartedAt: heartbeatRuns.processStartedAt,
+      processPid: heartbeatRuns.processPid,
+      processGroupId: heartbeatRuns.processGroupId,
       scopeKind: heartbeatRuns.scopeKind,
       issueId: heartbeatRuns.issueId,
       inputTokens: sql<number | null>`(${heartbeatRuns.usageJson} ->> 'inputTokens')::numeric`.as("inputTokens"),
@@ -7242,6 +7410,7 @@ export function agentRoutes(
       avatarUrl: agentAvatarUrl(resolveAgentAppearance(run.agentAppearance, run.agentId), 512),
       execution: projections.get(run.id) ?? null,
       outputSilence: await heartbeat.buildRunOutputSilence(run),
+      livenessProbe: heartbeat.buildRunLivenessProbe(run),
     }))), req.actor.type === "board" ? getActorInfo(req).actorId : null));
   });
 
@@ -7266,7 +7435,18 @@ export function agentRoutes(
       run.companyId,
       run.id,
       redactCurrentUserValue(
-        { ...decoratedRun, execution: await executionProjectionForRun(db, run.companyId, run.id), identityHistory: await listRunIdentityContexts(db, run.companyId, run.id), retryExhaustedReason, outputSilence: await heartbeat.buildRunOutputSilence(run) },
+        {
+          ...decoratedRun,
+          execution: await executionProjectionForRun(db, run.companyId, run.id),
+          identityHistory: await listRunIdentityContexts(db, run.companyId, run.id),
+          retryExhaustedReason,
+          outputSilence: await heartbeat.buildRunOutputSilence(run),
+          // Reaper-safe liveness for `running` rows (null otherwise). Lets an external
+          // actor distinguish a live (possibly provider-stalled) run from an orphaned
+          // one before treating a silent log tail as death evidence.
+          livenessProbe: await heartbeat.getRunLivenessProbe(runId),
+        },
+
         await getCurrentUserRedactionOptions(),
       ),
       req.actor.type === "board" ? getActorInfo(req).actorId : null,

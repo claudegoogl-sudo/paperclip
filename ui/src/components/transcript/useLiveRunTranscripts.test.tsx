@@ -412,7 +412,14 @@ describe("useLiveRunTranscripts", () => {
     });
 
     expect(logMock).not.toHaveBeenCalled();
+<<<<<<< fork
+    // Fork contract (heartbeat run lifecycle): queued runs are non-terminal and
+    // already subscribe to the live event socket so status transitions stream
+    // in; only persisted-log reads wait until the run is actually running.
+    expect(FakeWebSocket.instances).toHaveLength(1);
+=======
     expect(socketConstructed).not.toHaveBeenCalled();
+>>>>>>> upstream
 
     await act(async () => {
       root.render(<Harness status="running" />);
@@ -421,7 +428,14 @@ describe("useLiveRunTranscripts", () => {
 
     expect(logMock).toHaveBeenCalledTimes(1);
     expect(logMock).toHaveBeenCalledWith("run-queued", 0, 256_000, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+<<<<<<< fork
+    // The status change re-keys the runs memo, so the socket effect re-runs and
+    // opens a fresh socket (the previous instance is closed, not forgotten).
+    expect(FakeWebSocket.instances).toHaveLength(2);
+
+=======
     expect(socketConstructed).not.toHaveBeenCalled();
+>>>>>>> upstream
 
     act(() => {
       root.unmount();
