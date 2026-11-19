@@ -6,13 +6,6 @@ vi.mock("../services/fast-responses.js", () => ({
   enqueueFastResponse: vi.fn(async () => undefined),
 }));
 
-// Booting the route graph pulls in nearly every server service module; since the
-// v2026.824.1 merge that cold import alone can exceed the 5s default test
-// timeout, which killed the first tests in this file (the route module is cached
-// after the first import, so later tests never saw the cost).
-vi.setConfig({ testTimeout: 30_000 });
-
-const AGENT_RUN_ID = "44444444-4444-4444-8444-444444444444";
 const ASSIGNEE_AGENT_ID = "11111111-1111-4111-8111-111111111111";
 const PREVIOUS_AGENT_ID = "22222222-2222-4222-8222-222222222222";
 const MENTIONED_AGENT_ID = "33333333-3333-4333-8333-333333333333";
@@ -220,15 +213,6 @@ function registerModuleMocks() {
     }),
     workProductService: () => ({}),
   }));
-  // Agent-authored writes resolve source trust by querying the DB, which the
-  // stubbed `{}` db in this suite cannot serve. Stub it to a no-trust result so
-  // agent-actor comment POSTs exercise the wake fan-out rather than the db.
-  vi.doMock("../services/source-trust.js", async () => {
-    const actual = await vi.importActual<typeof import("../services/source-trust.js")>(
-      "../services/source-trust.js",
-    );
-    return { ...actual, resolveActorSourceTrustForIssue: vi.fn(async () => null) };
-  });
 }
 
 async function loadAppModules() {
@@ -244,61 +228,18 @@ async function createApp(transaction: (callback: (tx: Record<string, never>) => 
   const app = express();
   app.use(express.json());
   app.use((req, _res, next) => {
-    (req as any).actor = actor;
+    (req as any).actor = {
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      runId: req.header("x-paperclip-run-id") ?? null,
+      isInstanceAdmin: false,
+    };
     next();
   });
-  // Newer route reads go through db/tx select chains: instance-settings gating
-  // for the external-object comment sync, and the cross-issue influence cap's
-  // FOR UPDATE run lookup. Serve rows per table so those gates resolve instead
-  // of crashing on a select-less fake.
-  const instanceSettingsRow = {
-    id: "instance-settings",
-    defaultEnvironmentId: null,
-    general: {},
-    experimental: {},
-    createdAt: new Date(0),
-    updatedAt: new Date(0),
-  };
-  const actingAgentId = typeof actor.agentId === "string" ? actor.agentId : null;
-  const rowsFor = (table: unknown) => {
-    // Match on the drizzle table NAME, not object identity: server modules and
-    // this test file can resolve @paperclipai/db to separate module instances.
-    const tableName = (table as Record<symbol, string | undefined> | null | undefined)?.[Symbol.for("drizzle:Name")];
-    if (tableName === "heartbeat_runs") {
-      // The acting agent's run is bound to the issue under test, so the
-      // cross-issue cap classifies agent writes as in-scope (never cross-issue)
-      // and allows them without counting against the limit.
-      return [{
-        id: AGENT_RUN_ID,
-        companyId: "company-1",
-        agentId: actingAgentId,
-        responsibleUserId: null,
-        contextSnapshot: { issueId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" },
-      }];
-    }
-    return [instanceSettingsRow];
-  };
-  const selectStub = () => {
-    let rows: unknown[] = [];
-    const builder = {
-      from: (table: unknown) => ({
-        where: () => {
-          rows = rowsFor(table);
-          return thenableForUpdate;
-        },
-      }),
-    };
-    const thenableForUpdate = Object.assign(Promise.resolve().then(() => rows), {
-      for: () => thenableForUpdate,
-    }) as Promise<unknown[]> & { for: () => Promise<unknown[]> };
-    return builder;
-  };
-  const insertStub = () => ({ values: async () => [] });
-  const txStub = { select: selectStub, insert: insertStub };
   app.use("/api", issueRoutes({
-    select: selectStub,
-    insert: insertStub,
-    transaction: transaction ?? (async (callback: (tx: Record<string, unknown>) => Promise<unknown>) => callback(txStub)),
+    transaction,
   } as any, {} as any));
   app.use(errorHandler);
   return app;
@@ -486,7 +427,7 @@ describe("issue update comment wakeups", () => {
       }
     });
 
-    const res = await request(await createApp(BOARD_ACTOR, transaction))
+    const res = await request(await createApp(transaction))
       .patch(`/api/issues/${existing.id}`)
       .send({ comment: "use Astra", assigneeAdapterOverrides: { adapterConfig: { model: "gpt-6-astra" } } });
 

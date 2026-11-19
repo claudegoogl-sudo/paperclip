@@ -54,6 +54,34 @@ describe("board auth store", () => {
   });
 });
 
+describe("board auth requests", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("aborts a stalled request after the default timeout", async () => {
+    const timeout = new AbortController();
+    const timeoutSpy = vi.spyOn(AbortSignal, "timeout").mockReturnValue(timeout.signal);
+    const fetchMock = vi.fn(
+      (_url: string, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const pending = revokeStoredBoardCredential({ apiBase: "http://localhost:3100", token: "token-123" });
+    const settled = expect(pending).rejects.toThrow("aborted");
+    await Promise.resolve();
+
+    expect(timeoutSpy).toHaveBeenCalledWith(30_000);
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+
+    timeout.abort();
+    await settled;
+  });
+});
 
 describe("board CLI polling backoff", () => {
   afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
@@ -130,9 +158,9 @@ describe("board CLI polling backoff", () => {
     } finally { f.cleanup(); }
   });
 
-  it("does not retry other HTTP failures", async () => {
-    const f = harness([{ status: 503, body: { error: "Unavailable" } }]);
-    try { expect(await f.outcome).toHaveProperty("error.message", "Unavailable"); expect(f.counts()).toEqual({ creates: 1, polls: 1 }); }
+  it("does not retry permanent HTTP failures (4xx); 5xx is covered by the poll-failure tolerance tests", async () => {
+    const f = harness([{ status: 403, body: { error: "Forbidden" } }]);
+    try { expect(await f.outcome).toHaveProperty("error.message", "Forbidden"); expect(f.counts()).toEqual({ creates: 1, polls: 1 }); }
     finally { f.cleanup(); }
   });
 });

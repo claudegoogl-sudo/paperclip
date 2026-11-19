@@ -174,7 +174,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
   //  - `res.body`: response bodies are NOT logged anywhere in this server (the
   //    res serializer emits status only), so there is nothing to scrub there.
     serializers: {
-      req(req: Record<string, unknown> & { url?: unknown }) {
+      req(req: Record<string, unknown> & { url?: unknown; method?: unknown; id?: unknown }) {
         if (isPrivateAgentObservabilityHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
           return { id: req.id, method: req.method, url: "/api/companies/:companyId/observability" };
         }
@@ -234,11 +234,20 @@ export function createHttpLogger(baseLogger: pino.Logger) {
     if (isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))) {
       return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`);
     }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return `${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`;
+    }
     const ctx = (res as any).__errorContext;
     const errMsg = ctx?.error?.message || err?.message || (res as any).err?.message || "unknown error";
     return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — ${errMsg}`);
   },
   customErrorObject(req, _res, _err, value) {
+    if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
+    }
+    if (isPrivateMuseHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "External agent request failed" } };
+    }
     if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
       return { ...value, err: { type: "Error", message: "Feedback request failed" } };
     }
@@ -254,81 +263,18 @@ export function createHttpLogger(baseLogger: pino.Logger) {
   customProps(req, res) {
     if (res.statusCode >= 400 && /^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
       const ctx = (res as any).__errorContext;
-      const errMsg =
-        ctx?.error?.message ||
-        err?.message ||
-        (res as any).err?.message ||
-        "unknown error";
-      return `${req.method} ${stripSecretBearingUrlParts(req.url ?? "")} ${res.statusCode} — ${errMsg}`;
-    },
-    customErrorObject(req, _res, _err, value) {
-      if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
-        return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
-      }
-      if (isPrivateMuseHttpRequest(requestClassificationUrl(req)))return {...value,err:{type:"Error",message:"External agent request failed"}};
-      if (isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req))) {
-        return { ...value, err: { type: "Error", message: "Feedback request failed" } };
-      }
-      // pino-http serializes res.err independently of customProps/errorContext.
-      // Do not rely on a particular error handler having sanitized an SDK Error.
-      return isPrivateWebhook(req)
-        ? {
-            ...value,
-            err: { type: "Error", message: "Chat webhook request failed" },
-          }
-        : value;
-    },
-    customProps(req, res) {
-      if (res.statusCode >= 400) {
-        const ctx = (res as any).__errorContext;
-        if (/^\/mcp\/(?:oauth|paperclip)(?:\/|$)/.test(requestClassificationUrl(req) ?? "")) {
-          return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
-        }
-        if (isPrivateWebhook(req) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
-          // Omit, rather than recursively redact, the entire provider payload.
-          // This applies equally before/after parsing and with/without context.
-          return {
-            reqBody: "[REDACTED]",
-            ...(ctx || (res as any).err
-              ? { errorContext: { name: "Error" } }
-              : {}),
-          };
-        }
-        if (ctx) {
-          const secretSensitiveRoute = isSecretSensitiveHttpRequest(
-            req.method,
-            requestClassificationUrl(req),
-          );
-          return {
-            // Provider SDK and validation errors sometimes echo the supplied
-            // credential in their prose. Keep only a non-sensitive type marker
-            // for setup routes; the status, route, and redacted body remain.
-            errorContext: secretSensitiveRoute
-              ? { name: "Error" }
-              : redactSensitive(ctx.error),
-            reqBody: redactSensitive(ctx.reqBody),
-            reqParams: redactSensitive(ctx.reqParams),
-          };
-        }
-        const props: Record<string, unknown> = {};
-        const { body, params } = req as any;
-        if (body && typeof body === "object" && Object.keys(body).length > 0) {
-          props.reqBody = redactSensitive(body);
-        }
-        if (
-          params &&
-          typeof params === "object" &&
-          Object.keys(params).length > 0
-        ) {
-          props.reqParams = redactSensitive(params);
-        }
-        if ((req as any).route?.path) {
-          props.routePath = (req as any).route.path;
-        }
-        return props;
-      }
-      return {};
-    },
+      return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
+    }
+    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
+      // Omit, rather than recursively redact, the entire provider payload —
+      // before/after parsing, with or without error context.
+      return {
+        reqBody: "[REDACTED]",
+        ...((res as any).__errorContext || (res as any).err ? { errorContext: { name: "Error" } } : {}),
+      };
+    }
+    return redactSecretsDeepForLog(buildHttpLogProps(req, res));
+  },
   });
 }
 

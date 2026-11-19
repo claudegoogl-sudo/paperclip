@@ -53,6 +53,7 @@ import { badRequest, forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin } from "./authz.js";
+import { logInstanceActivity } from "./instance-activity.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 import { agentRunnerAvailability, type RunnerTarget } from "../services/agent-runner-selection.js";
 import type { AgentRunnerAvailability } from "@paperclipai/shared";
@@ -267,7 +268,8 @@ export function adapterRoutes(options: {
   getNativeRunnerEnabled?: () => Promise<boolean>;
   getOpenAiDotEnabled?: () => Promise<boolean>;
   resolveRunnerTarget?: (companyId: string, environmentId?: string) => Promise<RunnerTarget>;
-} = {}) {
+}) {
+  const { db } = options;
   const router = Router();
 
   /**

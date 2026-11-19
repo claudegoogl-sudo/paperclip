@@ -388,7 +388,7 @@ describe("durable Dot Runner integration", () => {
     } finally { await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, holding.run.id)); }
   });
 
-  it.skip("keeps competing Dot assignments queued and replays durable work requests", async () => {
+  it("keeps competing Dot assignments queued and replays durable work requests", async () => {
     const f = await fixture();
     await db.update(companies).set({ defaultResponsibleUserId: f.userId }).where(eq(companies.id, f.company.id));
     await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 20, wakeOnDemand: true } } }).where(eq(agents.id, f.agent.id));
@@ -450,7 +450,7 @@ describe("durable Dot Runner integration", () => {
     } finally { await f.events.unsubscribe(f.principal, f.subscription); await f.events.stop(); }
   });
 
-  it.skip("coalesces a normal comment wake into the accepted Dot mailbox without a second run", async () => {
+  it("coalesces a normal comment wake into the accepted Dot mailbox without a second run", async () => {
     const f = await fixture(), { run, assignment } = await offeredWork(f);
     const [task] = await db.insert(issues).values({ companyId: f.company.id, title: "Active Dot comment",
       status: "in_progress", assigneeAgentId: f.agent.id, executionRunId: run.id, checkoutRunId: run.id }).returning();
@@ -491,7 +491,7 @@ describe("durable Dot Runner integration", () => {
     }
   }, 30000);
 
-  it.skip.each(["finish before delivery", "read before wake admission", "partial history", "failed history"])(
+  it.each(["finish before delivery", "read before wake admission", "partial history", "failed history"])(
     "preserves comment delivery when %s", async scenario => {
       const f = await fixture(), { run, assignment } = await offeredWork(f);
       await db.update(companies).set({ defaultResponsibleUserId: f.userId }).where(eq(companies.id, f.company.id));

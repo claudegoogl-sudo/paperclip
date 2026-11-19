@@ -72,6 +72,13 @@ import {
   companies,
   companyMemberships,
   instanceUserRoles,
+  buildEmbeddedPostgresConnectionString,
+  buildEmbeddedPostgresConstructorOptions,
+  migrateLegacyEmbeddedPostgresSocket,
+  resolveEmbeddedPostgresPasswordForStartup,
+  rotateEmbeddedPostgresAuthIfNeeded,
+  scrubEmbeddedPostgresConnectionString,
+  socketDirectoryPathFor,
   closeLivenessDb,
 } from "@paperclipai/db";
 import detectPort from "detect-port";
@@ -1648,6 +1655,19 @@ async function startServerWithDatabaseTeardown(
         logger.error({ err }, "GitHub connection continuity sweep failed");
       }));
   };
+
+  // Sweep MCP child processes (e.g. Playwright MCP) that were orphaned to init
+  // by a prior crash or watchdog kill. Runs regardless of heartbeat scheduling
+  // so leaked strays never accumulate across restarts. Safe matching only:
+  // MCP command + ppid==1.
+  try {
+    const reaped = await reapOrphanedMcpProcessesOnStartup();
+    if (reaped.length > 0) {
+      logger.warn({ reapedPids: reaped }, "startup swept orphaned MCP child processes");
+    }
+  } catch (err) {
+    logger.error({ err }, "startup MCP orphan sweep failed");
+  }
 
   await timeStartupRecovery("tool_reviews", () => app.locals.toolGateway.sweepActionReviews()).catch((err: unknown) => logger.error({ err }, "startup tool review recovery failed"));
   await timeStartupRecovery("gateway_sessions", () => app.locals.toolGateway.cleanupExpiredSessions()).catch((err: unknown) => logger.error({ err }, "startup gateway token cleanup failed"));

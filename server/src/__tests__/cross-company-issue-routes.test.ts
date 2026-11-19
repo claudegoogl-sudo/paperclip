@@ -206,6 +206,11 @@ vi.mock("../services/index.js", () => ({
 // agent-actor comment POSTs exercise the wake fan-out rather than the db.
 // The 1005.0 issue read computes the execution blocker; the fake db here has no run rows to scan.
 vi.mock("../services/execution-blocker.js", () => ({ getExecutionBlocker: vi.fn(async () => null) }));
+// The 1106.0 issue read adds an interruption projection that queries the DB; the fake db has no rows.
+vi.mock("../services/task-interruption-presentation.js", () => ({
+  taskInterruptionPresentation: vi.fn(async () => null),
+  taskInterruptionPresentations: vi.fn(async () => new Map()),
+}));
 
 vi.mock("../services/source-trust.js", async () => {
   const actual = await vi.importActual<typeof import("../services/source-trust.js")>(

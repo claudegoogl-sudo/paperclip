@@ -13895,13 +13895,44 @@ export function issueRoutes(
         throw unprocessable("expectedExecutionPolicy requires a policy-only update");
       }
       const id = req.params.id as string;
-      const existing = await getAccessibleResource(
-        req,
-        res,
-        svc.getById(id),
-        "Issue not found",
-      );
-      if (!existing) return;
+      const resolvedPatch = await getIssueWithCrossCompany(req, res, id, "issue.update");
+      if (!resolvedPatch) return;
+      const existing = resolvedPatch.issue;
+      const crossCompanyPatch = resolvedPatch.crossCompany;
+      if (crossCompanyPatch) {
+        const guard = await checkCrossCompanyPatch(
+          req.body as Record<string, unknown>,
+          existing.companyId,
+          req.actor.agentId!,
+          crossCompanyPatchLookups,
+        );
+        await recordCrossCompanyIssueAccess((row) => logActivity(db, row), {
+          targetCompanyId: existing.companyId,
+          homeCompanyId: req.actor.companyId!,
+          agentId: req.actor.agentId!,
+          runId: req.actor.runId ?? null,
+          issueId: existing.id,
+          op: "issue.update",
+          method: req.method,
+          route: "/issues/:id",
+          outcome: guard.ok ? "allowed" : "denied",
+          reason: guard.ok ? undefined : `field:${guard.field}`,
+          changedFields: guard.ok ? guard.changedFields : [guard.field],
+        });
+        if (!guard.ok) {
+          res.status(422).json({ error: guard.error, field: guard.field });
+          return;
+        }
+        // M8: host-written marker on the PATCH comment; client text is never trusted.
+        if (typeof req.body.comment === "string" && req.body.comment.length > 0 && resolvedPatch.marker) {
+          req.body.comment = withCrossCompanyMarker(resolvedPatch.marker, req.body.comment);
+        }
+      }
+      if (!assertNoSecretPatternInWritePayload(req, res, [
+        { name: "description", value: req.body.description },
+        { name: "comment", value: req.body.comment },
+        { name: "title", value: req.body.title },
+      ], { issueId: existing.id, companyId: existing.companyId })) return;
       if (!(await assertIssueReadAllowed(req, res, existing))) return;
       if (req.body.expectedStatusVersion !== undefined && (
         existing.statusVersion !== req.body.expectedStatusVersion || existing.status !== "backlog"
@@ -16000,7 +16031,19 @@ export function issueRoutes(
           }
         }
 
-        const restoredBlockedReadyDependency = shouldWakeOnRestoredBlockedDependency({
+        // Fork reversal of upstream #8943: edge rule. Only wake when the issue was
+        // ALREADY blocked and this request removed >=1 blocker, or when the assignee
+        // changed. Parking into `blocked` onto done blockers, or an add-only change,
+        // is a deliberate park and must not self-wake.
+        const restoreRemovedBlockerCount = Array.isArray(req.body.blockedByIssueIds)
+          ? (existingRelations?.blockedBy ?? []).filter(
+              (relation) => !(req.body.blockedByIssueIds as string[]).includes(relation.id),
+            ).length
+          : 0;
+        const restoreEdgeRuleMet =
+          (existing.status === "blocked" && restoreRemovedBlockerCount > 0) ||
+          existing.assigneeAgentId !== issue.assigneeAgentId;
+        const restoredBlockedReadyDependency = restoreEdgeRuleMet && shouldWakeOnRestoredBlockedDependency({
           previousStatus: existing.status,
           nextStatus: issue.status,
           previousAssigneeAgentId: existing.assigneeAgentId ?? null,

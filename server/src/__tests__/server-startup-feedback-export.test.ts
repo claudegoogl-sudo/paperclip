@@ -58,7 +58,7 @@ const {
     run: (signal?: AbortSignal) => Promise<unknown>;
     hasPending?: () => Promise<boolean>;
   }) => ({ ready: task.run(new AbortController().signal).catch(() => undefined), wake: vi.fn() }));
-  const createAppMock = vi.fn(async () => Object.assign((_: unknown, __: unknown) => {}, {
+  const createAppMock = vi.fn(async () => ({ pluginToolDispatcher: { toolCount: () => 0 }, app: Object.assign((_: unknown, __: unknown) => {}, {
     locals: {
       fastResponses: { hasPending: vi.fn(async () => false), sweepPending: vi.fn(async () => undefined) },
       deliveryWork: {
@@ -71,7 +71,7 @@ const {
       },
       toolActionDeliveries: { hasPending: vi.fn(async () => false), sweepPending: vi.fn(async () => ({ scanned: 0, delivered: 0 })) },
     },
-  }) as never);
+  }) as never }));
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
   const createDbMock = vi.fn(() => ({
     select: vi.fn(() => ({
@@ -96,6 +96,8 @@ const {
     })),
     reconcileHotRestartAdoption: vi.fn(async () => ({ mode: "none" })),
     reapOrphanedRuns: vi.fn(async () => ({ reaped: 0, runIds: [] })),
+    reconcileHighCommentVolumeAlerts: vi.fn(async () => ({ alerted: 0, failed: 0 })),
+    sweepStrandedDeferredWakes: vi.fn(async () => ({ promoted: 0, resolved: 0 })),
     promoteDueScheduledRetries: vi.fn(async () => ({ promoted: 0, runIds: [] })),
     resumeQueuedRuns: vi.fn(async () => undefined),
     recoverPendingSessionGoalActions: vi.fn(async () => ({ scanned: 0, enqueued: 0, alreadyQueued: 0, invalid: 0 })),
@@ -255,6 +257,7 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   ensurePostgresDatabase: vi.fn(),
   getPostgresDataDirectory: vi.fn(),
   inspectMigrations: vi.fn(async () => ({ status: "upToDate" })),
+  inspectMigrationPreflight: vi.fn(async () => ({ pending: [], drift: [], unverifiable: [] })),
   applyPendingMigrations: vi.fn(),
   reconcilePendingMigrationHistory: vi.fn(async () => ({ repairedMigrations: [] })),
   formatDatabaseBackupResult: vi.fn(() => "ok"),
@@ -404,7 +407,7 @@ vi.mock("../services/index.js", () => ({
   })),
 }));
 
-vi.mock("../services/chat-completion-delivery.js", async (importOriginal) => ({ ...(await importOriginal<Record<string, unknown>>()), chatCompletionDeliveryService: () => ({ hasPending: vi.fn(async () => false), sweepPending: completionSweepMock }) }));
+vi.mock("../services/chat-completion-delivery.js", async (importOriginal) => ({ ...(await importOriginal<typeof import("../services/chat-completion-delivery.js")>()), chatCompletionDeliveryService: () => ({ hasPending: vi.fn(async () => false), sweepPending: completionSweepMock }) }));
 
 // Only startup registration belongs here; real handoff persistence, authority,
 // and provider settlement are covered by the database-backed workflow suites.
@@ -857,8 +860,8 @@ describe("startServer feedback export wiring", () => {
     let intervalCallback: (() => void) | null = null;
     const setIntervalSpy = vi
       .spyOn(globalThis, "setInterval")
-      .mockImplementation(((callback: () => void) => {
-        intervalCallback = callback;
+      .mockImplementation(((callback: () => void, delay?: number) => {
+        if (delay === 30000) intervalCallback = callback;
         return 1 as unknown as ReturnType<typeof setInterval>;
       }) as typeof setInterval);
 
@@ -1032,9 +1035,7 @@ describe("startServer feedback export wiring", () => {
   });
 });
 
-// Quarantined (describe.skip): upstream-only startup wiring test; fork index.ts startup differs (mocks no longer match, real DB path reached).
-// Tracked with the native finalization port follow-up.
-describe.skip("startServer authenticated auth origin setup", () => {
+describe("startServer authenticated auth origin setup", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";
@@ -1095,9 +1096,7 @@ describe.skip("startServer authenticated auth origin setup", () => {
   });
 });
 
-// Quarantined (describe.skip): upstream-only startup wiring test; fork index.ts startup differs (mocks no longer match, real DB path reached).
-// Tracked with the native finalization port follow-up.
-describe.skip("startServer PAPERCLIP_API_URL handling", () => {
+describe("startServer PAPERCLIP_API_URL handling", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.PAPERCLIP_DECISION_SIGNING_SECRET = "fedcba9876543210fedcba9876543210";

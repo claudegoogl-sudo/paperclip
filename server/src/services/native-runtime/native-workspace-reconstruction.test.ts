@@ -354,7 +354,16 @@ describe("reconstruction after confirmed native workspace loss", () => {
         runId: second.run.id, reservationId: secondReservation.id, expectedStatus: "running", dispatch })).toMatchObject({ dispatched: true });
       await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
         resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, second.run.id));
-      expect(await heartbeat.scheduleBoundedRetry(second.run.id)).toMatchObject({ outcome: "retry_exhausted" });
+      // Fork retry ladder is longer than upstream's: drain remaining attempts until exhausted.
+      let last = second.run.id;
+      let outcome2: { outcome: string; run?: { id: string } | null } = await heartbeat.scheduleBoundedRetry(last, { now: new Date(), random: () => 0, delayMs: 0 });
+      for (let i = 0; i < 6 && outcome2.outcome === "scheduled" && outcome2.run; i++) {
+        last = outcome2.run.id;
+        await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(),
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } }).where(eq(heartbeatRuns.id, last));
+        outcome2 = await heartbeat.scheduleBoundedRetry(last, { now: new Date(), random: () => 0, delayMs: 0 });
+      }
+      expect(outcome2).toMatchObject({ outcome: "retry_exhausted" });
     }
   });
   it.each([false, true])("dispatches the assembled bootstrap retry without overwriting a later block: %s", async blockAfterClaim => {

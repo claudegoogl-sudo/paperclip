@@ -115,6 +115,8 @@ async function recoverLegacyCaseHandoffCleanup(db: Db, run: typeof heartbeatRuns
 
 /** Kept independent of the handoff application service to avoid an issues/service cycle. */
 export async function pendingCaseHandoffForRun(db: Db, runId: string, companyId?: string) {
+  // The run id can be an attacker-controlled header value: a non-UUID must not reach a uuid column (500).
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(runId)) return null;
   const scope = companyId ?? await db.select({ companyId: heartbeatRuns.companyId }).from(heartbeatRuns)
     .where(eq(heartbeatRuns.id, runId)).limit(1).then(rows => rows[0]?.companyId);
   if (!scope) return null;

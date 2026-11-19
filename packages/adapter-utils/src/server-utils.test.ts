@@ -44,6 +44,19 @@ import {
   WATCHDOG_DEFAULT_MANDATE,
 } from "./server-utils.js";
 
+const sshMock = vi.hoisted(() => ({ cleanup: null as null | (() => Promise<void>) }));
+
+vi.mock("./ssh.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./ssh.js")>();
+  return {
+    ...actual,
+    buildSshSpawnTarget: async (...args: Parameters<typeof actual.buildSshSpawnTarget>) => {
+      if (!sshMock.cleanup) return actual.buildSshSpawnTarget(...args);
+      return { args: [], cleanup: sshMock.cleanup };
+    },
+  };
+});
+
 it("keeps Pi draft models empty and preserves saved native Pi settings", () => {
   expect(normalizePaperclipRunnerAdapterConfig("paperclip_runner", { provider: "acpx", acpxAgent: "pi", model: "" })).toMatchObject({ provider: "acpx", acpxAgent: "pi", model: "" });
   const saved = { provider: "acpx", acpxAgent: "pi", model: "openrouter/provider/model", piThinkingLevel: "max", acpxPermissionMode: "approve-reads", lifecycleMode: "warm" };

@@ -19,6 +19,8 @@ import {
   folders,
   goals,
   heartbeatRuns,
+  issueInboxArchives,
+  issueRelations,
   issues,
   pluginManagedResources,
   plugins,
@@ -2231,6 +2233,7 @@ export function routineService(
         }
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+          const pinDescription = describePinningRuns(pinningRuns, triggeredAt);
           const updated = await finalizeRun(createdRun.id, {
             status,
             linkedIssueId: activeIssue.id,
@@ -2314,23 +2317,29 @@ export function routineService(
             kind: issueOriginKind,
             id: issueOriginId,
           });
-          if (!existingIssue) throw error;
-          const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
-          const updated = await finalizeRun(createdRun.id, {
-            status,
-            linkedIssueId: existingIssue.id,
-            coalescedIntoRunId: existingIssue.originRunId,
-            completedAt: triggeredAt,
-          }, txDb);
-          await updateRoutineTouchedState({
-            routineId: input.routine.id,
-            triggerId: input.trigger?.id ?? null,
-            triggeredAt,
-            status,
-            issueId: existingIssue.id,
-            nextRunAt,
-          }, txDb);
-          return updated ?? createdRun;
+          if (existingIssue) {
+            const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
+            const pinDescription = describePinningRuns(await loadPinningRuns(existingIssue, txDb), triggeredAt);
+            const updated = await finalizeRun(createdRun.id, {
+              status,
+              linkedIssueId: existingIssue.id,
+              coalescedIntoRunId: existingIssue.originRunId,
+              failureReason: `Pinned by issue ${existingIssue.id}: ${pinDescription}`,
+              completedAt: triggeredAt,
+            }, txDb);
+            await updateRoutineTouchedState({
+              routineId: input.routine.id,
+              triggerId: input.trigger?.id ?? null,
+              triggeredAt,
+              status,
+              issueId: existingIssue.id,
+              nextRunAt,
+              resultDetail: pinDescription,
+            }, txDb);
+            return updated ?? createdRun;
+          }
+
+          throw error;
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.

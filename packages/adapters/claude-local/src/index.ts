@@ -1,3 +1,4 @@
+import type { AdapterModel } from "@paperclipai/adapter-utils";
 export const DEFAULT_CLAUDE_LOCAL_MODEL = "claude-opus-5-5";
 
 /** Resolve Paperclip's default without replacing an explicit provider model. */

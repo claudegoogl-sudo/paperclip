@@ -59,6 +59,12 @@ import { isPiUnknownSessionError, parsePiJsonl, createPiJsonlParser } from "./pa
 import { createPiStdoutCompactor, resolvePiStdoutLogMode } from "./stdout-compaction.js";
 import { ensurePiModelConfiguredAndAvailable } from "./models.js";
 import { preparePiRuntimeConfig } from "./runtime-config.js";
+import {
+  armProviderWaitGuard,
+  providerWaitTimeoutResult,
+  resolveProviderWaitGuardConfig,
+  type ProviderWaitTimeoutInfo,
+} from "./provider-wait-guard.js";
 import { preparePiOpenRouterExtension } from "./openrouter-extension.js";
 import { SANDBOX_INSTALL_COMMAND } from "../index.js";
 

@@ -5,7 +5,9 @@ import {
   agentRuntimeState,
   agentTaskSessions,
   agents,
+  authUsers,
   companies,
+  companyMemberships,
   createDb,
   heartbeatRuns,
   issues,
@@ -115,6 +117,15 @@ describeEmbeddedPostgres("heartbeat system-session prompt-bundle resume params",
     tempDb = await startEmbeddedPostgresTestDatabase("paperclip-heartbeat-sys-session-");
     db = createDb(tempDb.connectionString);
     heartbeat = heartbeatService(db);
+    const now = new Date();
+    await db.insert(authUsers).values({
+      id: "responsible-user",
+      name: "Responsible User",
+      email: "responsible-user@example.test",
+      emailVerified: true,
+      createdAt: now,
+      updatedAt: now,
+    });
   }, 20_000);
 
   afterEach(async () => {
@@ -153,6 +164,13 @@ describeEmbeddedPostgres("heartbeat system-session prompt-bundle resume params",
       issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
       defaultResponsibleUserId: "responsible-user",
       requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(companyMemberships).values({
+      companyId,
+      principalType: "user",
+      principalId: "responsible-user",
+      status: "active",
+      membershipRole: "member",
     });
     await db.insert(agents).values({
       id: agentId,
@@ -264,6 +282,7 @@ describeEmbeddedPostgres("heartbeat system-session prompt-bundle resume params",
       id: issueId,
       companyId,
       title: "Per-issue work",
+      responsibleUserId: "responsible-user",
       status: "in_progress",
       priority: "medium",
       assigneeAgentId: agentId,

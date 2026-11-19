@@ -111,6 +111,64 @@ All persisted under your bind mount (`./data/docker-paperclip` in the example ab
 
 ## Docker Compose
 
+### Published ports bind to loopback by default
+
+Every port published by the shipped Compose files binds to `127.0.0.1`, so a
+default `docker compose up` is reachable from the host only, not from the
+network. Override the bind address when you deliberately want off-host access:
+
+| Variable | Default | Applies to |
+|----------|---------|------------|
+| `PAPERCLIP_BIND_ADDR` | `127.0.0.1` | Paperclip server port in `docker-compose.yml` and `docker-compose.quickstart.yml` |
+| `PAPERCLIP_DB_BIND_ADDR` | `127.0.0.1` | PostgreSQL port in `docker-compose.yml` |
+| `REVIEW_BIND_ADDR` | `127.0.0.1` | both ports in `docker-compose.untrusted-review.yml` |
+
+`PAPERCLIP_BIND_ADDR` covers the server port in *both* `docker-compose.yml` and
+`docker-compose.quickstart.yml`, and Compose auto-loads `docker/.env` — setting it
+there to widen one stack widens the other stack's server port on its next `up`
+too. The database port is unaffected; it has its own variable.
+
+IPv6 bind addresses need bracket syntax — `PAPERCLIP_BIND_ADDR=[::1]`, not `::1`.
+The bare form expands to `::1:3100:3100`, which Compose will not parse as a
+host/port mapping. Fix that by adding the brackets, not by reaching for `0.0.0.0`.
+
+```sh
+# Expose the UI on every interface; PostgreSQL stays on loopback.
+PAPERCLIP_BIND_ADDR=0.0.0.0 \
+PAPERCLIP_PUBLIC_URL=http://<host>:3100 \
+BETTER_AUTH_SECRET=$(openssl rand -hex 32) \
+  docker compose -f docker/docker-compose.quickstart.yml up --build
+```
+
+Server and database bind addresses are separate on purpose: exposing the UI
+should not implicitly expose PostgreSQL. `docker-compose.yml` will not start
+until you choose a PostgreSQL password (see
+[PostgreSQL password](#postgresql-password)), but keep the database on loopback
+regardless unless you specifically need off-host database access.
+
+> **UFW does not filter Docker-published ports.** Docker installs its own DNAT
+> rules in `nat/PREROUTING` and filters container traffic in the `DOCKER` chain
+> hanging off `FORWARD`, so published ports never traverse the `INPUT` chain
+> that UFW's default-deny policy governs. `ufw deny 5432` will be accepted, will
+> show up in `ufw status`, and will silently do nothing. The publish bind
+> address above is the effective control. If you also want firewall
+> enforcement, write the rule in the `DOCKER-USER` chain, which *is* consulted
+> for container traffic.
+>
+> `DOCKER-USER` sees the packet *after* DNAT, so the rule must match the
+> **container** port, not the published host port:
+>
+> ```sh
+> iptables -I DOCKER-USER -p tcp --dport 3100 ! -s 127.0.0.1 -j DROP
+> ```
+>
+> With a remapped host port (`PAPERCLIP_PORT=3200`) a `--dport 3200` rule matches
+> nothing — the same silent no-op as `ufw deny`. Match the pre-DNAT destination
+> instead:
+>
+> ```sh
+> iptables -I DOCKER-USER -p tcp -m conntrack --ctorigdstport 3200 ! -s 127.0.0.1 -j DROP
+> ```
 ### Persistent signing secrets
 
 Before the first launch, generate two independent values with `openssl rand -hex 32`
@@ -185,6 +243,7 @@ docker compose -f docker/docker-compose.yml up --build
 
 PostgreSQL data persists in a named Docker volume (`pgdata`). Paperclip data persists in `paperclip-data`.
 
+Both published ports bind to `127.0.0.1` by default (see [Published ports bind to loopback by default](#published-ports-bind-to-loopback-by-default)). The server reaches PostgreSQL over the Compose network at `db:5432`, so the published `5432` exists only for host-side tooling such as `psql -h 127.0.0.1`.
 Both Compose files pass `PAPERCLIP_TOOL_ACTION_SIGNING_SECRET` to the server.
 Set it to enable signed tool-action approvals, and keep it independent from
 `BETTER_AUTH_SECRET`. Leaving it unset preserves startup without approval-gated

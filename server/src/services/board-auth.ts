@@ -427,6 +427,10 @@ export function boardAuthService(db: Db) {
       approvedAt: challenge.approvedAt?.toISOString() ?? null,
       cancelledAt: challenge.cancelledAt?.toISOString() ?? null,
       expiresAt: challenge.expiresAt.toISOString(),
+      // What the approver is granting: the key's scope kind and its lifetime
+      // from approval. Uses the same defaults as the mint site below.
+      keyScope: (challenge.pendingKeyScopeConfig ?? { kind: "plugin_ops" }).kind ?? "standard",
+      keyTtlMs: boardApiKeyTtlMsForScope(challenge.pendingKeyScopeConfig ?? { kind: "plugin_ops" }),
       approvedByUser: null,
     };
   }

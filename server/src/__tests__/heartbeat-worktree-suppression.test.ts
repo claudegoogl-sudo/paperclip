@@ -8,10 +8,17 @@ import {
   authUsers,
   agentWakeupRequests,
   agentRuntimeState,
+  companySkills,
   companies,
   companyMemberships,
   createDb,
+  documentRevisions,
+  documents,
+  heartbeatRunEvents,
   heartbeatRuns,
+  instanceSettings,
+  issueComments,
+  issueDocuments,
   issues,
 } from "@paperclipai/db";
 import {
@@ -19,7 +26,6 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
-import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService, resolveHeartbeatSchedulingSuppression } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -66,13 +72,6 @@ describeEmbeddedPostgres("heartbeat worktree suppression", () => {
       email: `worktree-${id}@example.test`, createdAt: new Date(), updatedAt: new Date() })));
   }, 20_000);
 
-  // The "still creates live-plane assignment runs" case below deliberately lets
-  // heartbeatService dispatch a real run, which keeps writing agent_runtime_state
-  // (and friends) in the background after the test function returns. An ordered
-  // per-table DELETE chain races that write burst and intermittently trips an FK
-  // violation on whichever table gets deleted out from under a still-in-flight
-  // insert — this is the same race reproduced in another suite; see resetEmbeddedPostgresTestDatabase for why
-  // an atomic TRUNCATE ... CASCADE doesn't have that race.
   afterEach(async () => {
     // Await every in-flight background heartbeat run to quiescence before the
     // deletes below. A live wakeup claims a run and dispatches its execution

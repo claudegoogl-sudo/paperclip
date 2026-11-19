@@ -38,6 +38,19 @@ vi.mock("../services/index.js", () => ({
   deduplicateAgentName: vi.fn((name: string) => name),
 }));
 
+function registerModuleMocks() {
+  vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
+
+  vi.doMock("../services/index.js", () => ({
+    accessService: () => mockAccessService,
+    agentService: () => mockAgentService,
+    boardAuthService: () => mockBoardAuthService,
+    logActivity: mockLogActivity,
+    notifyHireApproved: vi.fn(),
+    deduplicateAgentName: vi.fn((name: string) => name),
+  }));
+}
+
 let appImportCounter = 0;
 
 async function createApp(actor: any, db: any = {} as any, options: { cliAuthCreateRateLimiter?: InviteRateLimiter; cliAuthPollRateLimiter?: InviteRateLimiter } = {}) {
@@ -80,8 +93,17 @@ async function createApp(actor: any, db: any = {} as any, options: { cliAuthCrea
 }
 
 describe("cli auth routes", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
+    vi.resetModules();
+    vi.doUnmock("../services/index.js");
+    vi.doUnmock("../routes/authz.js");
+    vi.doUnmock("../routes/access.js");
+    vi.doUnmock("../middleware/index.js");
+    registerModuleMocks();
     vi.resetAllMocks();
+    // Cold route transforms are fixture setup, not HTTP request latency.
+    // Use the hook budget while preserving the request tests' normal timeout.
+    await Promise.all([import("../routes/access.js"), import("../middleware/index.js")]);
   });
 
   it("creates a CLI auth challenge with approval metadata", async () => {
@@ -426,8 +448,7 @@ describe("cli auth routes", () => {
   });
 
   it("creates a named board API key and logs audit activity", async () => {
-    // Computed, not hard-coded: expiry must be in the future for the schema.
-    const successorExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    const keyExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
     mockBoardAuthService.createNamedBoardApiKey.mockResolvedValue({
       id: "board-key-4",
       name: "external-admin",
@@ -435,7 +456,7 @@ describe("cli auth routes", () => {
       createdAt: new Date("2026-05-23T12:00:00.000Z"),
       lastUsedAt: null,
       revokedAt: null,
-      expiresAt: successorExpiresAt,
+      expiresAt: keyExpiresAt,
     });
     mockBoardAuthService.resolveBoardActivityCompanyIds.mockResolvedValue(["11111111-1111-4111-8111-111111111111"]);
 
@@ -451,7 +472,7 @@ describe("cli auth routes", () => {
       .send({
         name: "external-admin",
         requestedCompanyId: "11111111-1111-4111-8111-111111111111",
-        expiresAt: successorExpiresAt.toISOString(),
+        expiresAt: keyExpiresAt.toISOString(),
         scope: { kind: "plugin_ops" },
       });
 
@@ -460,12 +481,12 @@ describe("cli auth routes", () => {
       id: "board-key-4",
       name: "external-admin",
       token: "pcp_board_plaintext",
-      expiresAt: successorExpiresAt.toISOString(),
+      expiresAt: keyExpiresAt.toISOString(),
     });
     expect(mockBoardAuthService.createNamedBoardApiKey).toHaveBeenCalledWith({
       userId: "user-1",
       name: "external-admin",
-      expiresAt: successorExpiresAt,
+      expiresAt: keyExpiresAt,
       scope: { kind: "plugin_ops" },
     });
     expect(mockLogActivity).toHaveBeenCalledWith(

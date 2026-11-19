@@ -340,7 +340,7 @@ describe("claude remote execution", () => {
           // no configured skills, but the operational skill is always mounted for
           // legacy adapters (upstream's resolveLegacyPaperclipDesiredSkillNames)
           // and its library manifest participates in the bundle hash.
-          promptBundleKey: "94a42440a8a57bce7460dc06381fd0b1131b3b442cbdd42555321a98c2f086c2",
+          promptBundleKey: "37290853dbb838d4a84b1197bbd64994b86ae34a033059e3bbaa7783cbdef827",
           remoteExecution: {
             transport: "ssh",
             host: "127.0.0.1",
@@ -622,7 +622,7 @@ describe("claude remote execution", () => {
       },
       runtime: {
         sessionId: "12345678-1234-4abc-9def-123456789012",
-        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "94a42440a8a57bce7460dc06381fd0b1131b3b442cbdd42555321a98c2f086c2" },
+        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "37290853dbb838d4a84b1197bbd64994b86ae34a033059e3bbaa7783cbdef827" },
         sessionDisplayId: "12345678-1234-4abc-9def-123456789012",
         taskKey: null,
       },

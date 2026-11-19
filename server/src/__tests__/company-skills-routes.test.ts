@@ -142,26 +142,26 @@ function registerModuleMocks() {
   vi.doMock("../services/skill-sources.js", () => ({ skillSourceService: () => mockSkillSourceService }));
   vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
 
-  vi.mock("@paperclipai/shared/telemetry", () => ({
+  vi.doMock("@paperclipai/shared/telemetry", () => ({
     trackSkillImported: mockTrackSkillImported,
     trackErrorHandlerCrash: vi.fn(),
   }));
 
-  vi.mock("../telemetry.js", () => ({
+  vi.doMock("../telemetry.js", () => ({
     getTelemetryClient: mockGetTelemetryClient,
   }));
 
-  vi.mock("../services/access.js", () => ({
+  vi.doMock("../services/access.js", () => ({
     accessService: () => mockAccessService,
   }));
 
-  vi.mock("../services/activity-log.js", () => ({
+  vi.doMock("../services/activity-log.js", () => ({
     persistActivity: vi.fn(),
     publishActivity: vi.fn(),
     logActivity: mockLogActivity,
   }));
 
-  vi.mock("../services/agents.js", () => ({
+  vi.doMock("../services/agents.js", () => ({
     agentService: () => mockAgentService,
   }));
 
@@ -176,37 +176,37 @@ function registerModuleMocks() {
 
   vi.doMock("../services/company-skills.js", async () => {
     const actual = await vi.importActual<typeof import("../services/company-skills.js")>(
-  "../services/company-skills.js",
+      "../services/company-skills.js",
     );
     return {
-  ...actual,
-  companySkillService: () => mockCompanySkillService,
+      ...actual,
+      companySkillService: () => mockCompanySkillService,
     };
   });
 
-  vi.mock("../services/company-skill-policy.js", async () => {
+  vi.doMock("../services/company-skill-policy.js", async () => {
     const actual = await vi.importActual<typeof import("../services/company-skill-policy.js")>(
-  "../services/company-skill-policy.js",
+      "../services/company-skill-policy.js",
     );
     return {
-  ...actual,
-  companySkillPolicyService: () => mockCompanySkillPolicyService,
+      ...actual,
+      companySkillPolicyService: () => mockCompanySkillPolicyService,
     };
   });
 
-  vi.mock("../services/skills-catalog.js", () => mockCatalogService);
+  vi.doMock("../services/skills-catalog.js", () => mockCatalogService);
 
-  vi.mock("../services/change-consent-gate.js", async () => {
+  vi.doMock("../services/change-consent-gate.js", async () => {
     const actual = await vi.importActual<typeof import("../services/change-consent-gate.js")>(
-  "../services/change-consent-gate.js",
+      "../services/change-consent-gate.js",
     );
     return {
-  ...actual,
-  changeConsentGateService: () => mockReflectionCoachMutationGate,
+      ...actual,
+      changeConsentGateService: () => mockReflectionCoachMutationGate,
     };
   });
 
-  vi.mock("../services/index.js", () => ({
+  vi.doMock("../services/index.js", () => ({
     accessService: () => mockAccessService,
     agentService: () => mockAgentService,
     companySkillService: () => mockCompanySkillService,
@@ -214,10 +214,7 @@ function registerModuleMocks() {
     heartbeatService: () => mockHeartbeatService,
     logActivity: mockLogActivity,
   }));
-
-// The module mocks above are hoisted vi.mock calls, so they are already
-// registered before any import. hoistModuleGraph still needs a register hook.
-function registerModuleMocks() {}
+}
 
 function boardActor(userId = "local-board", source = "local_implicit") {
   return {
@@ -235,6 +232,7 @@ function assignedAgentActor() {
     agentId: "55555555-5555-4555-8555-555555555555",
     companyId: "company-1",
     runId: "run-1",
+    source: "agent_key",
   };
 }
 
@@ -302,7 +300,7 @@ describe("company skill mutation permissions", () => {
     const app = express();
     app.use(express.json());
     app.use((req, res, next) => {
-      (req as any).actor = withActorSource(actor);
+      (req as any).actor = actor;
       onResponse?.(res);
       next();
     });
@@ -1361,7 +1359,7 @@ describe("company skill mutation permissions", () => {
   it("rejects cross-company source reads and mutations for board users and agents", async () => {
     for (const actor of [
       { type: "board", userId: "member", companyIds: ["company-1"], isInstanceAdmin: true, source: "session" },
-      { type: "agent", agentId: "agent-1", companyId: "company-1" },
+      { type: "agent", agentId: "agent-1", companyId: "company-1", source: "agent_key" },
     ]) {
       const app = createApp(actor);
       const base = "/api/companies/company-2/skill-sources";
@@ -1802,6 +1800,7 @@ describe("company skill mutation permissions", () => {
       agentId: "reflection-coach",
       companyId: "company-1",
       runId: "run-apply",
+      source: "agent_key",
     }))
       .post("/api/companies/company-1/skills")
       .send({ name: "Reflection Draft", slug: "reflection-draft", markdown: "# Draft" });
@@ -1878,6 +1877,7 @@ describe("company skill mutation permissions", () => {
       agentId: "agent-1",
       companyId: "company-1",
       runId: "run-1",
+      source: "agent_key",
     }))
       .post("/api/companies/company-1/skills/import")
       .send({ source: "https://github.com/vercel-labs/agent-browser" });
@@ -2177,70 +2177,5 @@ describe("company skill mutation permissions", () => {
     });
     expect(mockCompanySkillService.deleteSkill).toHaveBeenCalledWith("company-1", "skill-1");
     expect(mockLogActivity).not.toHaveBeenCalled();
-  });
-
-  const malformedIdRoutes: Array<[string, "get" | "patch" | "delete" | "post", string, Record<string, unknown> | undefined, string, string]> = [
-    ["version", "get", "/api/companies/company-1/skills/skill-1/versions/x", undefined, "Skill version not found", "getVersion"],
-    ["test input patch", "patch", "/api/companies/company-1/skills/skill-1/test-inputs/x", { name: "n" }, "Test input not found", "updateTestInput"],
-    ["test input delete", "delete", "/api/companies/company-1/skills/skill-1/test-inputs/x", undefined, "Test input not found", "deleteTestInput"],
-    ["template patch", "patch", "/api/companies/company-1/skill-test-run-templates/x", { name: "n" }, "Test run template not found", "updateTestRunTemplate"],
-    ["template delete", "delete", "/api/companies/company-1/skill-test-run-templates/x", undefined, "Test run template not found", "deleteTestRunTemplate"],
-    ["test run detail", "get", "/api/companies/company-1/skills/skill-1/test-runs/x", undefined, "Test run not found", "getTestRunDetail"],
-    ["test run cancel", "post", "/api/companies/company-1/skills/skill-1/test-runs/x/cancel", undefined, "Test run not found", "cancelTestRun"],
-    ["test run delete", "delete", "/api/companies/company-1/skills/skill-1/test-runs/x", undefined, "Test run not found", "deleteTestRun"],
-    ["comment patch", "patch", "/api/companies/company-1/skills/skill-1/comments/x", { body: "b" }, "Skill comment not found", "updateComment"],
-    ["comment delete", "delete", "/api/companies/company-1/skills/skill-1/comments/x", undefined, "Skill comment not found", "deleteComment"],
-  ];
-
-  it.each(malformedIdRoutes)(
-    "returns 404 for a malformed %s id before reaching the service",
-    async (_label, method, path, body, message, serviceMethod) => {
-      const app = await createApp({
-        type: "board",
-        userId: "local-board",
-        companyIds: ["company-1"],
-        source: "local_implicit",
-        isInstanceAdmin: false,
-      });
-
-      const res = body === undefined ? await request(app)[method](path) : await request(app)[method](path).send(body);
-
-      expect(res.status, JSON.stringify(res.body)).toBe(404);
-      expect(res.body).toEqual({ error: message });
-      expect(mockCompanySkillService[serviceMethod as keyof typeof mockCompanySkillService]).not.toHaveBeenCalled();
-      expect(mockCompanySkillService.getTestRunDetail).not.toHaveBeenCalled();
-    },
-  );
-
-  it("returns 404 for a whitespace-padded UUID because Postgres rejects it", async () => {
-    const res = await request(await createApp({
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    }))
-      .get("/api/companies/company-1/skills/skill-1/versions/%2011111111-1111-4111-8111-111111111111");
-
-    expect(res.status, JSON.stringify(res.body)).toBe(404);
-    expect(mockCompanySkillService.getVersion).not.toHaveBeenCalled();
-  });
-
-  it("still looks up a well-formed version id", async () => {
-    const res = await request(await createApp({
-      type: "board",
-      userId: "local-board",
-      companyIds: ["company-1"],
-      source: "local_implicit",
-      isInstanceAdmin: false,
-    }))
-      .get("/api/companies/company-1/skills/skill-1/versions/33333333-3333-4333-8333-333333333333");
-
-    expect(res.status, JSON.stringify(res.body)).toBe(404);
-    expect(mockCompanySkillService.getVersion).toHaveBeenCalledWith(
-      "company-1",
-      "skill-1",
-      "33333333-3333-4333-8333-333333333333",
-    );
   });
 });

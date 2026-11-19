@@ -65,6 +65,7 @@
     "@modelcontextprotocol/sdk": "^1.31.0",
     "@openrouter/ai-sdk-provider": "3.1.0",
     "@opentelemetry/api": "^1.9.0",
+    "@paperclipai/adapter-acpx-local": "workspace:*",
     "@opentelemetry/otlp-transformer": "0.221.0",
     "@paperclipai/adapter-claude-local": "workspace:*",
     "@paperclipai/adapter-codex-local": "workspace:*",

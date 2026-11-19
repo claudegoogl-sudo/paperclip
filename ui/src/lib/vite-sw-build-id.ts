@@ -87,6 +87,18 @@ export function serviceWorkerBuildIdPlugin(
     },
     closeBundle() {
       const swPath = path.resolve(root, outDir, serviceWorkerFileName);
+      // Rolldown-based Vite runs closeBundle once per emitted bundle, and
+      // sub-builds (web-worker chunks, lib passes) close before the main
+      // bundle's assets land in the outDir. Those passes saw no entry chunk,
+      // so skip them silently; the main pass stamps after its emit. A missing
+      // sw.js on the main pass is still a hard failure — the worker would
+      // never rotate.
+      if (!fs.existsSync(swPath)) {
+        if (!sawMainBundle) return;
+        throw new Error(
+          `${swPath} was not emitted with the main bundle; the build cannot stamp the service-worker build id`,
+        );
+      }
       const source = fs.readFileSync(swPath, "utf8");
       const css = fs.readFileSync(path.resolve(root, "src/index.css"), "utf8");
       const stamped = stampServiceWorkerBuildId(

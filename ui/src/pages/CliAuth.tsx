@@ -8,6 +8,19 @@ import { ApiError } from "../api/client";
 import { authApi } from "../api/auth";
 import { queryKeys } from "../lib/queryKeys";
 
+export function describeKeyScope(scope: string | undefined) {
+  if (scope === "plugin_ops") return "Plugin operations (plugin_ops)";
+  if (scope === "standard") return "Full board authority (standard)";
+  return scope ? `Unknown (${scope}) - treat as full board authority` : "Unknown";
+}
+
+export function describeKeyTtl(ttlMs: number | undefined) {
+  if (typeof ttlMs !== "number" || !Number.isFinite(ttlMs) || ttlMs <= 0) return "unknown";
+  const hours = Math.round(ttlMs / (60 * 60 * 1000));
+  if (hours < 48) return `${hours} h`;
+  return `${Math.round(hours / 24)} days`;
+}
+
 function cliAuthRetryDelay(error: unknown): number {
   const body = error instanceof ApiError && error.body && typeof error.body === "object"
     ? error.body as { details?: unknown } : null;

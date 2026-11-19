@@ -11,6 +11,7 @@ import {
   costEvents,
   activityLog,
   agentRuntimeState,
+  agentTaskSessions,
   agentWakeupRequests,
   agents,
   companies,
@@ -18,9 +19,16 @@ import {
   companyMemberships,
   companySkills,
   createDb,
+  documentRevisions,
+  documents,
+  environmentLeases,
+  environments,
   executionWorkspaces,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
+  issueDocuments,
+  issuePlanDecompositions,
   issues,
   projects,
   projectWorkspaces,
@@ -31,7 +39,6 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
-import { resetEmbeddedPostgresTestDatabase } from "./helpers/reset-test-database.js";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 
@@ -266,6 +273,14 @@ describeEmbeddedPostgres("heartbeat workspace finalization branch guard", () => 
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   afterEach(async () => {
+    // Await every in-flight background heartbeat run to quiescence before the
+    // deletes below. A wakeup claims a run and dispatches its execution
+    // fire-and-forget, and finalization success can dispatch a follow-up
+    // wakeup, so a run or wakeup can still write heartbeat_runs and issues rows
+    // when teardown starts. The shared drain also awaits an in-flight wakeup
+    // that is still before run registration, which a plain run table status
+    // poll cannot see.
+    await drainHeartbeatRunsToQuiescence(db, heartbeatService(db));
     adapterExecute.mockReset();
     adapterExecute.mockImplementation(async () => ({
       exitCode: 0,

@@ -3003,6 +3003,7 @@ export function accessRoutes(
   });
 
   router.post("/cli-auth/revoke-current", async (req, res) => {
+    if (req.actor.type === "none") throw unauthorized("Board API key required");
     if (req.actor.type !== "board" || req.actor.source !== "board_key") {
       throw badRequest("Current board API key context is required");
     }

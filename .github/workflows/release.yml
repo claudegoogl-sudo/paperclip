@@ -382,8 +382,8 @@ jobs:
       runner_binaries_only: true
 
   publish_canary:
-    if: ${{ !cancelled() && github.event_name == 'push' && needs.verify_canary.result == 'success' && needs.release_runner_source.result == 'success' && (needs.release_runner_source.outputs.required == 'false' || needs.release_runner_binaries.result == 'success') }}
-    needs: [verify_canary, release_runner_source, release_runner_binaries]
+    if: github.event_name == 'push' && github.repository == 'paperclipai/paperclip'
+    needs: verify_canary
     runs-on: ubuntu-latest
     timeout-minutes: 150
     environment: npm-canary

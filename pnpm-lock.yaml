@@ -40,7 +40,7 @@ patchedDependencies:
     hash: vbylpnnxt5av2zdnuqmf6hjyjy
     path: patches/@discordjs__ws@1.2.3.patch
   acpx@0.12.0:
-    hash: vd7yjsirzglmfodiiuscqdnmqm
+    hash: vy6fb6n55os5u5npip6zprge7q
     path: patches/acpx@0.12.0.patch
   acpx@0.13.1:
     hash: j4huaoi2baejrlq7vdcgzlx54m
@@ -161,7 +161,7 @@ importers:
         version: link:../shared
       acpx:
         specifier: 0.12.0
-        version: 0.12.0(patch_hash=vd7yjsirzglmfodiiuscqdnmqm)
+        version: 0.12.0(patch_hash=vy6fb6n55os5u5npip6zprge7q)
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -192,7 +192,7 @@ importers:
         version: 0.12.0
       acpx:
         specifier: 0.12.0
-        version: 0.12.0(patch_hash=vd7yjsirzglmfodiiuscqdnmqm)
+        version: 0.12.0(patch_hash=vy6fb6n55os5u5npip6zprge7q)
       picocolors:
         specifier: ^1.1.1
         version: 1.1.1
@@ -978,6 +978,9 @@ importers:
       '@opentelemetry/resources':
         specifier: 2.10.0
         version: 2.10.0(@opentelemetry/api@1.9.1)
+      '@paperclipai/adapter-acpx-local':
+        specifier: workspace:*
+        version: link:../packages/adapters/acpx-local
       '@paperclipai/adapter-claude-local':
         specifier: workspace:*
         version: link:../packages/adapters/claude-local
@@ -8976,6 +8979,11 @@ packages:
   typed-emitter@2.1.0:
     resolution: {integrity: sha512-g/KzbYKbH5C2vPkaXGu8DJlHrGKHLsM25Zg9WuC9pMGfuvT+X25tZQWo5fK1BjBm8+UrVE9LDCvaY0CQk+fXDA==}
 
+  typescript@5.9.3:
+    resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
+    engines: {node: '>=14.17'}
+    hasBin: true
+
   typescript@7.0.2:
     resolution: {integrity: sha512-8FYau96o3NKOhbjKi/qNvG/W5jhzxkbdm5sj9AbZ/5T5sWqn3hJgLfGx27sRKZWTvyzCP8dLRBTf5tBTSRVUNA==}
     engines: {node: '>=16.20.0'}
@@ -9426,6 +9434,15 @@ snapshots:
 
   '@adobe/css-tools@4.5.0': {}
 
+  '@agentclientprotocol/claude-agent-acp@0.52.0(@anthropic-ai/sdk@0.129.0(zod@4.6.5))(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))':
+    dependencies:
+      '@agentclientprotocol/sdk': 1.0.0(zod@4.6.5)
+      '@anthropic-ai/claude-agent-sdk': 0.3.191(@anthropic-ai/sdk@0.129.0(zod@4.6.5))(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))(zod@4.6.5)
+      zod: 4.6.5
+    transitivePeerDependencies:
+      - '@anthropic-ai/sdk'
+      - '@modelcontextprotocol/sdk'
+
   '@agentclientprotocol/claude-agent-acp@0.73.0(patch_hash=riqgguivxjxydoydnzpedjy5au)(@anthropic-ai/sdk@0.129.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.31.0(zod@4.4.3))':
     dependencies:
       '@agentclientprotocol/sdk': 1.4.0(zod@4.4.3)
@@ -9609,6 +9626,21 @@ snapshots:
 
   '@anthropic-ai/claude-agent-sdk-win32-x64@0.3.286':
     optional: true
+
+  '@anthropic-ai/claude-agent-sdk@0.3.191(@anthropic-ai/sdk@0.129.0(zod@4.6.5))(@modelcontextprotocol/sdk@1.31.0(zod@4.6.5))(zod@4.6.5)':
+    dependencies:
+      '@anthropic-ai/sdk': 0.129.0(zod@4.6.5)
+      '@modelcontextprotocol/sdk': 1.31.0(zod@4.6.5)
+      zod: 4.6.5
+    optionalDependencies:
+      '@anthropic-ai/claude-agent-sdk-darwin-arm64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-darwin-x64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-arm64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-arm64-musl': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-x64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-linux-x64-musl': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-win32-arm64': 0.3.191
+      '@anthropic-ai/claude-agent-sdk-win32-x64': 0.3.191
 
   '@anthropic-ai/claude-agent-sdk@0.3.286(@anthropic-ai/sdk@0.129.0(zod@4.4.3))(@modelcontextprotocol/sdk@1.31.0(zod@4.4.3))(zod@4.4.3)':
     dependencies:
@@ -10041,7 +10073,7 @@ snapshots:
       jose: 6.2.10
       kysely: 0.29.5
       nanostores: 1.5.3
-      zod: 4.4.3
+      zod: 4.6.5
     optionalDependencies:
       '@opentelemetry/api': 1.9.1
 
@@ -14024,7 +14056,7 @@ snapshots:
 
   acorn@8.18.0: {}
 
-  acpx@0.12.0(patch_hash=vd7yjsirzglmfodiiuscqdnmqm):
+  acpx@0.12.0(patch_hash=vy6fb6n55os5u5npip6zprge7q):
     dependencies:
       '@agentclientprotocol/sdk': 1.4.0(zod@4.6.5)
       commander: 15.0.0
@@ -17569,6 +17601,8 @@ snapshots:
   typed-emitter@2.1.0:
     optionalDependencies:
       rxjs: 7.8.2
+
+  typescript@5.9.3: {}
 
   typescript@7.0.2:
     optionalDependencies:

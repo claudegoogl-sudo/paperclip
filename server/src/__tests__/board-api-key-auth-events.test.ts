@@ -105,7 +105,7 @@ describeEmbeddedPostgres("board API key auth events", () => {
   it("logs a revoked-key attempt as outcome=revoked, attributed to the key id", async () => {
     const boardAuth = boardAuthService(db);
     const created = await boardAuth.createNamedBoardApiKey({ userId: operatorUserId, name: "revoked-key" });
-    await boardAuth.revokeBoardApiKey(created.id);
+    await boardAuth.revokeBoardApiKey(created.id, { userId: operatorUserId, revokedVia: "board_api_key_lifecycle" });
     const app = buildApp();
 
     const res = await request(app).get("/api/ping").set("Authorization", `Bearer ${created.token}`);
@@ -151,7 +151,7 @@ describeEmbeddedPostgres("board API key auth events", () => {
     const created = await boardAuth.createNamedBoardApiKey({ userId: operatorUserId, name: "query-key" });
     const app = buildApp();
     await request(app).get("/api/ping").set("Authorization", `Bearer ${created.token}`);
-    await boardAuth.revokeBoardApiKey(created.id);
+    await boardAuth.revokeBoardApiKey(created.id, { userId: operatorUserId, revokedVia: "board_api_key_lifecycle" });
     await request(app).get("/api/ping").set("Authorization", `Bearer ${created.token}`);
 
     // The query documented in the PR description: "what did key X do, from

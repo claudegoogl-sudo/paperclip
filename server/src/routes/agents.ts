@@ -2730,11 +2730,11 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     path = "adapterConfig",
   ) {
+    assertNoAgentProtectedAdapterConfigMutation(req, adapterConfig, path);
     if (req.actor.type === "agent" && hasOwn(adapterConfig, "homeMode"))
       throw forbidden("Only an operator can configure Runner homeMode.");
     if (req.actor.type === "agent" && ["dotAttachmentAccess", "dotWorkspaceAccess", "dotBindingId", "externalBindingId", "museBindingId", "museGeneration", "museConnection"].some(key => hasOwn(adapterConfig, key)))
       throw forbidden("Only an operator can configure external-agent pairing, attachment access, or workspace access.");
-    assertNoAgentInstructionsConfigMutation(req, adapterConfig, path);
     assertNoAgentHostWorkspaceCommandMutation(
       req,
       collectAgentAdapterWorkspaceCommandPaths(adapterConfig, path),
@@ -5498,6 +5498,8 @@ export function agentRoutes(
       res.status(422).json({ error: "Use /api/agents/:id/permissions for permission changes" });
       return;
     }
+
+    assertAgentCrossAgentPatchIsModelOnly(req, existing, req.body as Record<string, unknown>);
 
     const runtimeSettings = req.body.runtimeSettings;
     if (runtimeSettings) await assertCanConfigureAgentSetup(req, existing);

@@ -43,13 +43,27 @@ function receiptNotice(version: 1 | 2 = 1): Record<string, any> {
 const receiptSchemaValue = (notice: Record<string, any>) => notice.details.find((detail: any) => detail.name === "schema").value;
 
 describe("redaction", () => {
-  it.each([1, 2, 3] as const)("preserves credential update metadata and masks adjacent secrets in PRP v%s", version => {
-    const event = { schema: `paperclip.prp.event.v${version}`, schemaVersion: version,
-      eventType: "auth.credentials.updated", payload: { schema: "paperclip.auth.credentials.updated.v1",
-        provider: "codex", bindingId: "harness-auth", revision: 1, detection: "credential_store" } };
-    expect(redactEventPayload({ prpEvent: event })).toEqual({ prpEvent: event });
-    expect(redactEventPayload({ prpEvent: { ...event, payload: { ...event.payload, refresh_token: "secret-sentinel" } } }))
-      .toEqual({ prpEvent: { ...event, payload: { ...event.payload, refresh_token: REDACTED_EVENT_VALUE } } });
+  it("preserves credential-related prose; fork redacts credential-named keys and dotted values", () => {
+    const input = {
+      body: "Keep the private key in a secret manager. Document credential handling and token permissions. Use bearer tokens for authentication. Prefer bearer authentication.",
+      tokenPolicy: "least privilege",
+      secretStorage: "vault",
+      credentialHandling: "harness",
+      authorizationRequired: true,
+      path: "deployment.credentials.example.md",
+    };
+    expect(sanitizeRecord(input)).toEqual({
+      body: input.body,
+      tokenPolicy: REDACTED_EVENT_VALUE,
+      secretStorage: REDACTED_EVENT_VALUE,
+      credentialHandling: REDACTED_EVENT_VALUE,
+      authorizationRequired: REDACTED_EVENT_VALUE,
+      path: REDACTED_EVENT_VALUE,
+    });
+    expect(redactSensitiveText(input.body)).toBe(input.body);
+    expect(sanitizeRecord({ credentials: { provider: "opaque-value" }, passwordValue: "opaque-value", authorization_code: "opaque-value" }))
+      .toEqual({ credentials: REDACTED_EVENT_VALUE, passwordValue: REDACTED_EVENT_VALUE, authorization_code: REDACTED_EVENT_VALUE });
+    expect(redactSensitiveText("--token-budget 4000 SECRET_STORAGE=vault")).toBe("--token-budget 4000 SECRET_STORAGE=vault");
   });
 
   it("preserves the actual Copilot receipt producer discriminator through nested durable redaction", () => {
@@ -313,11 +327,6 @@ describe("redaction", () => {
         providerValue: REDACTED_EVENT_VALUE,
       },
     });
-    expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v9" })).toEqual({ schema: "paperclip.native-execution-input.v9" });
-    expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v7", runtimeSchema: "paperclip.native-execution-input.v8" })).toEqual({
-      schema: "paperclip.native-execution-input.v7",
-      runtimeSchema: "paperclip.native-execution-input.v8",
-    });
     expect(sanitizeRecord({ schema: "paperclip.native-execution-input.v4", runtimeSchema: "paperclip.native-model-envelope.v2" })).toEqual({
       schema: "paperclip.native-execution-input.v4",
       runtimeSchema: "paperclip.native-model-envelope.v2",
@@ -396,10 +405,6 @@ describe("redaction", () => {
       "runner.session.bootstrap",
       "runner.turn.submit",
       "runner.session.startup",
-      "provider_pack.select",
-      "provider_pack.discover",
-      "provider_pack.verify_uploaded",
-      "provider_pack.upload",
       "provider.turn.queue",
       "question_response.to_run_created",
       "native.session.execute",

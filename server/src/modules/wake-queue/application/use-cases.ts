@@ -159,7 +159,7 @@ async function runReleaseDrain(
 
   while (true) {
     const candidate = await ports.transaction.findNextDeferredWake({
-      companyId: run.companyId, issueId: issue.id,
+      companyId: run.companyId, issueId: drainIssue.id,
       ...(preservedWakeIds.length ? { excludedWakeIds: preservedWakeIds } : {}),
     });
     if (!candidate) break;
@@ -203,8 +203,8 @@ async function runReleaseDrain(
     const ordinaryTaskComment = !candidate.authorizedFailedChatRetry && candidate.payload.mutation !== "interaction" &&
       !candidate.preservesIndependentContinuation && candidate.queuedCommentIds.length > 0 &&
       ["issue_commented", "issue_reopened_via_comment"].includes(candidate.wakeReason ?? candidate.reason ?? "");
-    if (ordinaryTaskComment && candidate.agentId !== issue.assigneeAgentId) {
-      if (input.resumeStrandedQueue || run.agentId !== issue.assigneeAgentId) {
+    if (ordinaryTaskComment && candidate.agentId !== drainIssue.assigneeAgentId) {
+      if (input.resumeStrandedQueue || run.agentId !== drainIssue.assigneeAgentId) {
         // The old owner can release before assignment admission adopts these
         // exact IDs. Leave its receipt intact, skip it for this drain, and let
         // a current-assignee wake behind it proceed.
