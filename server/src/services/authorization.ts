@@ -25,6 +25,7 @@ import {
 } from "@paperclipai/db";
 import type {
   AgentApiKeyScope,
+  BoardApiKeyScope,
   InboxAgentPolicyMode,
   PermissionKey,
   PrincipalType,
@@ -34,6 +35,7 @@ import type {
 import {
   LOW_TRUST_REVIEW_PRESET,
   extractAgentMentionIds,
+  isUuidLike,
   trustPresetSchema,
   lowTrustBoundarySchema,
   lowTrustReviewPresetPolicySchema,
@@ -73,6 +75,7 @@ export type AuthorizationActor =
     companyId?: string | null;
     keyId?: string | null;
     keyScope?: AgentApiKeyScope | null;
+    boardKeyScope?: BoardApiKeyScope | null;
     runId?: string | null;
     onBehalfOfUserId?: string | null;
     /** Pinned, server-derived external authorizer; never an agent-selected principal. */
@@ -760,6 +763,18 @@ function scopeBoolean(scope: Record<string, unknown> | null | undefined, key: st
   return scope?.[key] === true;
 }
 
+/**
+ * Requested scope for every `agent_config:update` decision on a specific target
+ * agent. Carries `targetAgentId` so a grant scoped to `{targetAgentIds:[...]}`
+ * can match; an unscoped grant (scope null) still matches any requested scope.
+ */
+export function agentConfigUpdateScope(
+  targetAgent: { id: string },
+  extra: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return { ...extra, targetAgentId: targetAgent.id };
+}
+
 export function authorizationDeniedDetails(decision: AuthorizationDecision) {
   return {
     ...(decision.code ? { code: decision.code } : {}),
@@ -1102,6 +1117,8 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
   async function loadRunPolicy(runId: string | null | undefined, companyId: string, agentId: string) {
     return batchRead(`run:${companyId}:${agentId}:${runId}`, async () => {
       if (!runId) return null;
+      // Caller-controlled header: malformed value is treated as missing (avoids UUID cast 500).
+      if (!isUuidLike(runId)) return null;
       const row = readSnapshot?.runs.has(runId) ? readSnapshot.runs.get(runId) : await db
         .select({
           id: heartbeatRuns.id,
@@ -1118,11 +1135,12 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         ? { companyId: row.companyId, executionPolicy: context.executionPolicy }
         : null;
     });
-
   }
 
   async function loadRunIssueId(runId: string | null | undefined, companyId: string, agentId: string) {
     if (!runId) return null;
+    // Same caller-controlled-header rule as loadRunPolicy.
+    if (!isUuidLike(runId)) return null;
     const row = await db
       .select({
         issueId: heartbeatRuns.issueId,
@@ -1353,7 +1371,8 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       input.action === "inbox:manage" ||
       input.action === "runtime:manage" ||
       input.action === "secrets:read" ||
-      input.action === "secrets:propose"
+      input.action === "secrets:propose" ||
+      input.action === "routines:manage"
     ) {
       return lowTrustDeny(
         `${LOW_TRUST_REVIEW_PRESET} agents cannot use company-wide or privileged ${input.action} APIs by default.`,
@@ -2273,6 +2292,30 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         action: input.action,
         reason: "deny_company_boundary",
         explanation: "Actor agent was not found in the target company.",
+      });
+    }
+
+    if (input.actor.keyScope?.kind === "notify_only") {
+      // Defense in depth behind enforceAgentKeyScopeMiddleware: a notify_only
+      // key may only read its allow-listed issues. Interaction create is
+      // authorized in the route by the same allow-list; everything else denies.
+      const allowedIssueIds = new Set(input.actor.keyScope.issueIds.map((id) => id.toLowerCase()));
+      if (
+        input.action === "issue:read" &&
+        input.resource.type === "issue" &&
+        typeof input.resource.issueId === "string" &&
+        allowedIssueIds.has(input.resource.issueId.toLowerCase())
+      ) {
+        return allow({
+          action: input.action,
+          reason: "allow_explicit_grant",
+          explanation: "Allowed for an issue on the notify_only key allow-list.",
+        });
+      }
+      return deny({
+        action: input.action,
+        reason: "deny_scope",
+        explanation: "notify_only keys can only read allow-listed issues and create interactions on them.",
       });
     }
 

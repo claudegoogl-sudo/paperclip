@@ -228,7 +228,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
   const [conversation] = await db.select({ agentId: issues.conversationAgentId,
     boundaryId: issues.conversationBoundaryCommentId, status: issues.status,
     assigneeAgentId: issues.assigneeAgentId, statusVersion: issues.statusVersion,
-    executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId }).from(issues).where(and(
+    executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
+    standbyWakeTarget: sql<boolean>`coalesce(${issues.executionPolicy}->>'standbyWakeTarget', 'false') = 'true'`,
+  }).from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId),
   )).limit(1);
   // Resetting model context cannot repair or recover a workspace. This hold
@@ -265,6 +267,9 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.companyId, companyId),
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
+    // A standing inbox only relays operator messages. A settled automatic no-replay
+    // disposition must not freeze it; active/escalated and unsafe-workspace holds still block.
+    conversation?.standbyWakeTarget ? inArray(issueRecoveryActions.status, ["active", "escalated"]) : undefined,
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate()) : undefined,
   )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);

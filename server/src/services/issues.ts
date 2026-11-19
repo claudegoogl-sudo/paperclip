@@ -160,6 +160,7 @@ import type {
 } from "@paperclipai/shared";
 import {
   clampIssueRequestDepth,
+  TERMINAL_HEARTBEAT_RUN_STATUSES as SHARED_TERMINAL_HEARTBEAT_RUN_STATUSES,
   extractAgentMentionIds,
   extractProjectMentionIds,
   issueCommentAuthorTypeSchema,
@@ -170,7 +171,7 @@ import {
   normalizeIssueIdentifier as normalizeIssueReferenceIdentifier,
 } from "@paperclipai/shared";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
-import { isForeignKeyViolation } from "../db-errors.js";
+import { isForeignKeyViolation, isUniqueViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
 import { parseObject } from "../adapters/utils.js";
 import {
@@ -215,6 +216,7 @@ import {
 } from "./issue-execution-policy.js";
 import { assertQualityReviewPolicyMutation, assertQualityReviewPolicyReuse, assertRequiredQualityReviewComplete, requiredQualityReview } from "./required-quality-review.js";
 import { instanceSettingsService } from "./instance-settings.js";
+import { retryOnTransientPgError } from "./pg-retry.js";
 import { redactCurrentUserText } from "../log-redaction.js";
 import { redactSensitiveText } from "../redaction.js";
 import {
@@ -2166,12 +2168,30 @@ function sameRunLock(checkoutRunId: string | null, actorRunId: string | null) {
   return checkoutRunId == null;
 }
 
-export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set([
-  "succeeded",
+// a not-yet-started `scheduled_retry` run reserves the issue's
+// executionRunId for its own agent until the retry becomes due (see the
+// handover in heartbeat.ts's scheduleTransientHeartbeatRetry). Nothing
+// previously let that reservation yield, so the same agent's own live run
+// got wedged with a 409 until the backoff timer fired. This predicate is the
+// one safe exception: cross-agent holders (or a holder that has already
+// started) are never yieldable, so the reservation still blocks everyone
+// else exactly as before.
+export function isYieldableExecutionLockHolder(
+  holderRun: { status: string; agentId: string; startedAt: Date | null } | null | undefined,
+  actorAgentId: string,
+  assigneeAgentId: string | null,
+): boolean {
+  if (!holderRun) return false;
+  if (holderRun.status !== "scheduled_retry") return false;
+  if (holderRun.startedAt != null) return false;
+  if (holderRun.agentId !== actorAgentId) return false;
+  return assigneeAgentId === actorAgentId;
+}
+
+
+export const TERMINAL_HEARTBEAT_RUN_STATUSES = new Set<string>([
+  ...SHARED_TERMINAL_HEARTBEAT_RUN_STATUSES,
   "interrupted",
-  "failed",
-  "cancelled",
-  "timed_out",
 ]);
 const ISSUE_LIST_DESCRIPTION_MAX_CHARS = 1200;
 const ISSUE_LIST_DESCRIPTION_MAX_BYTES = ISSUE_LIST_DESCRIPTION_MAX_CHARS * 4;
@@ -6771,6 +6791,199 @@ async function countBlockedInboxIssues(
   }, 0);
 }
 
+type IssueAttachmentBindRow = {
+  assetId: string;
+  issueId: string;
+  issueCommentId: string | null;
+};
+
+/**
+ * Classification of an existing `issue_attachments` row against a would-be
+ * bind of its asset onto `issueId` + `targetCommentId`. Shared by the
+ * pre-comment preflight ({@link validateAssetsBindableToIssue}, where
+ * `targetCommentId` is `null` because the comment does not exist yet) and the
+ * transactional bind loop in {@link attachAssetsToComment}.
+ *
+ * - `insert`  — no row yet (standalone `artifacts.create` asset): bind by INSERT.
+ * - `bind`    — row exists with `issueCommentId IS NULL` for THIS issue (the
+ *   upload-first flow): bind by UPDATE.
+ * - `skip`    — row is already bound to this exact comment (idempotent retry).
+ * - `conflict`— anything else: the asset is bound to another comment, or its
+ *   unbound row belongs to a different issue. Never silent.
+ */
+function classifyIssueAttachmentBindState(
+  existing: { issueId: string; issueCommentId: string | null } | null | undefined,
+  issueId: string,
+  targetCommentId: string | null,
+): "insert" | "bind" | "skip" | "conflict" {
+  if (!existing) return "insert";
+  if (existing.issueCommentId === null) {
+    return existing.issueId === issueId ? "bind" : "conflict";
+  }
+  return existing.issueCommentId === targetCommentId ? "skip" : "conflict";
+}
+
+function issueAttachmentConflictError(
+  assetId: string,
+  existing: { issueId: string; issueCommentId: string | null } | null | undefined,
+): HttpError {
+  if (!existing) {
+    return conflict("Attachment asset could not be bound: no issue_attachments row found", { assetId });
+  }
+  if (existing.issueCommentId === null) {
+    return conflict(
+      `Attachment asset ${assetId} is already uploaded to a different issue and cannot be attached here`,
+      { assetId, boundIssueId: existing.issueId, boundCommentId: null },
+    );
+  }
+  return conflict(
+    `Attachment asset ${assetId} is already attached to another comment`,
+    { assetId, boundIssueId: existing.issueId, boundCommentId: existing.issueCommentId },
+  );
+}
+
+/**
+ * Tenant checks shared by the attach preflight and the bind: the target issue
+ * must exist and every asset must exist and belong to the issue's company.
+ */
+/** One attachment row newly bound to a comment by `attachAssetsToComment`. */
+export interface BoundIssueAttachment {
+  companyId: string;
+  issueId: string;
+  attachmentId: string;
+  commentId: string;
+  contentType: string | null;
+  byteSize: number | null;
+}
+
+/**
+ * Log one `issue.attachment_bound` activity per newly bound row. The action maps
+ * to the `issue.attachment.created` plugin event, giving plugins an in-scope
+ * trigger for late-bound media. Metadata only — no content, no URLs.
+ */
+export function attachmentBoundActivityDetails(row: BoundIssueAttachment): Record<string, unknown> {
+  return {
+    attachmentId: row.attachmentId,
+    issueId: row.issueId,
+    commentId: row.commentId,
+    contentType: row.contentType,
+    byteSize: row.byteSize,
+    binding: "bind",
+  };
+}
+
+async function resolveBindableAssetContext(
+  dbOrTx: any,
+  issueId: string,
+  assetIds: string[],
+): Promise<{ issue: { id: string; companyId: string }; uniqueAssetIds: string[] }> {
+  const issue = await dbOrTx
+    .select({ id: issues.id, companyId: issues.companyId })
+    .from(issues)
+    .where(eq(issues.id, issueId))
+    .then((rows: { id: string; companyId: string }[]) => rows[0] ?? null);
+  if (!issue) throw notFound("Issue not found");
+
+  // Accept either key: callers hand out the ASSET id (upload route,
+  // artifacts.create) or the attachment ROW id (native runner handoff). Map
+  // row ids onto their asset before the company check.
+  const uniqueInputIds = [...new Set(assetIds)];
+  const attachmentMappedRows = await dbOrTx
+    .select({
+      inputId: issueAttachments.id,
+      assetId: issueAttachments.assetId,
+      companyId: issueAttachments.companyId,
+    })
+    .from(issueAttachments)
+    .where(
+      and(
+        eq(issueAttachments.companyId, issue.companyId),
+        eq(issueAttachments.issueId, issueId),
+        inArray(issueAttachments.id, uniqueInputIds),
+      ),
+    );
+  const assetIdByRowId = new Map<string, string>(
+    (attachmentMappedRows as { inputId: string; assetId: string }[]).map(
+      (row) => [row.inputId, row.assetId] as const,
+    ),
+  );
+  const uniqueAssetIds: string[] = [
+    ...new Set(uniqueInputIds.map((id) => assetIdByRowId.get(id) ?? id)),
+  ];
+  const assetRows = await dbOrTx
+    .select({ id: assets.id, companyId: assets.companyId })
+    .from(assets)
+    .where(inArray(assets.id, uniqueAssetIds));
+  const byId = new Map<string, { id: string; companyId: string }>(
+    assetRows.map((row: { id: string; companyId: string }) => [row.id, row] as const),
+  );
+  for (const assetId of uniqueAssetIds) {
+    const asset = byId.get(assetId);
+    if (!asset) throw notFound("Attachment asset not found");
+    if (asset.companyId !== issue.companyId) {
+      throw unprocessable("Attachment asset must belong to same company as issue");
+    }
+  }
+  return { issue, uniqueAssetIds };
+}
+
+/**
+ * Read-only preflight for {@link attachAssetsToComment}: verifies every asset
+ * could be bound to a NEW comment on this issue (exists, same company, and its
+ * `issue_attachments` row is absent or unbound for this issue). Callers run it
+ * BEFORE creating the comment so a conflicting `attachmentIds` list fails the
+ * comment POST with an explicit conflict instead of leaving a comment whose
+ * attachments never bound. Returns the resolved bind context for reuse.
+ */
+async function validateAssetsBindableToNewComment(
+  dbOrTx: any,
+  input: { issueId: string; assetIds: string[]; replayRunId?: string | null },
+): Promise<{ issue: { id: string; companyId: string }; uniqueAssetIds: string[] }> {
+  if (input.assetIds.length === 0) {
+    return { issue: { id: input.issueId, companyId: "" }, uniqueAssetIds: [] };
+  }
+  const { issue, uniqueAssetIds } = await resolveBindableAssetContext(dbOrTx, input.issueId, input.assetIds);
+  const rows: IssueAttachmentBindRow[] = await dbOrTx
+    .select({
+      assetId: issueAttachments.assetId,
+      issueId: issueAttachments.issueId,
+      issueCommentId: issueAttachments.issueCommentId,
+    })
+    .from(issueAttachments)
+    .where(inArray(issueAttachments.assetId, uniqueAssetIds));
+  const rowByAsset = new Map<string, IssueAttachmentBindRow>(
+    rows.map((row) => [row.assetId, row]),
+  );
+  for (const assetId of uniqueAssetIds) {
+    const existing = rowByAsset.get(assetId);
+    if (classifyIssueAttachmentBindState(existing, issue.id, null) === "conflict") {
+      // Idempotent replay: the same run re-posting its comment (helper
+      // retries) targets an asset already bound to that run's own comment on
+      // this issue. Let it through; addComment dedupes by run + body and the
+      // bind step re-checks inside its transaction.
+      if (
+        input.replayRunId &&
+        existing?.issueId === issue.id &&
+        existing.issueCommentId
+      ) {
+        const [boundComment] = await dbOrTx
+          .select({ createdByRunId: issueComments.createdByRunId })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.id, existing.issueCommentId),
+              eq(issueComments.issueId, issue.id),
+              isNull(issueComments.deletedAt),
+            ),
+          );
+        if (boundComment?.createdByRunId === input.replayRunId) continue;
+      }
+      throw issueAttachmentConflictError(assetId, existing);
+    }
+  }
+  return { issue, uniqueAssetIds };
+}
+
 export async function readIssueCommentRunLogText(run: {
   runId?: string | null;
   logStore: string | null;
@@ -7849,6 +8062,27 @@ export function issueService(db: Db) {
     actorRunId: string;
   }) {
     return db.transaction(async (tx) => {
+      const lockedIssue = await tx
+        .select({
+          id: issues.id,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, input.issueId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (
+        !lockedIssue ||
+        lockedIssue.status !== "in_progress" ||
+        lockedIssue.assigneeAgentId !== input.actorAgentId ||
+        lockedIssue.checkoutRunId != null
+      ) {
+        return null;
+      }
+
       await tx.execute(
         sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${input.actorRunId} for update`,
       );
@@ -7859,6 +8093,28 @@ export function issueService(db: Db) {
         .then((rows) => rows[0] ?? null);
       if (!actorRun || TERMINAL_HEARTBEAT_RUN_STATUSES.has(actorRun.status))
         return null;
+
+      // the issue's executionRunId can be held unexpired by a
+      // not-yet-started scheduled_retry run reserved for this same agent
+      // (see the handover in heartbeat.ts's scheduleTransientHeartbeatRetry).
+      // Re-read + lock that holder row inside this transaction — never trust
+      // a pre-transaction read — because the retry can become due
+      // concurrently between the caller's lookup and this adoption.
+      let yieldedRun: typeof heartbeatRuns.$inferSelect | null = null;
+      if (lockedIssue.executionRunId != null && lockedIssue.executionRunId !== input.actorRunId) {
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${lockedIssue.executionRunId} for update`,
+        );
+        const holderRun = await tx
+          .select()
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, lockedIssue.executionRunId))
+          .then((rows) => rows[0] ?? null);
+        if (!isYieldableExecutionLockHolder(holderRun, input.actorAgentId, lockedIssue.assigneeAgentId)) {
+          return null;
+        }
+        yieldedRun = holderRun;
+      }
 
       await notifyStatusCardIssueChange(tx, actorRun.companyId);
       const now = new Date();
@@ -7876,10 +8132,9 @@ export function issueService(db: Db) {
             eq(issues.status, "in_progress"),
             eq(issues.assigneeAgentId, input.actorAgentId),
             isNull(issues.checkoutRunId),
-            or(
-              isNull(issues.executionRunId),
-              eq(issues.executionRunId, input.actorRunId),
-            ),
+            lockedIssue.executionRunId == null
+              ? isNull(issues.executionRunId)
+              : eq(issues.executionRunId, lockedIssue.executionRunId),
           ),
         )
         .returning({
@@ -7891,13 +8146,88 @@ export function issueService(db: Db) {
         })
         .then((rows) => rows[0] ?? null);
 
+      if (!adopted) return null;
+
+      if (yieldedRun) {
+        // Cancel the superseded scheduled_retry run (and its wakeup request)
+        // in this same transaction so it can never later start and re-steal
+        // the issue back from the live run that just adopted the lock —
+        // mirrors cancelStaleScheduledRetry's cancel-in-transaction shape.
+        const reason = "Cancelled: yielded the issue's execution lock to the same agent's live run";
+        await tx
+          .update(heartbeatRuns)
+          .set({
+            status: "cancelled",
+            finishedAt: now,
+            error: reason,
+            errorCode: "issue_execution_lock_yielded",
+            updatedAt: now,
+          })
+          .where(and(eq(heartbeatRuns.id, yieldedRun.id), eq(heartbeatRuns.status, "scheduled_retry")));
+
+        if (yieldedRun.wakeupRequestId) {
+          await tx
+            .update(agentWakeupRequests)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: reason,
+              updatedAt: now,
+            })
+            .where(eq(agentWakeupRequests.id, yieldedRun.wakeupRequestId));
+        }
+      }
+
       return adopted;
     });
   }
 
-  async function clearExecutionRunIfTerminal(
-    issueId: string,
+  // shared by assertCheckoutOwner (PATCH/release) and checkout
+  // (POST /checkout) so the two entry points can never drift on what counts
+  // as an adoptable "unowned" checkout. This is a fast, non-authoritative
+  // pre-check — adoptUnownedCheckoutRun re-reads and locks the holder row
+  // inside its own transaction before committing to any adoption.
+  async function canAdoptUnownedCheckout(
+    candidate: {
+      status: string;
+      assigneeAgentId: string | null;
+      checkoutRunId: string | null;
+      executionRunId: string | null;
+    },
+    actorAgentId: string,
+    actorRunId: string | null,
   ): Promise<boolean> {
+    if (
+      !actorRunId
+      || candidate.status !== "in_progress"
+      || candidate.assigneeAgentId !== actorAgentId
+      || candidate.checkoutRunId != null
+    ) {
+      return false;
+    }
+    if (candidate.executionRunId == null || candidate.executionRunId === actorRunId) return true;
+
+    const holderRun = await db
+      .select({ status: heartbeatRuns.status, agentId: heartbeatRuns.agentId, startedAt: heartbeatRuns.startedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, candidate.executionRunId))
+      .then((rows) => rows[0] ?? null);
+    return isYieldableExecutionLockHolder(holderRun, actorAgentId, candidate.assigneeAgentId);
+  }
+
+  async function clearExecutionRunIfTerminal(issueId: string): Promise<boolean> {
+    // This helper takes overlapping locks on issues + heartbeat_runs
+    // and is called pre-authorization from multiple mutation routes; on its
+    // own it can deadlock against the heartbeat-run lifecycle and 500 the
+    // request before any other code runs. Wrap in retry so transient 40P01
+    // is invisible to callers.
+    return retryOnTransientPgError(
+      () => clearExecutionRunIfTerminalOnce(issueId),
+      { label: "clear_execution_run_if_terminal" },
+    );
+  }
+
+  async function clearExecutionRunIfTerminalOnce(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
@@ -7944,10 +8274,112 @@ export function issueService(db: Db) {
     });
   }
 
+  /**
+   * Defensive back-fill for the orphan-`checkoutRunId` lifecycle bug.
+   *
+   * When `releaseIssueExecutionAndPromote` failed to clear `checkoutRunId` (or any
+   * other code path leaves it pointing at a terminal heartbeat_runs row), mutation
+   * handlers should treat that state as "no active checkout" rather than 5xx-ing or
+   * 4xx-ing on a partial state. Call this once at the top of each mutation route
+   * (PATCH, addComment, checkout, release) before any authorization that depends on
+   * `checkoutRunId` / `executionRunId`. The helper is a no-op when both lock columns
+   * are null or point at a non-terminal run, so it is safe to call unconditionally.
+   *
+   * Returns true if any column was cleared (used by tests; callers can ignore).
+   */
+  async function clearOrphanCheckoutLocksIfTerminal(issueId: string): Promise<boolean> {
+    // See clearExecutionRunIfTerminal — same lock-ordering risk.
+    // Every mutation route calls this pre-auth, so an unwrapped deadlock
+    // here surfaces as a 500 before the route's own retry can see it.
+    return retryOnTransientPgError(
+      () => clearOrphanCheckoutLocksIfTerminalOnce(issueId),
+      { label: "clear_orphan_checkout_locks_if_terminal" },
+    );
+  }
+
+  async function clearOrphanCheckoutLocksIfTerminalOnce(issueId: string): Promise<boolean> {
+    return db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
+      );
+      const issue = await tx
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      if (!issue) return false;
+      if (!issue.checkoutRunId && !issue.executionRunId) return false;
+
+      const runIds = Array.from(
+        new Set([issue.checkoutRunId, issue.executionRunId].filter((id): id is string => Boolean(id))),
+      );
+      if (runIds.length === 0) return false;
+
+      // Lock the run rows in a stable order to avoid deadlocks against
+      // concurrent run-completion paths that lock the issue first then the run.
+      for (const runId of [...runIds].sort()) {
+        await tx.execute(
+          sql`select ${heartbeatRuns.id} from ${heartbeatRuns} where ${heartbeatRuns.id} = ${runId} for update`,
+        );
+      }
+      const runs = await tx
+        .select({ id: heartbeatRuns.id, status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(inArray(heartbeatRuns.id, runIds));
+      const runStatusById = new Map(runs.map((r) => [r.id, r.status]));
+
+      const isTerminal = (runId: string | null) => {
+        if (!runId) return false;
+        const status = runStatusById.get(runId);
+        // Missing run row (FK set null on delete cascade) or terminal status both qualify.
+        return status === undefined || TERMINAL_HEARTBEAT_RUN_STATUSES.has(status);
+      };
+
+      const clearCheckout = isTerminal(issue.checkoutRunId);
+      const clearExecution = isTerminal(issue.executionRunId);
+      if (!clearCheckout && !clearExecution) return false;
+
+      const patch: Partial<typeof issues.$inferInsert> = { updatedAt: new Date() };
+      if (clearCheckout) patch.checkoutRunId = null;
+      if (clearExecution) {
+        patch.executionRunId = null;
+        patch.executionAgentNameKey = null;
+        patch.executionLockedAt = null;
+      }
+
+      const conditions = [eq(issues.id, issueId)];
+      if (clearCheckout && issue.checkoutRunId) {
+        conditions.push(eq(issues.checkoutRunId, issue.checkoutRunId));
+      }
+      if (clearExecution && issue.executionRunId) {
+        conditions.push(eq(issues.executionRunId, issue.executionRunId));
+      }
+
+      const updated = await tx
+        .update(issues)
+        .set(patch)
+        .where(and(...conditions))
+        .returning({ id: issues.id })
+        .then((rows) => rows[0] ?? null);
+
+      return Boolean(updated);
+    });
+  }
+
   // Symmetric to clearExecutionRunIfTerminal. Clears checkoutRunId (and the
   // bundled execution lock cols) when the row's checkoutRunId points at a
   // heartbeat run that is terminal or no longer exists. No assignee/status
-  // precondition. Explicit retry claims remain owned by queue-first settlement.
+  // precondition: a terminal run holds no real claim regardless of who is
+  // assigned or what status the issue is currently in. Explicit retry claims
+  // remain owned by queue-first settlement.
+  //
+  // Retained alongside clearOrphanCheckoutLocksIfTerminal: this
+  // upstream (v2026.618.0) helper is the in-service self-heal invoked from
+  // `checkout`, while clearOrphanCheckoutLocksIfTerminal is the pre-auth route guard. They keep
+  // separate call sites and test suites, so both are preserved.
   async function clearCheckoutRunIfTerminal(issueId: string): Promise<boolean> {
     return db.transaction(async (tx) => {
       await tx.execute(
@@ -8172,6 +8604,7 @@ export function issueService(db: Db) {
 
   const service = {
     clearExecutionRunIfTerminal,
+    clearOrphanCheckoutLocksIfTerminal,
     clearCheckoutRunIfTerminal,
     addStopRelayCommentIfNeeded,
 
@@ -11213,6 +11646,7 @@ export function issueService(db: Db) {
         /** Server-owned transfer being applied; never accepted from HTTP input. */
         caseHandoffId?: string;
         actorRunStopId?: string | null;
+        handoffCommit?: { runId: string; stopId: string; toAgentId: string } | null;
         actorUserId?: string | null;
         companyGuard?: string;
         workspaceSelectionActor?: AuthorizationActor;
@@ -11305,6 +11739,7 @@ export function issueService(db: Db) {
         actorRunId,
         caseHandoffId,
         actorRunStopId,
+        handoffCommit,
         actorUserId,
         companyGuard,
         workspaceSelectionActor,
@@ -11839,6 +12274,29 @@ export function issueService(db: Db) {
           await executionWorkspaceService(db).assertTaskWorkspaceUpdateAccess({
             task: updated, actor: workspaceSelectionActor,
           }, tx);
+        }
+        // PLA-12409: the durable handoff marker commits with the assignment, so a
+        // failed update leaves no marker and the stopped run keeps its hold.
+        if (handoffCommit && updated.assigneeAgentId === handoffCommit.toAgentId) {
+          const [markedRun] = await tx.update(heartbeatRuns).set({
+            resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ handoffCommitted: { ...handoffCommit, at: new Date().toISOString() } })}::jsonb`,
+          }).where(and(eq(heartbeatRuns.id, handoffCommit.runId), eq(heartbeatRuns.companyId, updated.companyId)))
+            .returning({ resultJson: heartbeatRuns.resultJson });
+          const runEvidence = (markedRun?.resultJson ?? {}) as Record<string, unknown>;
+          if (!runEvidence.workspaceRestoreFailure && !runEvidence.workspaceRestoreRecovery)
+          // A hold minted after the grace window but before this commit is the
+          // stop's own hold; retire it unless it carries workspace-repair evidence.
+          await tx.update(issueRecoveryActions).set({
+            status: "resolved", outcome: "cancelled", resolvedAt: new Date(), updatedAt: new Date(),
+            resolutionNote: "The run was stopped by its own committed handoff; the new participant owns the issue.",
+          }).where(and(
+            eq(issueRecoveryActions.companyId, updated.companyId),
+            eq(issueRecoveryActions.sourceIssueId, updated.id),
+            inArray(issueRecoveryActions.status, ["active", "escalated"]),
+            eq(issueRecoveryActions.fingerprint, `legacy-execution:${handoffCommit.runId}`),
+            sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' is null`,
+            sql`${issueRecoveryActions.evidence}->'workspaceRestoreRecovery' is null`,
+          ));
         }
         if (issueData.description !== undefined) await attachOwnedDraftImages(tx, updated, updated.description,
           { userId: actorUserId, agentId: actorAgentId });
@@ -12435,38 +12893,34 @@ export function issueService(db: Db) {
       if (!current) throw notFound("Issue not found");
 
       if (
-        current.assigneeAgentId === agentId &&
-        current.status === "in_progress" &&
-        current.checkoutRunId == null &&
-        (current.executionRunId == null ||
-          current.executionRunId === checkoutRunId) &&
-        checkoutRunId
+        checkoutRunId &&
+        (await canAdoptUnownedCheckout(
+          {
+            status: current.status,
+            assigneeAgentId: current.assigneeAgentId,
+            checkoutRunId: current.checkoutRunId,
+            executionRunId: current.executionRunId,
+          },
+          agentId,
+          checkoutRunId,
+        ))
       ) {
-        const adopted = await db.transaction(async tx => {
-          await notifyStatusCardIssueChange(tx, issueCompany.companyId);
-          return tx
-          .update(issues)
-          .set({
-            checkoutRunId,
-            executionRunId: checkoutRunId,
-            updatedAt: new Date(),
-          })
-          .where(
-            and(
-              eq(issues.id, id),
-              eq(issues.status, "in_progress"),
-              eq(issues.assigneeAgentId, agentId),
-              isNull(issues.checkoutRunId),
-              or(
-                isNull(issues.executionRunId),
-                eq(issues.executionRunId, checkoutRunId),
-              ),
-            ),
-          )
-          .returning()
-          .then((rows) => rows[0] ?? null);
+        // route through the same transactional, re-verified-under-lock
+        // adoption used by assertCheckoutOwner (PATCH/release) so a yieldable
+        // scheduled_retry holder is reclaimed here too, instead of
+        // falling through to "Issue checkout conflict" for a lock the ownership
+        // layer would have let this same run take a moment later.
+        const adopted = await adoptUnownedCheckoutRun({
+          issueId: id,
+          actorAgentId: agentId,
+          actorRunId: checkoutRunId,
         });
-        if (adopted) return adopted;
+        if (adopted) {
+          const row = await db.select().from(issues).where(eq(issues.id, id)).then((rows) => rows[0] ?? null);
+          if (!row) throw notFound("Issue not found");
+          const [enriched] = await withIssueLabels(db, [row]);
+          return enriched;
+        }
       }
 
       if (
@@ -12622,19 +13076,6 @@ export function issueService(db: Db) {
         return null;
       };
 
-      const canAdoptUnownedCheckout = (candidate: {
-        status: string;
-        assigneeAgentId: string | null;
-        checkoutRunId: string | null;
-        executionRunId: string | null;
-      }) =>
-        actorRunId &&
-        candidate.status === "in_progress" &&
-        candidate.assigneeAgentId === actorAgentId &&
-        candidate.checkoutRunId == null &&
-        (candidate.executionRunId == null ||
-          candidate.executionRunId === actorRunId);
-
       const resolveOwnership = async (candidate: {
         id: string;
         status: string;
@@ -12646,7 +13087,7 @@ export function issueService(db: Db) {
         if (sameRunOwnership)
           return { ownership: sameRunOwnership, latest: null };
 
-        if (canAdoptUnownedCheckout(candidate)) {
+        if (await canAdoptUnownedCheckout(candidate, actorAgentId, actorRunId)) {
           const adopted = await adoptUnownedCheckoutRun({
             issueId: id,
             actorAgentId,
@@ -12739,6 +13180,7 @@ export function issueService(db: Db) {
       id: string,
       actorAgentId?: string,
       actorRunId?: string | null,
+      options: { managerOverride?: boolean } = {},
     ) =>
       db.transaction(async (tx) => {
         await tx.execute(
@@ -12751,13 +13193,48 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
 
         if (!existing) return null;
+        // Manager checkout-management override: an agent holding
+        // tasks:manage_active_checkouts (route-verified via
+        // hasActiveCheckoutManagementOverride and passed in as
+        // options.managerOverride) may release an in_progress issue assigned to
+        // another agent ONLY when the holding checkout run is terminal or
+        // missing — never to steal from a live run. The staleness re-check runs
+        // here on the locked row so the precondition cannot race the route's
+        // pre-auth orphan-clear. Board force-release (adminForceRelease) stays
+        // the only path that may clear a checkout held by a live run.
+        const managerOverride =
+          options.managerOverride === true &&
+          Boolean(actorAgentId) &&
+          existing.assigneeAgentId !== null &&
+          existing.assigneeAgentId !== actorAgentId;
         if (
           actorAgentId &&
           existing.assigneeAgentId &&
           existing.assigneeAgentId !== actorAgentId
         ) {
-          throw conflict("Only assignee can release issue");
+          if (managerOverride && existing.status === "in_progress") {
+            if (
+              existing.checkoutRunId &&
+              !(await isTerminalOrMissingHeartbeatRun(existing.checkoutRunId, tx))
+            ) {
+              throw conflict("Checkout is held by a live run", {
+                issueId: existing.id,
+                assigneeAgentId: existing.assigneeAgentId,
+                checkoutRunId: existing.checkoutRunId,
+                actorAgentId,
+              });
+            }
+            // Terminal-or-missing holding run (or none): fall through to the
+            // regular release effects below.
+          } else {
+            throw conflict("Only assignee can release issue");
+          }
         }
+        const previous = {
+          assigneeAgentId: existing.assigneeAgentId,
+          checkoutRunId: existing.checkoutRunId,
+          executionRunId: existing.executionRunId,
+        };
         if (
           actorAgentId &&
           existing.status === "in_progress" &&
@@ -12809,7 +13286,7 @@ export function issueService(db: Db) {
           .then((rows) => rows[0] ?? null);
         if (!updated) return null;
         const [enriched] = await withIssueLabels(tx, [updated]);
-        return enriched;
+        return { issue: enriched, previous, managerOverride };
       }),
 
     adminForceRelease: async (
@@ -13482,9 +13959,14 @@ export function issueService(db: Db) {
         originalFilename: string | null;
       }> = [];
       if (attachmentIds.length > 0) {
+        // Comment attachments are referenced by ASSET id (the upload and
+        // artifacts.create surfaces both hand out the asset id, and the
+        // route-level preflight validates the same key), so resolve rows
+        // through the asset join rather than by attachment-row id.
         const attachmentRows = await dbOrTx
           .select({
             id: issueAttachments.id,
+            assetId: issueAttachments.assetId,
             issueCommentId: issueAttachments.issueCommentId,
             originatingRunId: issueAttachments.originatingRunId,
             createdByAgentId: assets.createdByAgentId,
@@ -13496,28 +13978,53 @@ export function issueService(db: Db) {
             and(
               eq(issueAttachments.companyId, issue.companyId),
               eq(issueAttachments.issueId, issueId),
-              inArray(issueAttachments.id, attachmentIds),
+              // Two in-tree contracts reference attachments on comments:
+              // the HTTP route and upload/artifacts surfaces key by ASSET id,
+              // while the native runner file handoff passes the attachment
+              // ROW id returned by createAttachment. Match either.
+              or(
+                inArray(issueAttachments.assetId, attachmentIds),
+                inArray(issueAttachments.id, attachmentIds),
+              ),
             ),
           )
           .for("update");
         type CommentAttachmentRow = {
           id: string;
+          assetId: string;
           issueCommentId: string | null;
           originatingRunId: string | null;
           createdByAgentId: string | null;
           originalFilename: string | null;
         };
-        const attachmentById = new Map<string, CommentAttachmentRow>(
-          attachmentRows.map(
-            (
-              attachment: CommentAttachmentRow,
-            ): [string, CommentAttachmentRow] => [attachment.id, attachment],
-          ),
+        const attachmentById = new Map<string, CommentAttachmentRow>();
+        for (const attachment of attachmentRows) {
+          attachmentById.set(attachment.assetId, attachment);
+          attachmentById.set(attachment.id, attachment);
+        }
+        // Standalone `artifacts.create` assets have no issue_attachments row
+        // yet — validate them against the assets table (same company) and let
+        // attachAssetsToComment insert the bound row; only assets that are
+        // neither present as rows nor as same-company assets are rejected.
+        const missingAssetIds = attachmentIds.filter(
+          (attachmentId: string) => !attachmentById.has(attachmentId),
         );
-        if (attachmentById.size !== attachmentIds.length) {
-          throw unprocessable(
-            "Comment attachments must belong to the same task and company",
-          );
+        if (missingAssetIds.length > 0) {
+          const standaloneRows = await dbOrTx
+            .select({ id: assets.id })
+            .from(assets)
+            .where(
+              and(
+                eq(assets.companyId, issue.companyId),
+                inArray(assets.id, missingAssetIds),
+              ),
+            )
+            .for("update");
+          if (standaloneRows.length !== missingAssetIds.length) {
+            throw unprocessable(
+              "Comment attachments must belong to the same task and company",
+            );
+          }
         }
         if (
           attachmentRows.some(
@@ -13611,7 +14118,11 @@ export function issueService(db: Db) {
           );
         }
         for (const attachmentId of attachmentIds) {
-          const attachment = attachmentById.get(attachmentId)!;
+          const attachment = attachmentById.get(attachmentId);
+          // Standalone assets (no row yet) are bound — with their row
+          // inserted — by attachAssetsToComment after this call; they carry
+          // no existing-row metadata to report here.
+          if (!attachment) continue;
           boundAttachments.push({
             id: attachment.id,
             commentId: comment.id,
@@ -14061,7 +14572,203 @@ export function issueService(db: Db) {
       });
     },
 
-    listAttachments: async (issueId: string) =>
+    /**
+     * Create a standalone `assets` row with NO `issue_attachments`
+     * binding yet. Returned by `artifacts.create`; the asset is bound to an
+     * issue+comment later via {@link attachAssetsToComment} (called from
+     * `issues.createComment` with `attachmentIds`). The split exists because
+     * `artifacts.create` has no `issueId` in its signature — the worker stores
+     * bytes first, then surfaces them on a comment.
+     */
+    createStandaloneAsset: async (input: {
+      companyId: string;
+      provider: string;
+      objectKey: string;
+      contentType: string;
+      byteSize: number;
+      sha256: string;
+      originalFilename?: string | null;
+      createdByAgentId?: string | null;
+    }): Promise<{ id: string }> => {
+      const [asset] = await db
+        .insert(assets)
+        .values({
+          companyId: input.companyId,
+          provider: input.provider,
+          objectKey: input.objectKey,
+          contentType: input.contentType,
+          byteSize: input.byteSize,
+          sha256: input.sha256,
+          originalFilename: input.originalFilename ?? null,
+          createdByAgentId: input.createdByAgentId ?? null,
+          createdByUserId: null,
+        })
+        .returning({ id: assets.id });
+      return { id: asset.id };
+    },
+
+    /**
+     * Idempotency: find an existing asset for `(companyId, sha256)` that
+     * is NOT yet bound to any `issue_attachments` row. A retried
+     * `artifacts.create` (same bytes, same company) converges onto this asset
+     * instead of storing duplicate bytes. Attached assets are excluded because
+     * `issue_attachments.asset_id` is UNIQUE — reusing an already-attached asset
+     * would make the later bind fail, so only unattached ones are reusable.
+     */
+    findReusableUnattachedAsset: async (
+      companyId: string,
+      sha256: string,
+    ): Promise<{ id: string } | null> => {
+      const attachedAssetIds = db
+        .select({ assetId: issueAttachments.assetId })
+        .from(issueAttachments);
+      const rows = await db
+        .select({ id: assets.id })
+        .from(assets)
+        .where(
+          and(
+            eq(assets.companyId, companyId),
+            eq(assets.sha256, sha256),
+            notInArray(assets.id, attachedAssetIds),
+          ),
+        )
+        .orderBy(asc(assets.createdAt))
+        .limit(1);
+      return rows[0] ?? null;
+    },
+
+    /**
+     * Read-only preflight mirroring {@link attachAssetsToComment}'s bind
+     * semantics for a comment that does not exist yet: every asset must exist,
+     * belong to the issue's company, and carry an `issue_attachments` row that
+     * is absent or unbound (`issueCommentId IS NULL`) for this issue. Throws
+     * `notFound` / `unprocessable` / `conflict` otherwise. Comment routes call
+     * this BEFORE creating the comment so a conflicting `attachmentIds` list
+     * fails the request with an explicit error and no comment row is left
+     * behind.
+     */
+    validateAssetsBindableToIssue: async (input: {
+      issueId: string;
+      assetIds: string[];
+      replayRunId?: string | null;
+    }): Promise<void> => {
+      await validateAssetsBindableToNewComment(db, input);
+    },
+
+    /**
+     * Bind assets (by id) to an issue + comment before any downstream
+     * `comment.created` fan-out, so comment-scoped consumers (e.g. the media
+     * relay) see them. Per asset, exactly one of four states applies:
+     *
+     * - no `issue_attachments` row (standalone `artifacts.create` asset):
+     *   INSERT a bound row;
+     * - unbound row (`issueCommentId IS NULL`) on this issue (the
+     *   upload-first flow — the multipart attachment route creates the row at
+     *   upload time): UPDATE it onto this comment;
+     * - row already bound to this exact comment: idempotent skip, so a
+     *   retried bind (or a retried `createComment` reusing the same comment
+     *   id) converges without duplicating or erroring;
+     * - anything else (bound to a different comment, or unbound but uploaded
+     *   to a different issue): explicit `conflict` — the whole call rolls
+     *   back inside one transaction, leaving no partial binds.
+     *
+     * Each asset must belong to the issue's company or the call is rejected
+     * (`unprocessable`) — a worker cannot surface a foreign tenant's asset
+     * onto its own issue. A concurrent bind of the same asset that lost the
+     * INSERT race converges on the winning row instead of surfacing the
+     * unique-violation error.
+     */
+    attachAssetsToComment: async (input: {
+      issueId: string;
+      issueCommentId: string;
+      assetIds: string[];
+    }): Promise<BoundIssueAttachment[]> => {
+      if (input.assetIds.length === 0) return [];
+      const { issue, uniqueAssetIds } = await resolveBindableAssetContext(db, input.issueId, input.assetIds);
+      // Rows this call newly bound (bind of an unbound row, or fresh insert).
+      // Idempotent re-binds ("skip") are excluded so callers emit exactly one
+      // attachment event per real state change and retries converge.
+      const newlyBound: Array<{ attachmentId: string; assetId: string }> = [];
+
+      await db.transaction(async (tx) => {
+        for (const assetId of uniqueAssetIds) {
+          const [existing] = await tx
+            .select({
+              id: issueAttachments.id,
+              issueId: issueAttachments.issueId,
+              issueCommentId: issueAttachments.issueCommentId,
+            })
+            .from(issueAttachments)
+            .where(eq(issueAttachments.assetId, assetId));
+          const state = classifyIssueAttachmentBindState(existing ?? null, issue.id, input.issueCommentId);
+          if (state === "skip") continue;
+          if (state === "bind") {
+            await tx
+              .update(issueAttachments)
+              .set({ issueCommentId: input.issueCommentId, updatedAt: new Date() })
+              .where(eq(issueAttachments.id, existing.id));
+            newlyBound.push({ attachmentId: existing.id, assetId });
+            continue;
+          }
+          if (state === "insert") {
+            try {
+              const [inserted] = await tx.insert(issueAttachments).values({
+                companyId: issue.companyId,
+                issueId: issue.id,
+                assetId,
+                issueCommentId: input.issueCommentId,
+              }).returning({ id: issueAttachments.id });
+              if (inserted) newlyBound.push({ attachmentId: inserted.id, assetId });
+            } catch (err) {
+              if (!isUniqueViolation(err, "issue_attachments_asset_uq")) throw err;
+              // Lost an INSERT race against a concurrent bind/upload of the
+              // same asset. Re-read the winning row inside this transaction:
+              // if it landed on this comment the retry converges (idempotent);
+              // anything else is a real conflict.
+              const [winner] = await tx
+                .select({
+                  id: issueAttachments.id,
+                  issueId: issueAttachments.issueId,
+                  issueCommentId: issueAttachments.issueCommentId,
+                })
+                .from(issueAttachments)
+                .where(eq(issueAttachments.assetId, assetId));
+              if (
+                classifyIssueAttachmentBindState(winner ?? null, issue.id, input.issueCommentId) === "skip"
+              ) {
+                continue;
+              }
+              throw issueAttachmentConflictError(assetId, winner);
+            }
+            continue;
+          }
+          throw issueAttachmentConflictError(assetId, existing);
+        }
+      });
+
+      if (newlyBound.length === 0) return [];
+      const meta = await db
+        .select({ id: assets.id, contentType: assets.contentType, byteSize: assets.byteSize })
+        .from(assets)
+        .where(inArray(assets.id, newlyBound.map((row) => row.assetId)));
+      const metaById = new Map(meta.map((row) => [row.id, row] as const));
+      return newlyBound.map((row) => ({
+        companyId: issue.companyId,
+        issueId: issue.id,
+        attachmentId: row.attachmentId,
+        commentId: input.issueCommentId,
+        contentType: metaById.get(row.assetId)?.contentType ?? null,
+        byteSize: metaById.get(row.assetId)?.byteSize ?? null,
+      }));
+    },
+
+    // Tenant-scoped at the data layer: callers must pass the validated (issue)
+    // companyId. Filtering on issue_attachments.company_id here — not just via
+    // the caller's issue guard — is defense in depth: if any write path ever
+    // breaks the invariant that an attachment's company_id equals its parent
+    // issue's company_id, a foreign row can never surface (not even its
+    // companyId string in metadata).
+    listAttachments: async (issueId: string, companyId: string) =>
       db
         .select({
           id: issueAttachments.id,
@@ -14083,7 +14790,12 @@ export function issueService(db: Db) {
         })
         .from(issueAttachments)
         .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
-        .where(eq(issueAttachments.issueId, issueId))
+        .where(
+          and(
+            eq(issueAttachments.issueId, issueId),
+            eq(issueAttachments.companyId, companyId),
+          ),
+        )
         .orderBy(desc(issueAttachments.createdAt)),
 
     getAttachmentById: async (id: string) =>

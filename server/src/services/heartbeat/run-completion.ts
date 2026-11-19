@@ -10,7 +10,7 @@ import { PROJECT_ACCESS_DENIED, ProjectAccessDeniedError } from "../project-acce
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
-import { readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspacePreparationCode } from "./retries.js";
+import { readTransientRetryNotBeforeFromRun, readTransientRecoveryContractFromRun, readHeartbeatRunErrorFamily, isTransientWorkspaceGitScanCode, isTransientWorkspacePreparationCode } from "./retries.js";
 import { RemoteWorkspacePreparationTimeoutError, REMOTE_WORKSPACE_RESTORE_FAILED_CODE, findRemoteWorkspaceRestoreError } from "../remote-workspace-transport.js";
 import { escalateRemoteWorkspaceRestoreFailure } from "../remote-workspace-restore-recovery.js";
 import { findReusableSandboxResumeError } from "../reusable-sandbox-resume-error.js";
@@ -41,6 +41,7 @@ import { CHAT_RUN_PRESENTATION_AUTHORIZATION_REASON, isChatOriginPublicationCand
 import { normalizeMaxTurnStopReason } from "../heartbeat-stop-metadata.js";
 import { CHAT_CONTROL_RECOVERY_UNRESOLVED_CODE } from "../chat-control-recovery-stop.js";
 import { logActivity } from "../activity-log.js";
+import { SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE, currentShutdownSignal, isRunKilledByServerShutdown, isServerShutdownInProgress } from "../server-shutdown-state.js";
 import { isUnresolvedWorkspaceBaseRefError, readUnresolvedWorkspaceBaseRefDiagnostic, type UnresolvedWorkspaceBaseRefError } from "../workspace-runtime.js";
 import { runnerGoalService } from "../runner-goals.js";
 import { resolveChatRunPresentationAuthorizationReason } from "../chat-run-publications.js";
@@ -52,11 +53,14 @@ import { MAX_TURN_CONTINUATION_RETRY_REASON, isResolvedInteractionContinuationWa
 import { redactCurrentUserText } from "../../log-redaction.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
 import type { createHeartbeatRunPreparation } from "./run-preparation.js";
+import { resolveUsageLimitParkTarget, shouldParkForUsageLimit } from "./usage-limit-park-policy.js";
+import type { usageLimitParkService } from "../usage-limit-park.js";
 import type { createHeartbeatRetries, HeartbeatRetryDependencies } from "./retries.js";
 import type { createHeartbeatQueue } from "./queue.js";
 import type { createHeartbeatRunControl, HeartbeatRunControlDependencies } from "./run-control.js";
 import type { issueService } from "../issues.js";
 import type { recoveryService } from "../recovery/index.js";
+import type { createHeartbeatRecovery } from "./recovery.js";
 import type { BudgetServiceHooks } from "../budgets.js";
 import type { providerTraceStore } from "../provider-trace-store.js";
 import type { createAgentIdentityRedactor } from "../agent-identity-redaction.js";
@@ -87,8 +91,10 @@ export interface HeartbeatRunCompletionDependencies extends Pick<RunState,
   Pick<ReturnType<typeof createHeartbeatRunControl>, "releaseIssueExecutionAndPromote">,
   Pick<HeartbeatRetryDependencies, "finalizeAgentStatus">,
   Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup"> {
+  usageLimitPark?: Pick<ReturnType<typeof usageLimitParkService>, "park" | "clear">;
   issuesSvc: Pick<ReturnType<typeof issueService>, "addComment">;
-  recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop">;
+  recovery: Pick<ReturnType<typeof recoveryService>, "reconcileLegacyContinuation" | "reconcileResolvedDependencyWakeBackstop"> &
+    Pick<ReturnType<typeof createHeartbeatRecovery>, "enqueueProcessLossRetry">;
   getCurrentUserRedactionOptions: () => Promise<CurrentUserRedactionOptions>;
   budgetHooks: BudgetServiceHooks;
   runLogStore: Pick<ReturnType<typeof getRunLogStore>, "finalize">;
@@ -399,6 +405,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     handleSuccessfulRunHandoff,
     updateRuntimeState,
     scheduleBoundedRetryForRun,
+    usageLimitPark,
     scheduleInteractionContinuationInfrastructureRetryIfEligible,
     timerClaimWasFirstHeartbeat,
     releaseIssueExecutionAndPromote,
@@ -426,7 +433,18 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     await processCancellation?.settled;
     let outcome: RunSessionOutcome;
     const latestRun = await getRun(run.id);
-    if (isHeartbeatRunTerminalStatus(latestRun?.status)) {
+    // A shutdown-reaped `interrupted` row must not pin the outcome of a clean exit: the
+    // worker's own positive completion wins via the CAS on status='interrupted' below.
+    if (
+      isHeartbeatRunTerminalStatus(latestRun?.status) &&
+      !(
+        latestRun.status === "interrupted" &&
+        latestRun.errorCode === SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE &&
+        (adapterResult.exitCode ?? 0) === 0 &&
+        !adapterResult.errorMessage &&
+        !adapterResult.signal
+      )
+    ) {
       outcome = latestRun.status;
     } else if (signal.aborted) {
       outcome = "cancelled";
@@ -454,6 +472,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       outcome = "failed";
     }
 
+    // Clear early on the first successful dispatch so a stale park never outlives a recovered quota.
+    if (outcome === "succeeded") {
+      await usageLimitPark?.clear({ reason: "run_succeeded" });
+    }
+
     const nextSessionState = resolveNextSessionState({
       adapterType: agent.adapterType,
       codec: sessionCodec,
@@ -473,7 +496,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       usageBasis: adapterResult.usageBasis ?? null,
     });
     const normalizedUsage = sessionUsageResolution.normalizedUsage;
-    const runErrorMessage =
+    let runErrorMessage =
       outcome === "cancelled"
         ? redactCurrentUserText(latestRun?.error ?? adapterResult.errorMessage ?? "Cancelled", currentUserRedactionOptions)
         : outcome === "succeeded"
@@ -485,7 +508,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             );
     const recordedResponsibleUserDenialCode =
       normalizeResponsibleUserDenialCode(latestRun?.errorCode);
-    const runErrorCode =
+    let runErrorCode =
       outcome === "timed_out"
         ? "timeout"
         : outcome === "cancelled"
@@ -496,12 +519,35 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
               "adapter_failed")
             : null;
 
+    // A failure that lands while the server process is shutting down is a shutdown kill,
+    // not an adapter defect: reclassify before any terminal write (in-process signal only).
+    if (outcome === "failed" && isRunKilledByServerShutdown({ inProgress: isServerShutdownInProgress() })) {
+      outcome = "interrupted";
+      runErrorMessage =
+        `Interrupted by server shutdown (${currentShutdownSignal("SIGTERM")}) during adapter close; retry queued for restart recovery`;
+      runErrorCode = SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE;
+    }
+
     async function persistSessionState(finalizedRun: Run) {
       await updateRuntimeState(
         agent,
         finalizedRun,
         adapterResult,
-        { legacySessionId: nextSessionState.legacySessionId },
+        {
+          legacySessionId: nextSessionState.legacySessionId,
+          ...(taskKey
+            ? {}
+            : {
+                sessionParamsJson:
+                  adapterResult.clearSession || !nextSessionState.params
+                    ? null
+                    : attachPaperclipSessionMetadataToSessionParams(
+                        nextSessionState.params,
+                        configuredModel,
+                        sessionConfigMetadata,
+                      ),
+              }),
+        },
         normalizedUsage,
       );
       if (!taskKey) return;
@@ -572,7 +618,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           ? "cancelled"
           : outcome === "timed_out"
             ? "timed_out"
-            : "failed";
+            : outcome === "interrupted"
+              ? "interrupted"
+              : "failed";
 
     const cacheAdjustedCostUsd = adapterResult.costUsdExact != null && adapterResult.cacheAdjustedCostUsd == null
       ? null : resolveCacheAdjustedCostUsd(adapterResult);
@@ -724,6 +772,59 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           .returning()
           .then((rows) => rows[0] ?? null);
       }
+      if (!persistedRun && outcome === "succeeded") {
+        // Completion-wins: an external reap (shutdown drain, sweep) wrote `interrupted` while the
+        // worker was still alive. The positive completion is the last writer; only the status,
+        // metadata, liveness and agent status are refreshed here (the reap released the issue).
+        const reaped = persistedRunWrite.run;
+        if (reaped?.status === "interrupted") {
+          const reapedAt = reaped.finishedAt ? new Date(reaped.finishedAt) : null;
+          const completedAt = new Date();
+          const lateWrite = await db
+            .update(heartbeatRuns)
+            .set({
+              ...finalRunPatch,
+              status,
+              finishedAt: completedAt,
+              resultJson: {
+                ...parseObject(reaped.resultJson),
+                ...parseObject(finalRunPatch.resultJson),
+                completedAfterInterrupt: {
+                  reapedErrorCode: reaped.errorCode ?? null,
+                  reapedAt: reapedAt ? reapedAt.toISOString() : null,
+                  completedAt: completedAt.toISOString(),
+                  exitCode: adapterResult.exitCode,
+                },
+              },
+              updatedAt: completedAt,
+            })
+            .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "interrupted")))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+          if (lateWrite) {
+            await appendRunEvent(lateWrite, {
+              eventType: "lifecycle",
+              stream: "system",
+              level: "info",
+              message: `completed after reap: exit ${adapterResult.exitCode ?? "unknown"}`,
+              payload: {
+                reapedStatus: "interrupted",
+                reapedErrorCode: reaped.errorCode ?? null,
+                completionStatus: status,
+                exitCode: adapterResult.exitCode,
+              },
+            }).catch((err) => {
+              logger.warn({ err, runId: run.id }, "failed to append completed-after-reap provenance event");
+            });
+            await classifyAndPersistRunLiveness(lateWrite, persistedResultJson);
+            await finalizeAgentStatus(agent.id, outcome, null, {
+              keepIdleOnFailure: false,
+              wasFirstHeartbeat: timerClaimWasFirstHeartbeat(run),
+            });
+            return;
+          }
+        }
+      }
       if (!persistedRun) {
         await measureRunPhase("completion.cost", () => accountRunCost(db, run.id, budgetHooks)).catch((err) => {
           logger.error({ err, runId: run.id }, "Late run accounting queued for recovery");
@@ -749,6 +850,15 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           persistedRun!,
           persistedResultJson,
         ))) ?? persistedRun;
+    }
+
+    // A run reclassified as server-shutdown-interrupted on the adapter close path gets the same
+    // restart-recovery retry as the drain and sweep paths.
+    if (persistedRun && outcome === "interrupted" && runErrorCode === SERVER_SHUTDOWN_INTERRUPTED_ERROR_CODE) {
+      const shutdownRetry = await recovery.enqueueProcessLossRetry(persistedRun, agent, new Date());
+      if (!shutdownRetry) {
+        await releaseIssueExecutionAndPromote(persistedRun);
+      }
     }
 
     await setWakeupStatus(
@@ -984,6 +1094,22 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           livenessRun,
           agent,
         );
+      }
+      // Zero-work usage-limit hit (never billed, never reached the model, carries a
+      // limit-signal string) parks every agent until the advertised reset.
+      {
+        const failedResultJson = parseObject(livenessRun.resultJson);
+        if (shouldParkForUsageLimit(outcome, failedResultJson)) {
+          await usageLimitPark?.park({
+            parkedUntil: resolveUsageLimitParkTarget({
+              now: new Date(),
+              retryNotBefore: readTransientRetryNotBeforeFromRun(livenessRun),
+            }),
+            reason: readNonEmptyString(livenessRun.errorCode) ?? "usage_limit_zero_work",
+            rawLimitText: readNonEmptyString(failedResultJson.result),
+            sourceRunId: livenessRun.id,
+          });
+        }
       }
       const issueCommentPolicyResult = await finalizeIssueCommentPolicy(
         livenessRun,

@@ -7,6 +7,7 @@ import { notFound } from "../errors.js";
 import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { createS3StorageProvider } from "../storage/s3-provider.js";
 import type { StorageProvider } from "../storage/types.js";
+import { redactSensitiveText } from "../redaction.js";
 import type { ObjectJournalIOPriority } from "./object-byte-journal.js";
 import { createObjectRunLogStore } from "./object-run-log-store.js";
 import { resolveRunEvidenceStorage } from "./run-evidence-storage.js";
@@ -378,7 +379,7 @@ export function createDurableRunLogStore(options: DurableRunLogStoreOptions): Ru
         ts: event.ts,
         ...(handle.attemptId ? { attemptId: handle.attemptId } : {}),
         stream: event.stream,
-        chunk: event.chunk,
+        chunk: redactSensitiveText(event.chunk),
         // Monotonic per-run sequence so readers can dedupe and order records
         // even when several identical chunks share the same millisecond ts
         // (common for ACP-style token deltas).

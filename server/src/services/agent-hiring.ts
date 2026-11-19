@@ -1,3 +1,4 @@
+import { adapterConfigReferencesSecrets } from "./agent-secret-bindings.js";
 import { assertEphemeralAgentInstructions } from "./agent-instructions.js";
 import { initializeDurableAgentFiles } from "./agent-file-durability.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
@@ -152,7 +153,9 @@ export async function prepareAgentHireApproval(txDb: Db, existing: AgentHireReco
 
 export async function completeAgentHireApproval(txDb: Db, updated: AgentHireRecord, existing: AgentHireRecord) {
   const tx = txDb;
-  await agentCredentialService(txDb).syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+  if (adapterConfigReferencesSecrets(updated.adapterConfig)) {
+    await agentCredentialService(txDb).syncAgentSecretBindings(updated, txDb, existing.adapterConfig);
+  }
   if (!permissionsImplyLowTrust(updated.permissions) && !readBuiltInAgentMarker(updated.metadata)) {
     await tx.insert(principalPermissionGrants).values(
       NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS.map((permissionKey) => ({

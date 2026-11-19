@@ -55,13 +55,26 @@ export const legacyReconciliationRunFields = {
 
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
-  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
+  run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "error" | "startedAt" | "processPid" | "processGroupId" | "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
 ): boolean {
   if (
     run.runtimeMode === "native" ||
     !["failed", "timed_out", "interrupted", "cancelled"].includes(run.status)
   )
     return false;
+  // A run cancelled by the stale-run gate that never started cannot have side
+  // effects; minting another hold would feed the hold loop.
+  if (run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
+      !run.startedAt && !run.processPid && !run.processGroupId) return false;
+  // Provider-unreachable outage class: the provider never ran, nothing to reconcile.
+  if (run.errorCode === "adapter_failed" && typeof run.error === "string" &&
+      /^(No API key for provider|spawn E2BIG)/.test(run.error) &&
+      !(run.resultJson as Record<string, unknown> | null | undefined)?.toolCallCount) return false;
+  // Fork carryover: our own shutdown (SIGTERM wave) killed the process; the restart
+  // retry ladder owns recovery, not an action-outcome hold.
+  if (run.status === "interrupted" && run.errorCode === "server_shutdown_interrupted" &&
+      typeof run.error === "string" && run.error.includes("process lost across the shutdown boundary") &&
+      !(run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson))) return false;
   // A fresh model turn cannot repair or verify unrestored files.
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive" || hasRequiredWorkspaceRecovery(run.resultJson)) return true;
   // A fresh conversation turn lets the agent decide what remains. The retry
@@ -90,18 +103,60 @@ export function legacyExecutionNeedsReconciliation(
       || run.errorCode === RUNNER_REVISION_MISMATCH_CODE || run.errorCode === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE
       || run.errorCode === REPOSITORY_CATALOG_UNAVAILABLE_CODE) &&
       evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
+  // A no-op dispatch (pre-turn rate limit) never reached the model, so there is
+  // no provider work to reconcile however many times it retried. Its retry
+  // counter can sit at the ladder top without ever having executed a turn.
+  if ((run.resultJson as Record<string, unknown> | null | undefined)?.noOpDispatch === true) return false;
+  // Bootstrap evidence that the provider never started is authoritative no
+  // matter how many pre-provider attempts stacked up: there is no provider
+  // work to reconcile, so the retry ladder (which may run longer than the
+  // historical two-attempt default) owns the budget.
+  if (evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false) return false;
   if (executionFailureRetryCount(run) >= 2) return true;
-  return !(
-    evidence?.kind === "bootstrap" && evidence.providerWorkStarted === false
-  );
+  return true;
+}
+
+export const HANDOFF_PENDING_GRACE_MS = 5 * 60_000;
+
+/**
+ * A run the server stopped for its own handoff (PLA-12409) carries
+ * resultJson.handoffPending {runId, stopId, toAgentId, at}. No hold is minted
+ * while the handoff is committed (handoffCommitted, written in the same
+ * transaction as the assignment) or still inside the grace window. After the
+ * grace without a commit marker (failed update, crash) the normal hold applies.
+ */
+export function handoffSuppressesHold(
+  run: Pick<Run, "id" | "resultJson">, now: Date = new Date(),
+): boolean {
+  const rj = run.resultJson as Record<string, unknown> | null | undefined;
+  const p = rj?.handoffPending as Record<string, unknown> | undefined;
+  if (!p || p.runId !== run.id || typeof p.stopId !== "string" || typeof p.toAgentId !== "string" ||
+      p.stopId !== rj?.issueMutationStopId || typeof p.at !== "string") return false;
+  if (hasRequiredWorkspaceRecovery(rj) || hasWorkspaceRestoreFailure(rj)) return false;
+  const c = rj?.handoffCommitted as Record<string, unknown> | undefined;
+  if (c && c.runId === run.id && c.stopId === p.stopId && c.toAgentId === p.toAgentId) return true;
+  const at = Date.parse(p.at);
+  return Number.isFinite(at) && now.getTime() - at < HANDOFF_PENDING_GRACE_MS;
+}
+
+/** The handoff update failed: drop the pending marker and mint the normal hold. */
+export async function releaseFailedHandoffHold(db: Db, run: Run) {
+  return terminalizeLegacyExecution({ db, run, status: "cancelled", fromStatuses: ["cancelled"],
+    reconcileIfNeeded: true, dropHandoffPending: true });
 }
 
 /** Admission-wait receipts are only exempt after retained execution evidence agrees.
  * The synchronous classifier stays conservative for callers without a DB proof. */
 export async function legacyExecutionNeedsReconciliationWithEvidence(db: Db, run: Run): Promise<boolean> {
   if (await isInterruptedNativePreparation(db, run)) return false;
+  // The synchronous stale-gate exemption (fork #706) trusts the receipt alone. With a
+  // DB available, the exemption must come from verified evidence (review or execution
+  // wait predicate), so conflicting or incomplete evidence keeps the hold.
+  const staleGateReceipt = run.status === "cancelled" && run.errorCode === "execution_reconciliation_required" &&
+    !run.startedAt && !run.processPid && !run.processGroupId;
+  const classified = staleGateReceipt ? { ...run, startedAt: new Date(0) } : run;
   return await hasUnrestoredRemoteWorkspace(db, run) ||
-    (legacyExecutionNeedsReconciliation(run) && !(await isPreDispatchReviewWaitVerified(db, run))
+    (legacyExecutionNeedsReconciliation(classified) && !(await isPreDispatchReviewWaitVerified(db, run))
       && !(await isPreDispatchExecutionWaitVerified(db, run)));
 }
 
@@ -117,6 +172,8 @@ export async function terminalizeLegacyExecution(input: {
   /** Adapter settlement records a copy-back failure before host finalization. */
   recordRestoreFailureOnly?: boolean;
   workspaceRestoreSource?: LegacyWorkspaceRestoreSource;
+  /** Drop resultJson.handoffPending from the LOCKED run row (PLA-12409). */
+  dropHandoffPending?: boolean;
 }) {
   const { db, run, status } = input;
   let patch = input.patch;
@@ -146,6 +203,16 @@ export async function terminalizeLegacyExecution(input: {
     )).for("update");
     if (!current || (current.runtimeMode !== "legacy" && !(input.recordRestoreFailureOnly && current.runtimeMode === "native")) ||
         (!input.recordRestoreFailureOnly && !(input.fromStatuses ?? [run.status]).includes(current.status))) return null;
+    // Recheck under the run lock: a concurrent request may have committed the handoff.
+    if (input.dropHandoffPending && (current.resultJson as Record<string, unknown> | null)?.handoffCommitted) return current;
+    if (input.dropHandoffPending) {
+      const { handoffPending: _p, ...locked } = (current.resultJson ?? {}) as Record<string, unknown>;
+      patch = { ...patch, resultJson: locked };
+    }
+    // A late finalization snapshot must not erase the same-transaction commit marker.
+    const committedMarker = (current.resultJson as Record<string, unknown> | null)?.handoffCommitted;
+    if (committedMarker && patch?.resultJson !== undefined && !(patch.resultJson as Record<string, unknown>).handoffCommitted)
+      patch = { ...patch, resultJson: { ...(patch.resultJson ?? {}), handoffCommitted: committedMarker } };
     if (patch?.resultJson !== undefined) patch = { ...patch,
       resultJson: preserveWorkspaceRestoreRecoveryMetadata(current.resultJson,
         input.recordRestoreFailureOnly ? { ...current.resultJson, ...patch.resultJson } : patch.resultJson),
@@ -248,6 +315,7 @@ export async function terminalizeLegacyExecution(input: {
       review.currentParticipant?.type === "agent" && review.currentParticipant.agentId === run.agentId;
     if (
       task &&
+      !(retainedLeaseIds.length === 0 && handoffSuppressesHold(updated)) &&
       !isSupersededConversationRun(task, updated) &&
       (task.assigneeAgentId === run.agentId || isCurrentReviewer) &&
       (!["done", "cancelled"].includes(task.status) || retainedLeaseIds.length > 0)

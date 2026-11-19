@@ -24,6 +24,7 @@ import {
   eq,
   inArray,
   isNull,
+  ne,
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -69,6 +70,9 @@ import {
   toolProfiles,
 } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
+import { logger } from "../../middleware/logger.js";
+import { formatBridgeKeyRefusalLine, type BridgeKeyRefusal, type BridgeKeyVerifyResult } from "@paperclipai/shared";
+import { SANCTIONED_BRIDGE_ENV_KEY } from "../task-bridge-keys.js";
 import { isAiConnectionIncompatible } from "../ai-connection-runtime.js";
 import { ReviewedChatBindingNotReadyError, type ReviewedChatBindingDenialReason } from "../reviewed-chat-binding-diagnostics.js";
 import { filterResolvedGitHubConnectionsForRun } from "../git-credentials.js";
@@ -236,9 +240,13 @@ const LOW_TRUST_SENSITIVE_ENV_KEY_RE =
 //    binding; adapters enforce this at env-merge time.
 // 3. Any other PAPERCLIP_*-named binding is user data and flows through to
 //    the run env like any non-prefixed binding.
+// Fork (INV-1): worker-supplied run identity must never survive into a
+// resolved child env: the host injects the real values after resolution.
 const FORBIDDEN_ENV_BINDING_KEYS = new Set([
   "BASH_ENV", "ZDOTDIR", "GH_CONFIG_DIR",
   CONFIGURED_ENVIRONMENT_KEYS,
+  "PAPERCLIP_RUN_ID",
+  "PAPERCLIP_API_URL",
   "PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY",
   "PAPERCLIP_RUNNER_NETWORK_ACCESS",
   "PAPERCLIP_RUNNER_NETWORK_ROOTS",
@@ -311,6 +319,121 @@ function assertLowTrustEnvConfigAllowed(envValue: unknown, source: string) {
   }
 }
 
+/**
+ * Resolve the operator-bound `task_bridge` credential for
+ * `PAPERCLIP_BRIDGE_API_KEY` from the RAW (pre-strip) agent adapterConfig env,
+ * enforcing the security invariants below (INV-2/INV-3/INV-5). Fail-closed by
+ * construction: any deviation returns a typed refusal and no credential is
+ * delivered (the hermes adapter then default-denies non-allowlisted
+ * providers). The refusal taxonomy (`BridgeKeyRefusalCode`) distinguishes the
+ * historically collapsed states — expired vs revoked vs missing vs
+ * wrong-scope key, plus binding-level faults — so a bridge outage is
+ * self-explanatory instead of a generic-refusal debug pass.
+ *
+ *  - INV-2: the binding MUST be an operator-set `secret_ref`, and it is read from
+ *    the RAW env the caller supplies as `rawAgentEnv` — which MUST be the agent's
+ *    board-gated adapterConfig revision (`agents.adapterConfig`), NOT the
+ *    issue-override-merged execution-run config. Issue-assignee adapterConfig
+ *    overrides are agent-settable and shallow-merged into the run config; reading
+ *    the bridge binding from the board-gated revision keeps a future
+ *    issue-override/secret-binding refactor from opening a self-authorization
+ *    path. The `secret_ref` alone is not the authorization boundary: resolution
+ *    still requires an operator `companySecretBindings` row pinned to
+ *    `(companyId, secretId, targetType=agent, targetId=<running agent>,
+ *    configPath=env.PAPERCLIP_BRIDGE_API_KEY)` (secrets.ts), so the operator, not
+ *    the agent, authorizes the consumer. A bare string, an inline `plain` value,
+ *    or a per-user `user_secret_ref` is refused.
+ *  - INV-3: the resolved secret MUST be an agent API key whose scope kind is
+ *    `task_bridge`; any other scope (standard / board / broad) is refused via the
+ *    injected `verifyTaskBridgeKey` classifier. No verifier ⇒ scope unprovable ⇒
+ *    refuse.
+ *  - INV-5: the caller adds the returned `secretKeys` to the run-config redaction
+ *    set so the live credential is masked in logs.
+ */
+export type SanctionedBridgeKeyResolution =
+  | { status: "delivered"; value: string; secretKeys: Set<string> }
+  | { status: "refused"; refusal: BridgeKeyRefusal };
+
+export async function resolveSanctionedBridgeEnvBinding(input: {
+  companyId: string;
+  rawAgentEnv: unknown;
+  secretsSvc: Pick<RuntimeConfigSecretResolver, "resolveEnvBindings">;
+  verifyTaskBridgeKey?: (resolvedKey: string) => Promise<BridgeKeyVerifyResult>;
+  context?: Parameters<RuntimeConfigSecretResolver["resolveEnvBindings"]>[2];
+}): Promise<SanctionedBridgeKeyResolution> {
+  const rawBinding = parseObject(input.rawAgentEnv)[SANCTIONED_BRIDGE_ENV_KEY];
+  if (rawBinding === undefined) {
+    // No bridge binding configured at all — the common case for agents without
+    // a bridge credential, not a fault. Stay silent (no warn spam) and let the
+    // typed code speak for itself when a consumer surface renders it.
+    return { status: "refused", refusal: { code: "binding_absent" } };
+  }
+  const parsed = envBindingSchema.safeParse(rawBinding);
+  if (!parsed.success) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "binding_malformed" },
+      "sanctioned bridge env binding is malformed; failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code: "binding_malformed" } };
+  }
+  const binding = parsed.data;
+  // INV-2: operator-set secret_ref only. Reject legacy inline string, `plain`
+  // values, and per-user secret refs — none is an operator company secret_ref.
+  const isSecretRef =
+    typeof binding === "object" && binding !== null && binding.type === "secret_ref";
+  if (!isSecretRef) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "binding_not_secret_ref" },
+      "sanctioned bridge env binding is not an operator secret_ref; failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code: "binding_not_secret_ref" } };
+  }
+  let value: string | undefined;
+  let secretKeys = new Set<string>();
+  try {
+    const resolution = await input.secretsSvc.resolveEnvBindings(
+      input.companyId,
+      { [SANCTIONED_BRIDGE_ENV_KEY]: binding },
+      input.context,
+    );
+    value = resolution.env[SANCTIONED_BRIDGE_ENV_KEY];
+    secretKeys = resolution.secretKeys;
+  } catch (err) {
+    // Missing backing secret / provider error ⇒ fail closed (INV-2). Never leak
+    // the value or a partial secret into logs.
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "secret_unresolved", err: (err as Error).message },
+      "sanctioned bridge secret failed to resolve; failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code: "secret_unresolved" } };
+  }
+  if (typeof value !== "string" || value.length === 0) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "secret_unresolved" },
+      "sanctioned bridge secret resolved to an empty value; failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code: "secret_unresolved" } };
+  }
+  // INV-3: fail-closed unless the resolved key is a task_bridge-scoped agent key.
+  if (!input.verifyTaskBridgeKey) {
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: "verifier_unavailable" },
+      "no bridge key verifier is wired; scope unprovable, failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code: "verifier_unavailable" } };
+  }
+  const verification = await input.verifyTaskBridgeKey(value);
+  if (!verification.ok) {
+    const { ok: _ok, code, ...rest } = verification;
+    logger.warn(
+      { companyId: input.companyId, envKey: SANCTIONED_BRIDGE_ENV_KEY, refusalCode: code, ...rest },
+      formatBridgeKeyRefusalLine(verification) + "; failing closed (no bridge key injected)",
+    );
+    return { status: "refused", refusal: { code, ...rest } };
+  }
+  return { status: "delivered", value, secretKeys };
+}
+
 export async function resolveExecutionRunAdapterConfig(input: {
   managedAiCredentials?: boolean;
   companyId: string;
@@ -329,6 +452,14 @@ export async function resolveExecutionRunAdapterConfig(input: {
   routineEnv?: unknown;
   secretsSvc: RuntimeConfigSecretResolver;
   trustPreset?: TrustPresetResolution;
+  /**
+   * RAW `agents.adapterConfig.env` (board-gated; before the issue-override merge and the
+   * PAPERCLIP_* strip): the only authorization source for the sanctioned
+   * `PAPERCLIP_BRIDGE_API_KEY` binding (INV-2). Omit to fail closed.
+   */
+  boardGatedAgentEnv?: unknown;
+  /** Classifies a resolved bridge key as a live `task_bridge` key or a typed refusal (INV-3). Omit to fail closed. */
+  verifyTaskBridgeKey?: (resolvedKey: string) => Promise<BridgeKeyVerifyResult>;
   requiredScopedEnvBinding?: {
     keys: string[];
     consumerScopes: Array<"agent" | "project">;
@@ -601,6 +732,43 @@ export async function resolveExecutionRunAdapterConfig(input: {
     };
     for (const key of input.trustedEnvSecretKeys ?? []) secretKeys.add(key);
   }
+  // Sanctioned task_bridge credential delivery (separated-identity design). The PAPERCLIP_*
+  // strip above removed any PAPERCLIP_BRIDGE_API_KEY binding along with run identity;
+  // re-resolve it from the agent's BOARD-GATED adapterConfig env (INV-2), never from the
+  // issue-override-merged run config. Delivered only into the single sanctioned slot;
+  // run identity (PAPERCLIP_API_KEY) is never touched (INV-1).
+  let bridgeKey: { status: "delivered" } | { status: "refused"; refusal: BridgeKeyRefusal } | null = null;
+  if (input.agentId) {
+    const bridgeResolution = await resolveSanctionedBridgeEnvBinding({
+      companyId: input.companyId,
+      rawAgentEnv: input.boardGatedAgentEnv,
+      secretsSvc: input.secretsSvc,
+      verifyTaskBridgeKey: input.verifyTaskBridgeKey,
+      context: {
+        consumerType: "agent",
+        consumerId: input.agentId,
+        actorType: "agent",
+        actorId: input.agentId,
+        responsibleUserId: input.responsibleUserId ?? null,
+        issueId: input.issueId ?? null,
+        heartbeatRunId: input.heartbeatRunId ?? null,
+        ...(lowTrustAllowedBindingIds !== undefined ? { allowedBindingIds: lowTrustAllowedBindingIds } : {}),
+      },
+    });
+    if (bridgeResolution.status === "delivered") {
+      bridgeKey = { status: "delivered" };
+      resolvedConfig.env = {
+        ...parseObject(resolvedConfig.env),
+        [SANCTIONED_BRIDGE_ENV_KEY]: bridgeResolution.value,
+      };
+      for (const key of bridgeResolution.secretKeys) {
+        secretKeys.add(key); // INV-5: mask the live credential in run-config logging.
+      }
+      secretKeys.add(SANCTIONED_BRIDGE_ENV_KEY);
+    } else {
+      bridgeKey = { status: "refused", refusal: bridgeResolution.refusal };
+    }
+  }
   // Pre-dispatch credential gate for codex_local: a managed Codex home with no
   // usable auth.json and an empty OPENAI_API_KEY would dispatch a run that
   // immediately fails with "no Codex credentials provisioned" (adapter_failed),
@@ -657,6 +825,8 @@ export async function resolveExecutionRunAdapterConfig(input: {
       Object.entries(parseObject(resolvedConfig.env)).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
     ),
     secretKeys,
+    // Typed outcome of the sanctioned task_bridge credential resolution (null = not attempted).
+    bridgeKey,
     secretManifest: [
       ...(environmentEnvResolution.manifest ?? []),
       ...(manifest ?? []),
@@ -2310,6 +2480,9 @@ export async function buildPaperclipWakePayload(input: {
   // Experimental: agents write user-interaction content in ASD-STE100
   // Simplified Technical English (rendered as a prompt directive downstream).
   simplifiedEnglishInteractions?: boolean;
+  // The run that will receive this payload: enables the run-start stamp and
+  // the same-issue sibling-run list (metadata only).
+  currentRun?: { id: string; startedAt?: Date | string | null } | null;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const commentIds = extractWakeCommentIds(input.contextSnapshot);
@@ -2674,6 +2847,36 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const currentRun = input.currentRun ?? null;
+  const runStartedAt = (() => {
+    if (!currentRun?.startedAt) return null;
+    const parsed = currentRun.startedAt instanceof Date ? currentRun.startedAt : new Date(currentRun.startedAt);
+    return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+  })();
+  const siblingRuns =
+    issueId && currentRun
+      ? await input.db
+          .select({ runId: heartbeatRuns.id, agentName: agents.name, startedAt: heartbeatRuns.startedAt })
+          .from(heartbeatRuns)
+          .innerJoin(agents, eq(agents.id, heartbeatRuns.agentId))
+          .where(
+            and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+              ne(heartbeatRuns.id, currentRun.id),
+              inArray(heartbeatRuns.status, ["queued", "running"]),
+            ),
+          )
+          .orderBy(desc(heartbeatRuns.createdAt))
+          .limit(5)
+          .then((rows) =>
+            rows.map((row) => ({
+              runId: row.runId,
+              agentName: row.agentName,
+              startedAt: row.startedAt ? row.startedAt.toISOString() : null,
+            })),
+          )
+      : [];
   const payload = {
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
@@ -2851,6 +3054,8 @@ export async function buildPaperclipWakePayload(input: {
     },
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
+    runStartedAt,
+    siblingRuns,
   };
   return issueId
     ? createRunSecretRedactionRegistry(input.db).redactForIssue(

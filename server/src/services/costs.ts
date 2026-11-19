@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { receiptFingerprint } from "./receipt-fingerprint.js";
 import { agentAvatarUrl, resolveAgentAppearance, createCostEventSchema, createServiceCostEventSchema, normalizeCents, isUuidLike, type MoneyInput, type CostByUserReport } from "@paperclipai/shared";
 import { and, desc, eq, gte, inArray, isNotNull, isNull, lt, lte, ne, sql } from "drizzle-orm";
@@ -117,7 +118,7 @@ export async function createCostEventInTransaction(db: Db, companyId: string, da
   }
   // Server-derived attribution stays outside the immutable receipt fingerprint;
   // replaying a receipt must not depend on later account metadata changes.
-  const [inserted] = await db.insert(costEvents).values({ ...values, subscriptionId, costCents: sql`${values.costCents}::numeric`, reportedCostCents: values.costCents, id: data.id, companyId, receiptHash })
+  const [inserted] = await db.insert(costEvents).values({ ...values, subscriptionId, costCents: sql`${values.costCents}::numeric`, reportedCostCents: values.costCents, id: data.id, companyId, receiptHash, runIdentifier: (values as { runIdentifier?: string | null }).runIdentifier ?? values.heartbeatRunId ?? randomUUID() })
     .onConflictDoNothing().returning();
   if (!inserted) {
     const [winner] = values.idempotencyKey ? await db.select().from(costEvents).where(and(
@@ -434,9 +435,9 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.runIdentifier} end)::int`,
           subscriptionRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.runIdentifier} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
@@ -476,9 +477,9 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.runIdentifier} end)::int`,
           subscriptionRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.runIdentifier} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:
@@ -510,9 +511,9 @@ export function costService(db: Db, _budgetHooks: BudgetServiceHooks = {}) {
           cachedInputTokens: sumAsNumber(costEvents.cachedInputTokens),
           outputTokens: sumAsNumber(costEvents.outputTokens),
           apiRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} = ${METERED_BILLING_TYPE} then ${costEvents.runIdentifier} end)::int`,
           subscriptionRunCount:
-            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.heartbeatRunId} end)::int`,
+            sql<number>`count(distinct case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.runIdentifier} end)::int`,
           subscriptionCachedInputTokens:
             sql<number>`coalesce(sum(case when ${costEvents.billingType} in (${sql.join(SUBSCRIPTION_BILLING_TYPES.map((value) => sql`${value}`), sql`, `)}) then ${costEvents.cachedInputTokens} else 0 end), 0)::double precision`,
           subscriptionInputTokens:

@@ -1,3 +1,4 @@
+import { MAX_ATTACHMENT_BYTES } from "../../attachment-types.js";
 import { resolveExternalTestDatabaseUrl } from "../../__tests__/helpers/external-test-database.js";
 import type { PrpStructuredRunResult } from "../../vendor/paperclip-runner/index.js";
 import { nativeCompletionFeedback } from "./native-completion-feedback.js";
@@ -392,7 +393,7 @@ describe("native runner file handoff", () => {
           filename: {
             description: expect.stringContaining("Directory components"),
           },
-          byteSize: { minimum: 1, maximum: 10 * 1024 * 1024 },
+          byteSize: { minimum: 1, maximum: MAX_ATTACHMENT_BYTES },
           contentRef: {
             description: expect.stringContaining("Workspace-relative"),
           },

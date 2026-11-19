@@ -394,10 +394,11 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     }
     : null;
 
+  const standbyWakeTarget = parsed.data.standbyWakeTarget === true;
   const reviewPreset = parsed.data.reviewPreset;
   const authorizationPolicy = parsed.data.authorizationPolicy;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy
+  if (stages.length === 0 && !monitor && !standbyWakeTarget && !reviewPreset && !authorizationPolicy
     && parsed.data.maxReviewRounds == null && !parsed.data.requiredQualityReview) return null;
 
   return {
@@ -406,6 +407,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     stages,
     ...(parsed.data.requiredQualityReview ? { requiredQualityReview: parsed.data.requiredQualityReview } : {}),
     ...(monitor ? { monitor } : {}),
+    ...(standbyWakeTarget ? { standbyWakeTarget: true } : {}),
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),

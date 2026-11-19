@@ -1,3 +1,4 @@
+import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../delivery-work-notifications.js";
 import { notifyIssueReviewState } from "../issue-review-state-notifications.js";
@@ -36,6 +37,7 @@ import {
   asc,
   getTableColumns,
   gte,
+  gt,
 } from "drizzle-orm";
 import { RECOVERY_ORIGIN_KINDS } from "../recovery/index.js";
 import { visibleIssueCondition } from "../issue-visibility.js";
@@ -587,6 +589,12 @@ export function createHeartbeatScheduling(
       eq(issues.monitorWakeRequestedAt, claimed.monitorWakeRequestedAt!));
   }
 
+  // Release only our own claim; tolerate status/assignee changes after the claim.
+  function issueMonitorOwnClaimCondition(claimed: IssueMonitorDispatchRow) {
+    return and(eq(issues.id, claimed.id), eq(issues.companyId, claimed.companyId),
+      eq(issues.monitorWakeRequestedAt, claimed.monitorWakeRequestedAt!));
+  }
+
   async function releaseIssueMonitorWithDiagnostic(
     claimed: IssueMonitorDispatchRow,
     input: Pick<Parameters<typeof dispatchClaimedIssueMonitor>[1],
@@ -638,6 +646,36 @@ export function createHeartbeatScheduling(
       });
       logger.warn({ err, issueId: claimed.id }, "issue monitor diagnostic could not be recorded");
     }
+  }
+
+  function parseSkipMonitorWhenNoActivity(agent: { runtimeConfig: unknown }) {
+    const runtimeConfig = parseObject(agent.runtimeConfig);
+    return runtimeConfig.skipMonitorWhenNoActivity === true;
+  }
+
+  // Activity = any comment, or any non-monitor activity-log entry on the issue,
+  // after the monitor last fired. Monitor bookkeeping rows do not count.
+  async function issueHasActivitySince(issueId: string, companyId: string, since: Date) {
+    const [comment] = await db
+      .select({ id: issueComments.id })
+      .from(issueComments)
+      .where(and(eq(issueComments.issueId, issueId), gt(issueComments.createdAt, since)))
+      .limit(1);
+    if (comment) return true;
+    const [event] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, issueId),
+          gt(activityLog.createdAt, since),
+          sql`${activityLog.action} not like 'issue.monitor%'`,
+        ),
+      )
+      .limit(1);
+    return Boolean(event);
   }
 
   async function dispatchClaimedIssueMonitor(
@@ -695,6 +733,70 @@ export function createHeartbeatScheduling(
       : claimed.assigneeAgentId;
     if (!targetAgentId) {
       throw conflict("Issue monitor has no agent target");
+    }
+    if (input.source === "automation" && !isProviderQuotaReviewMonitor) {
+      let shouldSkip = false;
+      try {
+        const skipAgent = await getAgent(targetAgentId);
+        shouldSkip = Boolean(
+          skipAgent &&
+            parseSkipMonitorWhenNoActivity(skipAgent) &&
+            !clearReason &&
+            !monitor?.serviceName &&
+            claimed.monitorLastTriggeredAt &&
+            !(await issueHasActivitySince(claimed.id, claimed.companyId, claimed.monitorLastTriggeredAt)),
+        );
+      } catch (err) {
+        // Release the claim so the monitor is not stuck, then surface the error.
+        await db.update(issues).set({ monitorWakeRequestedAt: null })
+          .where(issueMonitorOwnClaimCondition(claimed));
+        throw err;
+      }
+      if (shouldSkip) {
+        const skipped = await db
+          .update(issues)
+          .set({
+            ...buildIssueMonitorClearedPatch({
+              issue: claimed,
+              policy,
+              clearReason: "dispatch_skipped",
+              clearedAt: input.now,
+            }),
+            updatedAt: new Date(),
+          })
+          .where(and(
+            issueMonitorClaimCondition(claimed),
+            // Do not overwrite a policy/state change made after the claim.
+            sql`${issues.executionPolicy} is not distinct from ${claimed.executionPolicy === null || claimed.executionPolicy === undefined ? null : JSON.stringify(claimed.executionPolicy)}::jsonb`,
+            sql`${issues.executionState} is not distinct from ${claimed.executionState === null || claimed.executionState === undefined ? null : JSON.stringify(claimed.executionState)}::jsonb`,
+          ))
+          .returning({ id: issues.id });
+        if (skipped.length === 0) {
+          // Snapshot or monitor changed after the claim: release our claim if we still hold it.
+          await db.update(issues).set({ monitorWakeRequestedAt: null })
+            .where(issueMonitorOwnClaimCondition(claimed));
+          return { outcome: "skipped" as const, reason: "monitor_replaced" };
+        }
+        await logActivity(db, {
+          companyId: claimed.companyId,
+          actorType: input.actorType,
+          actorId: input.actorId,
+          agentId: input.agentId,
+          runId: input.runId,
+          action: "issue.monitor_skipped",
+          entityType: "issue",
+          entityId: claimed.id,
+          details: {
+            identifier: claimed.identifier,
+            nextCheckAt: scheduledAtIso,
+            attemptCount: nextAttemptCount,
+            notes: claimed.monitorNotes ?? null,
+            reason: "no_activity_since_last_run",
+            source: input.activitySource,
+          },
+        });
+        return { outcome: "skipped" as const, reason: "no_activity_since_last_run" };
+      }
     }
     const wakeReason = isProviderQuotaReviewMonitor
       ? EXECUTION_REVIEW_PARTICIPANT_RECOVERY_WAKE_REASON
@@ -756,7 +858,15 @@ export function createHeartbeatScheduling(
             "Native execution recovery owns this provider failure; a quota monitor cannot start a replacement.",
           );
         }
-        if (await legacyExecutionNeedsReconciliationWithEvidence(db, sourceRun)) {
+        // A quota monitor replays only while the source run retains retry
+        // budget; once the two-attempt hold is spent, escalate to operator
+        // reconciliation instead of replaying forever.
+        const quotaReplayBudgetExhausted =
+          executionFailureRetryCount(sourceRun) >= 2;
+        if (
+          quotaReplayBudgetExhausted ||
+          await legacyExecutionNeedsReconciliationWithEvidence(db, sourceRun)
+        ) {
           await terminalizeLegacyExecution({
             db,
             run: sourceRun,

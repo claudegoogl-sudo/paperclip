@@ -6,7 +6,6 @@ import { normalizeAgentNameKey } from "../agent-name-key.js";
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { deriveTaskKeyWithHeartbeatFallback } from "./run-state.js";
-import { infrastructureRetryDelayMs } from "../system-recovery-state.js";
 import {
   WORKSPACE_VALIDATION_FAILURE_CODE,
   isWorkspaceValidationFailedRun,
@@ -61,6 +60,8 @@ import {
 import { logger } from "../../middleware/logger.js";
 import { parseObject } from "../../adapters/utils.js";
 import { logActivity } from "../activity-log.js";
+import { issueService } from "../issues.js";
+import { EXECUTION_PATH_HEARTBEAT_RUN_STATUSES } from "./queue.js";
 import { readContinuationAttempt } from "../recovery/index.js";
 import { withRecoveryContext } from "../recovery/status-only-context.js";
 import {
@@ -136,10 +137,45 @@ export interface HeartbeatRetryDependencies {
 }
 
 export const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS = [
-  30_000, 60_000,
+  2 * 60 * 1000,
+  10 * 60 * 1000,
+  30 * 60 * 1000,
+  2 * 60 * 60 * 1000,
 ] as const;
 
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON = "transient_failure";
+// Routine executions only release issues that still have actionable work (fork guard).
+const ROUTINE_EXECUTION_RELEASABLE_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked"] as const;
+// Fork no-op dispatch retry budget: a dispatch that never reached the model gets its own cap.
+export const NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS = 8;
+const NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS = 10 * 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MIN_DELAY_MS = 60 * 1000;
+const NO_OP_DISPATCH_RETRY_MAX_DELAY_MS = 5 * 60 * 60 * 1000;
+const NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS_LOCAL = 60 * 1000;
+// Bound a single provider-stated transient wait so a pathological timestamp cannot strand the run.
+export const TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS = 7 * 24 * 60 * 60 * 1000;
+
+function resolveNoOpDispatchRetry(input: { run: { resultJson?: unknown; contextSnapshot?: unknown }; retryReason: string }) {
+  const isNoOp =
+    input.retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON &&
+    parseObject(input.run.resultJson).noOpDispatch === true;
+  const prev = parseObject(input.run.contextSnapshot).noOpDispatchRetryAttempt;
+  const prevAttempt = typeof prev === "number" && Number.isInteger(prev) && prev > 0 ? prev : 0;
+  const attempt = isNoOp ? prevAttempt + 1 : 0;
+  const exhausted = isNoOp && attempt > NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS;
+  return { attempt, exhausted, active: isNoOp && !exhausted, maxAttempts: NO_OP_DISPATCH_RETRY_MAX_ATTEMPTS };
+}
+
+function buildNoOpDispatchRetrySchedule(input: { now: Date; attempt: number; maxAttempts: number; retryNotBefore: Date | null }) {
+  const target = input.retryNotBefore
+    ? input.retryNotBefore.getTime() + NO_OP_DISPATCH_RETRY_SAFETY_MARGIN_MS_LOCAL
+    : input.now.getTime() + NO_OP_DISPATCH_RETRY_FALLBACK_DELAY_MS;
+  const delayMs = Math.min(
+    NO_OP_DISPATCH_RETRY_MAX_DELAY_MS,
+    Math.max(NO_OP_DISPATCH_RETRY_MIN_DELAY_MS, target - input.now.getTime()),
+  );
+  return { attempt: input.attempt, baseDelayMs: delayMs, delayMs, dueAt: new Date(input.now.getTime() + delayMs), maxAttempts: input.maxAttempts };
+}
 
 const BOUNDED_TRANSIENT_HEARTBEAT_RETRY_WAKE_REASON = "transient_failure_retry";
 
@@ -292,7 +328,7 @@ export function readHeartbeatRunErrorFamily(
   return null;
 }
 
-function readTransientRetryNotBeforeFromRun(
+export function readTransientRetryNotBeforeFromRun(
   run: Pick<typeof heartbeatRuns.$inferSelect, "resultJson">,
 ) {
   const resultJson = parseObject(run.resultJson);
@@ -395,7 +431,9 @@ export function computeBoundedTransientHeartbeatRetrySchedule(
   if (!Number.isInteger(attempt) || attempt <= 0) return null;
   const baseDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[attempt - 1];
   if (typeof baseDelayMs !== "number") return null;
-  const delayMs = infrastructureRetryDelayMs(attempt, random());
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMultiplier = 1 + (sample * 2 - 1) * 0.25;
+  const delayMs = Math.max(1_000, Math.round(baseDelayMs * jitterMultiplier));
   return {
     attempt,
     baseDelayMs,
@@ -431,6 +469,101 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     getWorktreeExecutionCutoff,
     applyRunDispatchPostCommitEffects,
   } = dependencies;
+
+  const issuesSvc = issueService(db);
+
+  // A routine execution issue is only reachable through its run. Once the bounded retry ladder
+  // gives up, terminalise it (with a visible comment) so the next tick can start a fresh run.
+  async function releaseRoutineExecutionIssueAfterRetryGiveUp(
+    run: typeof heartbeatRuns.$inferSelect,
+    details: { retryReason: string; attempt: number; maxAttempts: number; giveUpReason: string },
+  ) {
+    // Releasing the routine issue is best-effort: a failure here must never block
+    // exhaustion bookkeeping or the plan-resume escalation that follows.
+    try {
+      return await releaseRoutineExecutionIssueAfterRetryGiveUpUnsafe(run, details);
+    } catch (err) {
+      logger.warn({ err, runId: run.id }, "failed to release routine execution issue after retry give-up");
+      return { released: false as const, reason: "release_failed" as const };
+    }
+  }
+
+  async function releaseRoutineExecutionIssueAfterRetryGiveUpUnsafe(
+    run: typeof heartbeatRuns.$inferSelect,
+    details: { retryReason: string; attempt: number; maxAttempts: number; giveUpReason: string },
+  ) {
+    const contextSnapshot = parseObject(run.contextSnapshot);
+    const issueId = readNonEmptyString(contextSnapshot.issueId);
+    if (!issueId) return { released: false as const, reason: "no_issue" as const };
+    const issue = await db
+      .select({ id: issues.id, status: issues.status, originKind: issues.originKind })
+      .from(issues)
+      .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+      .then((rows) => rows[0] ?? null);
+    if (!issue) return { released: false as const, reason: "issue_not_found" as const };
+    if (issue.originKind !== "routine_execution") {
+      return { released: false as const, reason: "not_routine_execution" as const };
+    }
+    if (!ROUTINE_EXECUTION_RELEASABLE_ISSUE_STATUSES.includes(issue.status as never)) {
+      return { released: false as const, reason: "issue_already_terminal" as const };
+    }
+    // Never release an issue another live run is still driving; that run is the waker.
+    const otherLiveRun = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, run.companyId),
+          ne(heartbeatRuns.id, run.id),
+          inArray(heartbeatRuns.status, [...EXECUTION_PATH_HEARTBEAT_RUN_STATUSES]),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    if (otherLiveRun) return { released: false as const, reason: "another_live_run" as const };
+
+    const lastError = readNonEmptyString(run.error);
+    const lastErrorCode = readNonEmptyString(run.errorCode);
+    const comment = [
+      "Automatic retries for this routine execution have been exhausted, so the control plane is closing this issue.",
+      "",
+      `- Retry ladder: \`${details.retryReason}\`, ${details.maxAttempts} scheduled attempt(s); attempt ${details.attempt} was not queued`,
+      `- Give-up reason: ${details.giveUpReason}`,
+      `- Last error code: ${lastErrorCode ? `\`${lastErrorCode}\`` : "_none recorded_"}`,
+      `- Last error: ${lastError ? lastError.slice(0, 500) : "_none recorded_"}`,
+      `- Last run: \`${run.id}\``,
+      "",
+      "No further automatic wake will be queued for this issue. The routine's next scheduled tick will create a fresh execution issue.",
+    ].join("\n");
+    try {
+      await issuesSvc.addComment(issueId, comment, { agentId: run.agentId, runId: run.id });
+    } catch (err) {
+      logger.warn({ err, issueId, runId: run.id }, "failed to post retry-exhaustion comment on routine execution issue");
+    }
+    await issuesSvc.update(issueId, { status: "cancelled", actorAgentId: run.agentId });
+    await appendRunEvent(run, {
+      eventType: "lifecycle",
+      stream: "system",
+      level: "warn",
+      message: "Released routine execution issue after bounded retry give-up",
+      payload: { issueId, retryReason: details.retryReason, attempt: details.attempt, maxAttempts: details.maxAttempts, giveUpReason: details.giveUpReason, errorCode: lastErrorCode },
+    });
+    try {
+      await logActivity(db, {
+        companyId: run.companyId,
+        actorType: "system",
+        actorId: "heartbeat-retry",
+        action: "routine.execution_issue_released",
+        entityType: "issue",
+        entityId: issueId,
+        details: { runId: run.id, retryReason: details.retryReason, attempt: details.attempt, maxAttempts: details.maxAttempts, giveUpReason: details.giveUpReason, errorCode: lastErrorCode },
+      });
+    } catch (err) {
+      logger.warn({ err, issueId, runId: run.id }, "failed to log routine execution issue release");
+    }
+    return { released: true as const, issueId };
+  }
 
   async function scheduleBoundedRetryForRun(
     run: typeof heartbeatRuns.$inferSelect,
@@ -494,8 +627,9 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           ? INTERRUPTED_PREPARATION_RETRY_MAX_ATTEMPTS : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS),
       ),
     );
+    const noOpDispatchRetry = resolveNoOpDispatchRetry({ run, retryReason });
     const consumedAttempts = executionRetryAttemptCount(run, retryReason);
-    const nextAttempt = consumedAttempts + 1;
+    const nextAttempt = consumedAttempts + (noOpDispatchRetry.active ? 0 : 1);
     // An interrupted preparation never spends failures, but it never revives
     // a chain whose real failures already spent the failure budget either.
     const failureBudgetSpent = interruptedPreparationLane && opts?.maxAttempts == null
@@ -527,9 +661,6 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               opts?.random,
             )
           : null;
-    const baseSchedule = computedBaseSchedule
-      ? { ...computedBaseSchedule, maxAttempts }
-      : null;
     const transientRecovery =
       (retryReason === BOUNDED_TRANSIENT_HEARTBEAT_RETRY_REASON
         || retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON && run.errorCode === REPOSITORY_CATALOG_UNAVAILABLE_CODE)
@@ -541,6 +672,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         ? resolveCodexTransientFallbackMode(nextAttempt)
         : null;
     const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;
+    const baseSchedule = noOpDispatchRetry.exhausted
+      ? null
+      : noOpDispatchRetry.active
+        ? buildNoOpDispatchRetrySchedule({ now, attempt: nextAttempt, maxAttempts, retryNotBefore: transientRetryNotBefore })
+        : computedBaseSchedule
+          ? { ...computedBaseSchedule, maxAttempts }
+          : null;
     const contextSnapshot = parseObject(run.contextSnapshot);
     // A retry inherits the durable authorization scope of its source run. Do
     // not promote an untrusted or legacy contextSnapshot.issueId into a new
@@ -552,14 +690,29 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         retryReason,
         scheduledRetryAttempt: consumedAttempts,
         maxAttempts,
+        ...(noOpDispatchRetry.exhausted
+          ? { noOpDispatchRetryAttempt: noOpDispatchRetry.attempt, noOpDispatchMaxAttempts: noOpDispatchRetry.maxAttempts }
+          : {}),
       };
       await appendRunEvent(run, {
         eventType: "lifecycle",
         stream: "system",
         level: "warn",
-        message: `Bounded retry exhausted after ${consumedAttempts} scheduled attempts; no further automatic retry will be queued`,
+        message: `${noOpDispatchRetry.exhausted
+          ? `No-op dispatch retries exhausted after ${noOpDispatchRetry.maxAttempts} attempts that never reached the model`
+          : `Bounded retry exhausted after ${consumedAttempts} scheduled attempts`}; no further automatic retry will be queued`,
         payload: exhaustion,
         retryExhaustion: exhaustion,
+      });
+      // Interaction-continuation retries resume a plan approval, never a routine tick;
+      // they have no routine execution issue to release (and must not query for one).
+      if (retryReason !== INTERACTION_CONTINUATION_INFRA_RETRY_REASON) await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
+        retryReason,
+        attempt: nextAttempt,
+        maxAttempts,
+        giveUpReason: noOpDispatchRetry.exhausted
+          ? `No-op dispatch retries exhausted after ${noOpDispatchRetry.maxAttempts} attempts that never reached the model`
+          : `Bounded retry exhausted after ${consumedAttempts} scheduled attempts`,
       });
       if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON) {
         await escalatePlanApprovalResumeFailureNeedsAttention({
@@ -611,6 +764,12 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             ...invokability.details,
           },
         });
+        await releaseRoutineExecutionIssueAfterRetryGiveUp(run, {
+          retryReason,
+          attempt: nextAttempt,
+          maxAttempts,
+          giveUpReason: "Scheduled retry suppressed because the agent is not invokable",
+        });
         return {
           outcome: "not_scheduled" as const,
           reason:
@@ -621,16 +780,23 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       }
     }
 
+    // The cap applies to the transient_upstream family only; provider-quota
+    // reset horizons are the account's real reset clock and are honored exactly.
+    const capApplies = transientRecovery?.errorFamily !== "provider_quota";
+    const honoredNotBeforeMs =
+      transientRetryNotBefore !== null
+        ? capApplies
+          ? Math.min(transientRetryNotBefore.getTime(), now.getTime() + TRANSIENT_RETRY_NOT_BEFORE_MAX_DELAY_MS)
+          : transientRetryNotBefore.getTime()
+        : null;
     const schedule =
-      transientRetryNotBefore &&
-      transientRetryNotBefore.getTime() > baseSchedule.dueAt.getTime()
+      !noOpDispatchRetry.active &&
+      honoredNotBeforeMs !== null &&
+      honoredNotBeforeMs > baseSchedule.dueAt.getTime()
         ? {
             ...baseSchedule,
-            dueAt: transientRetryNotBefore,
-            delayMs: Math.max(
-              0,
-              transientRetryNotBefore.getTime() - now.getTime(),
-            ),
+            dueAt: new Date(honoredNotBeforeMs),
+            delayMs: Math.max(0, honoredNotBeforeMs - now.getTime()),
           }
         : baseSchedule;
 
@@ -737,6 +903,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           : {}),
         scheduledRetryAttempt: schedule.attempt,
         scheduledRetryAt: schedule.dueAt.toISOString(),
+        noOpDispatchRetryAttempt: noOpDispatchRetry.attempt,
+        ...(noOpDispatchRetry.active ? { noOpDispatchRetry: true } : {}),
         ...(transientRetryNotBefore
           ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() }
           : {}),
@@ -1258,7 +1426,10 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
           }
         }
 
-        if (issueId) {
+        // The lock hand-off is guarded by `executionRunId = run.id`, so a legacy
+        // contextSnapshot issueId is safe here (fork behavior; no FK binding is created).
+        const lockIssueId = issueId ?? readNonEmptyString(contextSnapshot.issueId);
+        if (lockIssueId) {
           await notifyStatusCardIssueChange(tx, run.companyId);
           await tx
             .update(issues)
@@ -1277,7 +1448,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             })
             .where(
               and(
-                eq(issues.id, issueId),
+                eq(issues.id, lockIssueId),
                 eq(issues.companyId, run.companyId),
                 eq(issues.executionRunId, run.id),
               ),
@@ -1347,8 +1518,13 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       eventType: "lifecycle",
       stream: "system",
       level: "warn",
-      message: `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
+      message: noOpDispatchRetry.active
+        ? `Scheduled no-op dispatch retry ${noOpDispatchRetry.attempt}/${noOpDispatchRetry.maxAttempts} for ${schedule.dueAt.toISOString()} without consuming bounded retry attempt ${schedule.attempt}`
+        : `Scheduled bounded retry ${schedule.attempt}/${schedule.maxAttempts} for ${schedule.dueAt.toISOString()}`,
       payload: {
+        ...(noOpDispatchRetry.active
+          ? { noOpDispatchRetry: true, noOpDispatchRetryAttempt: noOpDispatchRetry.attempt, noOpDispatchMaxAttempts: noOpDispatchRetry.maxAttempts }
+          : {}),
         retryRunId: retryRun.id,
         retryReason,
         ...(transientRecovery
