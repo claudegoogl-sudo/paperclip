@@ -631,10 +631,6 @@ export async function createApp(
   // A signed claim above commits identity before any normal request can seed
   // company data. Unclaimed probes bypass session resolution as well as SQL.
   app.use(cloudWarmStandbyMiddleware(isWarmStandby, health, staticUi));
-  const workerManager = opts.pluginWorkerManager ?? createPluginWorkerManager();
-  app.use("/api/customer-success/v1", customerSuccessRoutes(db, opts.storageService, {
-    pluginWorkerManager: workerManager,
-  }));
   app.use(museTransportRoutes(db, opts.authPublicBaseUrl));
   app.use(publicMcpIngress);
   // Connection-intent tools carry their own short-lived, run-bound bearer and
@@ -677,6 +673,9 @@ export async function createApp(
         publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
       },
     });
+  app.use("/api/customer-success/v1", customerSuccessRoutes(db, opts.storageService, {
+    pluginWorkerManager: workerManager,
+  }));
   let lifecyclePluginsReady = false;
   const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
   const connectionIntentHeartbeat = heartbeatService(db, {
@@ -1629,17 +1628,6 @@ export async function createApp(
         importSpoolCleanup.unsubscribe();
         await deliveryWork.stop();
         eventRelayProbe.stop();
-        unsubscribeChatPublicationSignals();
-        chatReconciliation.stop();
-        if (chatPublicationTimer) {
-          clearInterval(chatPublicationTimer);
-          chatPublicationTimer = null;
-        }
-        await chatReconciliation.drain();
-        if (importTransferSweepTimer) {
-          clearInterval(importTransferSweepTimer);
-          importTransferSweepTimer = null;
-        }
         devWatcher?.close();
         viteHtmlRenderer?.dispose();
         void viteDevServer?.close().catch(() => undefined);

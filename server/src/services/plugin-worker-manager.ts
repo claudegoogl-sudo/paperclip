@@ -22,7 +22,6 @@ import { PluginWorkerUnavailableError } from "./plugin-worker-unavailable-error.
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
-import { randomUUID } from "node:crypto";
 import { beginIdleTrackedWork, readTaskDrain, trackIdleWork } from "./task-admission.js";
 import { EventEmitter } from "node:events";
 import type { PaperclipPluginManifestV1 } from "@paperclipai/shared";

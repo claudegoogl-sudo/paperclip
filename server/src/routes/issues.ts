@@ -15511,7 +15511,14 @@ export function issueRoutes(
               "Cancelled before issue reassignment",
               {
                 errorCode: "issue_reassigned",
-                resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
+                resultJson: {
+                  reassignmentStopConfirmed: true,
+                  issueMutationStopId,
+                  ...(nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId
+                    ? { handoffPending: { runId: runToStopForReassignment.id, stopId: issueMutationStopId,
+                        toAgentId: nextAssigneeAgentId, at: new Date().toISOString() } }
+                    : {}),
+                },
                 eventMessage: "run cancelled before issue reassignment",
                 eventPayload: { issueId: existing.id },
               },
@@ -15549,6 +15556,9 @@ export function issueRoutes(
             }
           }
           interruptedRunId = runToStopForReassignment.id;
+          if (nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId) {
+            handoffStop = { runId: runToStopForReassignment.id, stopId: issueMutationStopId, toAgentId: nextAssigneeAgentId };
+          }
         }
       }
 

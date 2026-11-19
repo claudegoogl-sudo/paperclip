@@ -2343,10 +2343,6 @@ async function startServerWithDatabaseTeardown(
       markServerShutdownStarted(signal);
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
-      if (heartbeatSchedulerInterval) {
-        clearInterval(heartbeatSchedulerInterval);
-        heartbeatSchedulerInterval = null;
-      }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
         signal,
