@@ -9951,14 +9951,10 @@ export function issueRoutes(
   router.get("/issues/:id", async (req, res) => {
     const timing = createIssueReadTiming();
     const id = req.params.id as string;
-    const issue = await getAccessibleResource(
-      req,
-      res,
-      timing.time("lookup", () => getIssueById(req, id)),
-      "Issue not found",
-    );
-    if (!issue) return;
-    if (!(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true })))) return;
+    const resolved = await timing.time("lookup", () => getIssueWithCrossCompany(req, res, id, "issue.read"));
+    if (!resolved) return;
+    const { issue } = resolved;
+    if (!resolved.crossCompany && !(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true })))) return;
     // Saved cards are structural conversation data. Include their local
     // projection before first paint, independently of slow recovery, workspace
     // and related-task enrichment. This never refreshes external providers.
@@ -20487,6 +20483,46 @@ export function issueRoutes(
         await db.transaction(tx => enqueueFastResponse(tx as unknown as Db, { companyId: currentIssue.companyId, issueId: currentIssue.id, agentId: currentIssue.assigneeAgentId,
           responsibleUserId: actor.actorId, sourceCommentId: comment.id, sourceKey: `comment:${comment.id}`, acceptedAt: new Date(comment.createdAt) }))
           .catch(() => logger.warn({ issueId: currentIssue.id }, "fast response admission unavailable"));
+      }
+
+      // Bind pre-uploaded assets to this comment before any downstream
+      // `comment.created` fan-out, so a media relay sees them at
+      // comment-created time. Conflict-aware: unbound rows on this issue are
+      // adopted, same-comment binds are idempotent, genuine conflicts throw 409.
+      if (commentAttachmentIds.length > 0) {
+        await svc.attachAssetsToComment({
+          issueId: currentIssue.id,
+          issueCommentId: comment.id,
+          assetIds: commentAttachmentIds,
+        });
+        // addComment binds pre-existing attachment rows inline, so
+        // attachAssetsToComment only reports standalone assets. The comment is
+        // new, so every row now bound to it was bound by this request: emit
+        // one issue.attachment_bound per row (plugin issue.attachment.created).
+        const bound = (await svc.listAttachments(currentIssue.id, currentIssue.companyId))
+          .filter((row) => row.issueCommentId === comment.id)
+          .map((row) => ({
+            companyId: row.companyId,
+            issueId: row.issueId,
+            attachmentId: row.id,
+            commentId: comment.id,
+            contentType: row.contentType ?? null,
+            byteSize: row.byteSize ?? null,
+          }));
+        for (const row of bound) {
+          await logActivity(db, {
+            companyId: currentIssue.companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.attachment_bound",
+            entityType: "issue",
+            entityId: currentIssue.id,
+            details: attachmentBoundActivityDetails(row),
+          });
+        }
       }
 
       const keyedComment = req.actor.type === "board" && Boolean(req.actor.userId && req.body.clientRequestId);

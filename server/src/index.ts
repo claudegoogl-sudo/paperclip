@@ -1466,6 +1466,7 @@ async function startServerWithDatabaseTeardown(
     drainRunIds?: string[];
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
+  let heartbeatForkSweepInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     const finishIdleWork = beginIdleTrackedWork();
@@ -1980,6 +1981,17 @@ async function startServerWithDatabaseTeardown(
             "startup session-goal recovery resumed durable agent goals",
           );
         }
+        // Fork-only recovery (ported back after the v2026.1117.0 merge).
+        await heartbeat.sweepStrandedDeferredWakes().then((strandedDeferredWakes) => {
+          if (strandedDeferredWakes.promoted > 0 || strandedDeferredWakes.resolved > 0) {
+            logger.warn({ ...strandedDeferredWakes }, "startup stranded deferred-wake sweep promoted or resolved wakes");
+          }
+        }).catch((err) => logger.error({ err }, "startup stranded deferred-wake sweep failed"));
+        await heartbeat.reconcileHighCommentVolumeAlerts().then((commentAlerts) => {
+          if (commentAlerts.alerted > 0 || commentAlerts.failed > 0) {
+            logger.warn({ ...commentAlerts }, "startup high-comment-volume monitor raised alerts");
+          }
+        }).catch((err) => logger.error({ err }, "startup high-comment-volume monitor failed"));
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
@@ -2169,6 +2181,20 @@ async function startServerWithDatabaseTeardown(
       idleDeadlineOwners.quota = bindIdleDeadlineOwner(scheduled.monitors.reconciliationSnapshot, readIdleQuotaSchedule,
         snapshot => ({ issueWaits: snapshot.issueWaits }));
       trackHeartbeatSchedulerWork(Promise.all([scheduled.timers.ready, scheduled.monitors.ready, scheduled.routines.ready]));
+      // Fork-only periodic recovery (ported back after the v2026.1117.0 merge).
+      heartbeatForkSweepInterval = setInterval(() => {
+        if (heartbeatSchedulerStopped || isIdleTaskDrainActive() || isWarmStandby()) return;
+        void (async () => {
+          const wakes = await heartbeat.sweepStrandedDeferredWakes();
+          if (wakes.promoted > 0 || wakes.resolved > 0) {
+            logger.warn({ ...wakes }, "periodic stranded deferred-wake sweep promoted or resolved wakes");
+          }
+          const alerts = await heartbeat.reconcileHighCommentVolumeAlerts();
+          if (alerts.alerted > 0 || alerts.failed > 0) {
+            logger.warn({ ...alerts }, "periodic high-comment-volume monitor raised alerts");
+          }
+        })().catch((err) => logger.error({ err }, "periodic fork recovery sweep failed"));
+      }, config.heartbeatSchedulerIntervalMs);
     };
     trackHeartbeatSchedulerWork(runStartupHousekeeping().then(() => {
       if (!heartbeatSchedulerStopped) startHeartbeatScheduler();
@@ -2343,6 +2369,10 @@ async function startServerWithDatabaseTeardown(
       markServerShutdownStarted(signal);
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
+      if (heartbeatForkSweepInterval) {
+        clearInterval(heartbeatForkSweepInterval);
+        heartbeatForkSweepInterval = null;
+      }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
         signal,
