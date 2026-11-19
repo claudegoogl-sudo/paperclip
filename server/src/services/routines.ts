@@ -2132,13 +2132,8 @@ export function routineService(
       title,
       description,
     });
-<<<<<<< fork
-    // Boxed so the assignment inside the transaction callback survives control-flow narrowing.
-    const stalePinRelease: { value: StalePinRelease | null } = { value: null };
-=======
     const idempotentRunId = input.routineIdempotency && input.idempotencyKey
       ? routineScopedRunId(input.routine.id, input.source, input.idempotencyKey) : null;
->>>>>>> upstream
     let reusedExistingRun = false;
     const run = await db.transaction(async (tx) => {
       const txDb = tx as unknown as Db;
@@ -2234,38 +2229,11 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
-<<<<<<< fork
-        let activeIssue: typeof issues.$inferSelect | null = await findLiveExecutionIssue(
-          input.routine,
-          txDb,
-          dispatchFingerprint,
-          { kind: issueOriginKind, id: issueOriginId },
-        );
-        let pinningRuns: PinningRun[] = [];
-        if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
-          pinningRuns = await loadPinningRuns(activeIssue, txDb);
-          const deadRuns = findDeadExecutionPinRuns(pinningRuns, triggeredAt, nextRunAt);
-          if (deadRuns) {
-            const released = await releaseDeadExecutionPin({
-              routine: input.routine,
-              issue: activeIssue,
-              deadRuns,
-              now: triggeredAt,
-              executor: txDb,
-            });
-            if (released) {
-              stalePinRelease.value = { issueId: activeIssue.id, ...released };
-              activeIssue = null;
-            }
-          }
-        }
-=======
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
           allowLegacyDefault: !creationRunFingerprint,
         });
->>>>>>> upstream
         if (activeIssue && input.routine.concurrencyPolicy !== "always_enqueue") {
           const status = input.routine.concurrencyPolicy === "skip_if_active" ? "skipped" : "coalesced";
           const pinDescription = describePinningRuns(pinningRuns, triggeredAt);
@@ -2288,19 +2256,6 @@ export function routineService(
           return updated ?? createdRun;
         }
 
-<<<<<<< fork
-        // Nothing live is pinning us, but an earlier execution issue can still be sitting open
-        // with every one of its runs terminal — the shape a killed agent leaves
-        // behind. It is invisible to findLiveExecutionIssue (which inner-joins live runs), so the
-        // tick sails past the skip branch, and it does NOT collide on this insert either: a new
-        // issue has a null execution_run_id and the unique index only covers non-null ones. The
-        // collision lands later, when the assignment wakeup checks the issue out and sets
-        // execution_run_id — far from here, and it fails the whole dispatch. So reap it up front.
-        if (input.routine.concurrencyPolicy !== "always_enqueue") {
-          const runlessIssue = await findRunlessExecutionIssue(input.routine, txDb, dispatchFingerprint, {
-            kind: issueOriginKind,
-            id: issueOriginId,
-=======
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -2327,7 +2282,6 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
->>>>>>> upstream
           });
           if (runlessIssue) {
             const released = await releaseRunlessExecutionIssue({

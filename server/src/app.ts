@@ -643,7 +643,6 @@ export async function createApp(
   app.use(runtimeConnectionIntentRoutes(db));
   app.use(nativeRunMcpRoutes());
   const hostServicesDisposers = new Map<string, () => void>();
-<<<<<<< fork
   // pluginId -> pluginKey, populated as each plugin's host handlers are
   // built. Lets the event-relay probe resolve the bus key (which is the plugin
   // key) for the running workers reported by the worker manager.
@@ -678,8 +677,6 @@ export async function createApp(
         publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
       },
     });
-=======
->>>>>>> upstream
   let lifecyclePluginsReady = false;
   const agentLifecycle = startAgentLifecycle(db, createLifecycleDriver(db, workerManager), () => lifecyclePluginsReady && !isWarmStandby() && !isIdleTaskDrainActive());
   const connectionIntentHeartbeat = heartbeatService(db, {
@@ -714,34 +711,7 @@ export async function createApp(
   // REPLACES whatever actor the request otherwise resolved to, and only on
   // the one endpoint it authorizes (see the middleware for the contract).
   app.use(cloudControlMiddleware());
-<<<<<<< fork
-  // The dedicated proxy IP or CIDR allowlist for requests that arrive through
-  // a TLS-terminating proxy. The global `TRUST_PROXY` setting never satisfies
-  // anything that reads this list; an operator sets it to the real
-  // TLS-terminating proxy addresses. An empty value keeps the confidential
-  // setup-token login responses on direct TLS (or a `local_trusted` loopback
-  // peer) only, and keeps board-key auth-event rows pinned to the immediate
-  // socket peer. Declared here, before both consumers (the actor middleware
-  // and the setup-token login transport).
-  const setupTokenLoginProxyAllowlist = (process.env.CLAUDE_LOGIN_TRUSTED_PROXIES ?? "")
-    .split(",")
-    .map((entry) => entry.trim())
-    .filter((entry) => entry.length > 0);
-  // Resolve the acting credential (req.actor) and bind its provenance into
-  // AsyncLocalStorage so logActivity records it centrally. The provenance
-  // regression test drives the same registerActorContext, so removing the
-  // provenance registration turns that test red instead of silently logging NULL.
-  registerActorContext(app, db, {
-    deploymentMode: opts.deploymentMode,
-    resolveSession: opts.resolveSession,
-    // Same dedicated operator allowlist the confidential-transport guard uses
-    // (SR-7); the board-key auth-event log reads it only to derive
-    // source_ip. Never derived from the global TRUST_PROXY setting.
-    authEventTrustedProxies: setupTokenLoginProxyAllowlist,
-  });
-=======
   app.use(connectionEventWakeRoutes(db));
->>>>>>> upstream
   app.use(skillAccessRequestContext);
   app.use("/api/auth", authRoutes(db));
   if (opts.betterAuthHandler) {
@@ -793,21 +763,7 @@ export async function createApp(
     res.set("Cache-Control", "no-store"); res.set("Referrer-Policy", "no-referrer");
     res.redirect(303, await chatChannels.githubWizard.identityCallback(String(req.query.state ?? ""), String(req.query.code ?? ""), req.actor));
   });
-<<<<<<< fork
-  const managedAutoInstallKeys = opts.managedPluginAutoInstall ?? null;
-  const crossCompanyReadAllowlist = new Set(
-    opts.pluginCrossCompanyReadAllowlist ??
-      parsePluginCrossCompanyReadAllowlist(process.env.PAPERCLIP_PLUGIN_CROSS_COMPANY_READ_ALLOWLIST),
-  );
-  if (crossCompanyReadAllowlist.size > 0) {
-    logger.warn(
-      { pluginKeys: [...crossCompanyReadAllowlist] },
-      "plugin cross-company read allowlist is active",
-    );
-  }
-=======
   const managedAutoInstallKeys = resolveManagedBundledPluginKeys(opts.managedPluginAutoInstall);
->>>>>>> upstream
   const bundledCatalogRoot =
     opts.bundledPluginCatalogRoot ?? resolveBundledCatalogRoot(process.env);
   const distributionPlugins = readDistributionPluginCatalog(bundledCatalogRoot, BUNDLED_PLUGIN_CATALOG);
@@ -1102,21 +1058,11 @@ export async function createApp(
     {
       localPluginDir: opts.localPluginDir ?? DEFAULT_LOCAL_PLUGIN_DIR,
       migrationDb: opts.pluginMigrationDb,
-<<<<<<< fork
-      escalationGateway,
-      assertPackageActivation: distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
-      // Capabilities a fresh install may declare without a board approval.
-      // Default empty: any capability parks a fresh install (gateway set only).
-      installCapabilityAllowlist: parsePluginCrossCompanyReadAllowlist(
-        process.env.PAPERCLIP_PLUGIN_INSTALL_CAPABILITY_ALLOWLIST,
-      ),
-=======
       assertPackageActivation: bundledPackageResolver?.assertActivation ?? distributionPluginActivationGuard(bundledCatalogRoot, distributionPlugins, managedAutoInstallKeys),
       resolvePackageRoot: bundledPackageResolver?.resolve,
       prebuiltOnly: managedAutoInstallKeys !== null,
       enableLocalFilesystem: managedAutoInstallKeys === null,
       enableNpmDiscovery: managedAutoInstallKeys === null,
->>>>>>> upstream
     },
     {
       workerManager,
@@ -1551,8 +1497,6 @@ export async function createApp(
   void toolDispatcher.initialize().catch((err) => {
     logger.error({ err }, "Failed to initialize plugin tool dispatcher");
   });
-<<<<<<< fork
-=======
   const devWatcher = managedAutoInstallKeys !== null ? null : createPluginDevWatcher(
     lifecycle,
     async (pluginId) =>
@@ -1560,7 +1504,6 @@ export async function createApp(
     undefined,
     { unwatchedRoots: [bundledCatalogRoot] },
   );
->>>>>>> upstream
   // Auto-provision bundled plugins so their providers are registered for
   // agent runs. Bundles are excluded from the pnpm
   // workspace and built standalone into the image (see Dockerfile), then
@@ -1649,41 +1592,6 @@ export async function createApp(
       await publicMcpEvents?.stop();
       await dotMcpEvents?.stop();
       jobCoordinator.stop();
-<<<<<<< fork
-      resourceLifecycleDelivery.dispose();
-      await deliveryWork.stop();
-      eventRelayProbe.stop();
-      unsubscribeChatPublicationSignals();
-      chatReconciliation.stop();
-      if (chatPublicationTimer) {
-        clearInterval(chatPublicationTimer);
-        chatPublicationTimer = null;
-      }
-      await chatReconciliation.drain();
-      if (importTransferSweepTimer) {
-        clearInterval(importTransferSweepTimer);
-        importTransferSweepTimer = null;
-      }
-      devWatcher?.close();
-      viteHtmlRenderer?.dispose();
-      void viteDevServer?.close().catch(() => undefined);
-      viteHmrServer?.close();
-      hostServiceCleanup.disposeAll();
-      hostServiceCleanup.teardown();
-      pluginRunContextRegistry.dispose();
-      await stopMuseMaintenance();
-      await emailChannels.shutdown();
-      await chatChannels.shutdown();
-      // End the avatar worker pool, if a request ever started one, so no
-      // render outlives the HTTP teardown.
-      await agentAvatars.close();
-      // Cancel every live setup-token login session and AWAIT the cancellation,
-      // so each direct child stops and the server releases each lease before the
-      // caller stops the database and the provider. A lease release that
-      // fails stays a durable record for the startup reaper.
-      await setupTokenLoginService?.shutdown();
-    })();
-=======
       await finishServiceShutdown(() => resourceLifecycleDelivery.dispose(), async () => {
         importSpoolCleanup.unsubscribe();
         await deliveryWork.stop();
@@ -1706,7 +1614,6 @@ export async function createApp(
         await setupTokenLoginService?.shutdown();
       });
     });
->>>>>>> upstream
     return appServicesShutdown;
   };
   app.locals.paperclipShutdown = shutdownAppServices;

@@ -498,11 +498,7 @@ export function useLiveRunTranscripts({
             return next;
           });
           // A newly started run may not have created its log yet.
-<<<<<<< fork
-          if (isTerminalHeartbeatRunStatus(run.status)) missingTerminalLogRunIdsRef.current.add(run.id);
-=======
           if (isTerminalStatus(run.status)) { missingTerminalLogRunIdsRef.current.add(run.id); failed = false; }
->>>>>>> upstream
         } else {
           setErrorsByRun((previous) => {
             if (previous.has(run.id)) return previous;
@@ -531,21 +527,6 @@ export function useLiveRunTranscripts({
       }
     };
 
-<<<<<<< fork
-    const readAll = async () => {
-      await Promise.all(readableRuns.map((run) => readRunLog(run)));
-    };
-
-    void readAll();
-      const activeRuns = normalizedRuns.filter((run) => !isTerminalHeartbeatRunStatus(run.status));
-      // The realtime websocket is the primary live source when enabled, so the
-      // recurring poll only needs to run as a slow fallback rather than doubling
-      // the live update work every couple of seconds.
-      const effectivePollMs = enableRealtimeUpdates
-        ? Math.max(logPollIntervalMs, REALTIME_FALLBACK_POLL_INTERVAL_MS)
-        : logPollIntervalMs;
-      const interval = activeRuns.length > 0 && effectivePollMs > 0
-=======
     for (const run of readableRuns) {
       refreshByRunRef.current.set(run.id, (force = false) => {
         if (force) { pendingRefresh.add(run.id); missingTerminalLogRunIdsRef.current.delete(run.id); }
@@ -561,7 +542,6 @@ export function useLiveRunTranscripts({
       ? Math.max(logPollIntervalMs, REALTIME_FALLBACK_POLL_INTERVAL_MS)
       : logPollIntervalMs;
     const interval = !stream.healthy && activeRuns.length > 0 && effectivePollMs > 0
->>>>>>> upstream
       ? window.setInterval(() => {
           void Promise.all(activeRuns.map((run) => readRunLog(run)));
         }, effectivePollMs)
@@ -576,7 +556,6 @@ export function useLiveRunTranscripts({
     };
   }, [visible, enableRealtimeUpdates, logPollIntervalMs, logReadLimitBytes, normalizedRuns, runIdsKey, retryGeneration, enabled, companyId, stream.healthy, stream.epoch]);
 
-<<<<<<< fork
         if (event.type === "heartbeat.run.log") {
           const chunk = readString(payload["chunk"]);
           if (!chunk) return;
@@ -652,8 +631,6 @@ export function useLiveRunTranscripts({
       }
     };
   }, [visible, activeRunIds, companyId, enableRealtimeUpdates, runById]);
-=======
->>>>>>> upstream
 
   const transcriptByRun = useMemo(() => {
     const next = new Map<string, TranscriptEntry[]>();

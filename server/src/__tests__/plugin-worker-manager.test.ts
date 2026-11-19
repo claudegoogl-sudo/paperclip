@@ -424,20 +424,7 @@ describe("plugin-worker-manager stderr failure context", () => {
       // secrets.resolve). It never overrides an active dispatch scope.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-a" },
-<<<<<<< fork
-        {
-          invocationScope: {
-            companyId: "company-a",
-            runId: "run-1",
-            agentId: "agent-1",
-          },
-          // Host-minted from its own dispatch record, never from worker params.
-          invocationDispatchMethod: "performAction",
-          serviceScope: { runId: expect.any(String) },
-        },
-=======
         { invocationScope: { companyId: "company-a" }, traceparent: undefined, providerSpanBudget: { remaining: 256 } },
->>>>>>> upstream
       );
     } finally {
       await handle.stop().catch(() => undefined);
@@ -475,15 +462,7 @@ describe("plugin-worker-manager stderr failure context", () => {
       // The service scope is always present alongside the echoed scope.
       expect(companiesGet).toHaveBeenCalledWith(
         { companyId: "company-1" },
-<<<<<<< fork
-        {
-          invocationScope: { companyId: "company-1" },
-          invocationDispatchMethod: "getData",
-          serviceScope: { runId: expect.any(String) },
-        },
-=======
         { invocationScope: { companyId: "company-1" }, traceparent: undefined, providerSpanBudget: { remaining: 256 } },
->>>>>>> upstream
       );
     } finally {
       await handle.stop().catch(() => undefined);

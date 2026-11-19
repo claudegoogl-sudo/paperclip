@@ -1040,15 +1040,7 @@ export function pluginRoutes(
       return '"runContext.runId" does not belong to "runContext.agentId"';
     }
 
-<<<<<<< fork
-    // A run that is not project-scoped carries no projectId at all; the
-    // agent/run/company binding above is what authorizes the dispatch. Skipping
-    // the assertion is only correct because the field is absent — a present but
-    // unresolvable value was already denied above.
-    if (runContext.projectId !== undefined) {
-=======
     if (runContext.projectId) {
->>>>>>> upstream
       const [project] = await db
         .select({ companyId: projects.companyId })
         .from(projects)
@@ -1333,19 +1325,7 @@ export function pluginRoutes(
       return;
     }
 
-<<<<<<< fork
-    // Caller-supplied contexts must still name a project. A host-resolved
-    // context omits the field when the run is not project-scoped, which the
-    // scope check handles explicitly rather than by asserting on a fake value.
-    if (
-      !runContext.agentId ||
-      !runContext.runId ||
-      !runContext.companyId ||
-      (!runContext.projectId && !hostResolvedRunContext)
-    ) {
-=======
     if (!requestedRunContext.agentId || !requestedRunContext.runId || !requestedRunContext.companyId) {
->>>>>>> upstream
       res.status(400).json({
         error: '"runContext" must include agentId, runId, and companyId',
       });

@@ -136,24 +136,9 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
-<<<<<<< fork
-import {
-  RUN_HISTORY_PRUNE_BATCH_SIZE,
-  RUN_HISTORY_PRUNE_MAX_BATCHES,
-  startRunHistoryRetention,
-} from "./services/run-history-retention.js";
-import {
-  PLUGIN_WEBHOOK_DELIVERY_PRUNE_BATCH_SIZE,
-  PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
-  startPluginWebhookDeliveryRetention,
-} from "./services/plugin-webhook-delivery-retention.js";
-import { startBoardApiKeyAuthEventRetention } from "./services/board-api-key-auth-event-retention.js";
-import { loadConfig } from "./config.js";
-=======
 import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
 import { loadCloudBootstrapConfig, loadConfig, type Config } from "./config.js";
->>>>>>> upstream
 import { logger } from "./middleware/logger.js";
 import { setStartupRecoveryPhase } from "./startup-recovery-state.js";
 import {
@@ -193,12 +178,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
-<<<<<<< fork
-import { markServerShutdownStarted } from "./services/server-shutdown-state.js";
-import { questionResponseDeliveryService } from "./services/question-response-delivery.js";
-=======
 import { questionResponseDeliveryService, registerQuestionResponseDeliveryWork } from "./services/question-response-delivery.js";
->>>>>>> upstream
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { registerStatusCardEvaluationWork, statusCardEvaluationService } from "./services/status-card-evaluation.js";
 import { createSecretProposalsService } from "./services/secret-proposals.js";
@@ -220,21 +200,7 @@ import {
 } from "./services/adapter-registry-bootstrap.js";
 import { reapOrphanedMcpProcessesOnStartup } from "./services/mcp-orphan-reaper.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
-<<<<<<< fork
-import {
-  EGRESS_POSTURE_SWEEP_INTERVAL_MS,
-  startEgressPostureSweep,
-} from "./services/egress-posture.js";
-import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
-import {
-  buildRuntimeApiCandidateUrls,
-  chooseAgentApiUrl,
-  choosePrimaryRuntimeApiUrl,
-  isInsecureNonLoopbackApiUrl,
-} from "./runtime-api.js";
-=======
 import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl, resolveLocalRuntimeApiUrl } from "./runtime-api.js";
->>>>>>> upstream
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { bufferPluginLogEntry } from "./services/plugin-host-services.js";
@@ -613,13 +579,8 @@ async function startServerWithDatabaseTeardown(
     const migrationUrl = startupConfig.databaseMigrationUrl ?? startupConfig.databaseUrl;
     migrationSummary = await ensureMigrations(migrationUrl, "PostgreSQL");
 
-<<<<<<< fork
-    db = createDb(config.databaseUrl);
-    pluginMigrationDb = config.databaseMigrationUrl ? createDb(config.databaseMigrationUrl) : db;
-=======
     db = createDb(startupConfig.databaseUrl);
     pluginMigrationDb = startupConfig.databaseMigrationUrl ? createDb(startupConfig.databaseMigrationUrl) : db;
->>>>>>> upstream
     logger.info("Using external PostgreSQL via DATABASE_URL/config");
     activeDatabaseConnectionString = startupConfig.databaseUrl;
     startupDbInfo = { mode: "external-postgres", connectionString: startupConfig.databaseUrl };
@@ -1116,97 +1077,6 @@ async function startServerWithDatabaseTeardown(
   ];
   const idleDatabaseBackupEnabled = config.databaseBackupEnabled
     && process.env.PAPERCLIP_DB_BACKUP_IDLE_CHECKPOINT_ENABLED === "1";
-<<<<<<< fork
-  const runServerDatabaseBackup = async (
-    trigger: InstanceDatabaseBackupTrigger,
-  ): Promise<InstanceDatabaseBackupRunResult | null> => {
-    if (databaseBackupInFlight) {
-      const message = "Database backup already in progress";
-      if (trigger === "scheduled") {
-        logger.warn("Skipping scheduled database backup because a previous backup is still running");
-        return null;
-      }
-      throw conflict(message);
-    }
-
-    databaseBackupInFlight = true;
-    const finishIdleBackup = beginIdleTrackedWork();
-    const startedAt = new Date();
-    const startedAtMs = Date.now();
-    const label = trigger === "manual" ? "Manual" : trigger === "idle" ? "Pre-sleep" : "Automatic";
-    try {
-      if (trigger === "idle") await markIdleBackupWakeRequired(config.databaseBackupDir);
-      logger.info({ backupDir: config.databaseBackupDir, trigger }, `${label} database backup starting`);
-      // Read retention from Instance Settings (DB) so changes take effect without restart.
-      const generalSettings = await backupSettingsSvc.getGeneral();
-      const retention = generalSettings.backupRetention;
-      const verifyCheckpoint = trigger === "idle" || existsSync(idleBackupWakeMarker(config.databaseBackupDir));
-
-      const result = await runDatabaseBackup({
-        connectionString: activeDatabaseConnectionString,
-        backupDir: config.databaseBackupDir,
-        retention,
-        filenamePrefix: "paperclip",
-        verifyBeforePrune: verifyCheckpoint ? verifyIdleDatabaseBackup : undefined,
-      });
-      if (verifyCheckpoint) {
-        if (trigger !== "idle") await clearIdleBackupWakeRequired(config.databaseBackupDir);
-      }
-      const finishedAt = new Date();
-      const response: InstanceDatabaseBackupRunResult = {
-        ...result,
-        trigger,
-        backupDir: config.databaseBackupDir,
-        retention,
-        startedAt: startedAt.toISOString(),
-        finishedAt: finishedAt.toISOString(),
-        durationMs: Date.now() - startedAtMs,
-      };
-      logger.info(
-        {
-          backupFile: result.backupFile,
-          sizeBytes: result.sizeBytes,
-          prunedCount: result.prunedCount,
-          backupDir: config.databaseBackupDir,
-          retention,
-          trigger,
-          durationMs: response.durationMs,
-        },
-        `${label} database backup complete: ${formatDatabaseBackupResult(result)}`,
-      );
-      return response;
-    } catch (err) {
-      logger.error({ err, backupDir: config.databaseBackupDir, trigger }, `${label} database backup failed`);
-      throw err;
-    } finally {
-      databaseBackupInFlight = false;
-      finishIdleBackup();
-    }
-  };
-  const pluginRunContextRegistry = createPluginRunContextRegistry();
-  // One process-wide stream bus. Verified worker stream notifications publish
-  // here and the plugin SSE bridge (`GET /api/plugins/:pluginId/bridge/stream/:channel`)
-  // fans them out to subscribed UIs. Without this wiring the SSE
-  // bridge was a silently-dead surface — the endpoint 501'd and no worker
-  // notification ever reached a subscriber.
-  const pluginStreamBus = createPluginStreamBus();
-  const pluginWorkerManager = createPluginWorkerManager({
-    runContextRegistry: pluginRunContextRegistry,
-    // Worker ctx.logger notifications persist to plugin_logs on the same
-    // buffered path as the logger.log host service (§26.1), so the operator
-    // logs panel can show plugin errors.
-    workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
-    onStreamNotification: ({ pluginId, method, params }) => {
-      const published = publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
-      if (!published) {
-        logger.warn(
-          { pluginId, method },
-          "unrecognized plugin stream notification could not be published",
-        );
-      }
-    },
-  });
-=======
   const runServerDatabaseBackup = createDatabaseBackupOwner({
     connectionString: activeDatabaseConnectionString,
     backupDir: config.databaseBackupDir,
@@ -1214,7 +1084,6 @@ async function startServerWithDatabaseTeardown(
     logger,
   });
   const pluginWorkerManager = createPluginWorkerManager();
->>>>>>> upstream
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
@@ -1226,9 +1095,6 @@ async function startServerWithDatabaseTeardown(
   // document parsed fail-closed above (`plugins.autoInstall`). Absent env means
   // self-hosted: createApp falls back to its built-in kubernetes-only default.
   const managedPluginAutoInstall = managedConfig?.plugins.autoInstall ?? null;
-<<<<<<< fork
-  const { app, pluginToolDispatcher } = await createApp(db as any, {
-=======
   const cloudQualification = await qualifyCloudConfigurationForCurrentImage(db as any);
   if (cloudQualification && !cloudQualification.configurationPackagesEligible) {
     logger.warn({ scope: cloudQualification.scope, blockerCodes: cloudQualification.blockers.map((blocker) => blocker.code) }, "Cloud configuration and package qualification has blockers");
@@ -1239,7 +1105,6 @@ async function startServerWithDatabaseTeardown(
   const app = await createApp(db as any, {
     idleDeadlineOwners,
     budgetResumeDelivery,
->>>>>>> upstream
     prepareIdleDatabaseBackup: idleDatabaseBackupEnabled
       ? async () => (await runServerDatabaseBackup("idle")) !== null
       : undefined,
@@ -1802,23 +1667,6 @@ async function startServerWithDatabaseTeardown(
     if (githubCanRun()) await githubConnectionEvents.pollOnce({ forSetup: true });
   }));
 
-<<<<<<< fork
-  // Sweep MCP child processes (e.g. Playwright MCP) that were orphaned to init
-  // by a prior crash or watchdog kill. Runs regardless of heartbeat scheduling
-  // so leaked strays never accumulate across restarts. Safe matching only:
-  // MCP command + ppid==1.
-  try {
-    const reaped = await reapOrphanedMcpProcessesOnStartup();
-    if (reaped.length > 0) {
-      logger.warn({ reapedPids: reaped }, "startup swept orphaned MCP child processes");
-    }
-  } catch (err) {
-    logger.error({ err }, "startup MCP orphan sweep failed");
-  }
-
-  await timeStartupRecovery("tool_reviews", () => app.locals.toolGateway.sweepActionReviews()).catch((err: unknown) => logger.error({ err }, "startup tool review recovery failed"));
-  await timeStartupRecovery("gateway_sessions", () => app.locals.toolGateway.cleanupExpiredSessions()).catch((err: unknown) => logger.error({ err }, "startup gateway token cleanup failed"));
-=======
   await timeStartupRecovery("tool_reviews", async () => {
     if (config.heartbeatSchedulerEnabled) {
       await registerToolReviewExpiryWork(deliveryWork, app.locals.toolGateway,
@@ -1847,7 +1695,6 @@ async function startServerWithDatabaseTeardown(
     ? registerGatewayCredentialExpiryWork(deliveryWork, app.locals.toolGateway,
       () => !isIdleTaskDrainActive() && !heartbeatSchedulerStopped && !isWarmStandby()).ready
     : app.locals.toolGateway.cleanupExpiredSessions()).catch((err: unknown) => logger.error({ err }, "startup gateway token cleanup failed"));
->>>>>>> upstream
   await timeStartupRecovery("delivery_workers", () => Promise.all([budgetEnforcementWorker, accountingWorker, fastResponseWorker, ...deliveryWorkers].map(worker => worker.ready)));
   await Promise.all([githubEventWorker.ready, githubContinuityWorker.ready]);
 
@@ -2075,7 +1922,6 @@ async function startServerWithDatabaseTeardown(
             "startup session-goal recovery resumed durable agent goals",
           );
         }
-<<<<<<< fork
         const reconciled = await heartbeat.reconcileStrandedAssignedIssues();
         if (
           promotion.promoted > 0 ||
@@ -2133,8 +1979,6 @@ async function startServerWithDatabaseTeardown(
         if (commentAlerts.alerted > 0 || commentAlerts.failed > 0) {
           logger.warn({ ...commentAlerts }, "startup high-comment-volume monitor raised alerts");
         }
-=======
->>>>>>> upstream
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
@@ -2297,7 +2141,6 @@ async function startServerWithDatabaseTeardown(
         () => !isIdleTaskDrainActive() && !isWarmStandby() && !heartbeatSchedulerStopped).ready);
     };
 
-<<<<<<< fork
     const createHeartbeatSchedulerTick = (scheduled: ReturnType<typeof registerScheduledWork>) => () => {
       // Track the outer async callback as well as the work it starts. Shutdown
       // can then wait through an already-running suppression check before it
@@ -2477,8 +2320,6 @@ async function startServerWithDatabaseTeardown(
         logger.error({ err }, "heartbeat scheduler tick failed");
       }));
     };
-=======
->>>>>>> upstream
     const startHeartbeatScheduler = () => {
       if (isCloudManagedInstance()) {
         const status = registerRoutineExecutionStatusWork(deliveryWork, routineExecutionStatusService(db as any),
@@ -2758,14 +2599,8 @@ async function startServerWithDatabaseTeardown(
       void shutdown("SIGTERM");
     });
   }
-<<<<<<< fork
-
-
-    const shutdown = async (
-=======
   
   const performShutdown = async (
->>>>>>> upstream
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {

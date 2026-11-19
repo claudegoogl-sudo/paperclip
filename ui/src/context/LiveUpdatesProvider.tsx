@@ -13,12 +13,6 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
-<<<<<<< fork
-import { useQuery, useQueryClient, type InfiniteData, type QueryClient } from "@tanstack/react-query";
-import { createCoalescingQueryClient, createInvalidationBatcher } from "../lib/query-invalidation-batcher";
-import { patchRunStatusInList, removeRunFromList } from "../lib/live-runs-cache";
-import { isTerminalHeartbeatRunStatus, type Agent, type HeartbeatRun, type Issue, type IssueComment, type LiveEvent } from "@paperclipai/shared";
-=======
 import {
   useQuery,
   useQueryClient,
@@ -41,7 +35,6 @@ import type {
   IssueComment,
   LiveEvent,
 } from "@paperclipai/shared";
->>>>>>> upstream
 import type { RunForIssue } from "../api/activity";
 import type { ActiveRunForIssue, LiveRunForIssue } from "../api/heartbeats";
 import type { CompanyUserDirectoryResponse } from "../api/access";

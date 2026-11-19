@@ -100,8 +100,6 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
   });
 
   beforeEach(() => {
-<<<<<<< fork
-=======
     vi.resetModules();
     vi.doUnmock("@paperclipai/shared/telemetry");
     vi.doUnmock("../telemetry.js");
@@ -127,7 +125,6 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
       return { accessService, documentAnnotationService, logActivity, routineService };
     });
     vi.doMock("../routes/authz.js", async () => vi.importActual("../routes/authz.js"));
->>>>>>> upstream
     vi.clearAllMocks();
   });
 

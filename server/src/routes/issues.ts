@@ -9951,12 +9951,6 @@ export function issueRoutes(
   router.get("/issues/:id", async (req, res) => {
     const timing = createIssueReadTiming();
     const id = req.params.id as string;
-<<<<<<< fork
-    const resolved = await timing.time("lookup", () => getIssueWithCrossCompany(req, res, id, "issue.read"));
-    if (!resolved) return;
-    const { issue } = resolved;
-    if (!resolved.crossCompany && !(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true })))) return;
-=======
     const issue = await getAccessibleResource(
       req,
       res,
@@ -9977,7 +9971,6 @@ export function issueRoutes(
       res.json({ ...issue, ...documentPayload, workProducts });
       return;
     }
->>>>>>> upstream
     const inboxArchiveFieldsPromise =
       req.actor.type === "board" && req.actor.userId
         ? timing.time("inbox", () => svc.getActiveInboxArchiveFields(issue, req.actor.userId!))
@@ -15511,34 +15504,11 @@ export function issueRoutes(
           runToStopForReassignment.companyId === existing.companyId &&
           runToStopForReassignment.contextSnapshot?.issueId === existing.id;
         if (runToStopForReassignment && !isHumanSelfHandoff) {
-<<<<<<< fork
-          const cancelled = await heartbeat.cancelRun(
-            runToStopForReassignment.id,
-            "Cancelled before issue reassignment",
-            {
-              errorCode: "issue_reassigned",
-              resultJson: {
-                reassignmentStopConfirmed: true,
-                issueMutationStopId,
-                ...(nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId
-                  ? { handoffPending: { runId: runToStopForReassignment.id, stopId: issueMutationStopId,
-                      toAgentId: nextAssigneeAgentId, at: new Date().toISOString() } }
-                  : {}),
-              },
-              eventMessage: "run cancelled before issue reassignment",
-              eventPayload: { issueId: existing.id },
-            },
-          );
-          if (!cancelled || cancelled.status !== "cancelled") {
-            throw conflict(
-              "The active agent run could not be stopped before reassignment",
-=======
           let cancelled: Awaited<ReturnType<typeof heartbeat.cancelRun>> = null;
           try {
             cancelled = await heartbeat.cancelRun(
               runToStopForReassignment.id,
               "Cancelled before issue reassignment",
->>>>>>> upstream
               {
                 errorCode: "issue_reassigned",
                 resultJson: { reassignmentStopConfirmed: true, issueMutationStopId },
@@ -15551,12 +15521,6 @@ export function issueRoutes(
             // acknowledgement is outstanding. Settle below like any pending Stop.
             if (!(error instanceof HttpError && parseObject(error.details).code === "native_stop_pending")) throw error;
           }
-<<<<<<< fork
-          interruptedRunId = cancelled.id;
-          if (nextAssigneeAgentId && nextAssigneeAgentId !== existing.assigneeAgentId) {
-            handoffStop = { runId: cancelled.id, stopId: issueMutationStopId, toAgentId: nextAssigneeAgentId };
-          }
-=======
           if (!cancelled || cancelled.status !== "cancelled") {
             // A native Stop can outlast this request. Once its durable fence is
             // committed the stop will complete, so apply the reassignment now:
@@ -15585,7 +15549,6 @@ export function issueRoutes(
             }
           }
           interruptedRunId = runToStopForReassignment.id;
->>>>>>> upstream
         }
       }
 
@@ -20516,54 +20479,6 @@ export function issueRoutes(
           .catch(() => logger.warn({ issueId: currentIssue.id }, "fast response admission unavailable"));
       }
 
-<<<<<<< fork
-      // Bind pre-uploaded assets to this comment before any downstream
-      // `comment.created` fan-out, so a media relay reading attachments at
-      // comment-created time sees them (no attach-after-post race). Binding is
-      // conflict-aware: unbound rows on this issue are adopted, already-bound
-      // same-comment binds are idempotent, and genuine conflicts throw 409
-      // (pre-checked above, re-checked in-transaction here). Mirrors the host
-      // bridge path.
-      if (commentAttachmentIds.length > 0) {
-        await svc.attachAssetsToComment({
-          issueId: currentIssue.id,
-          issueCommentId: comment.id,
-          assetIds: commentAttachmentIds,
-        });
-        // addComment binds pre-existing attachment rows inline, so
-        // attachAssetsToComment only reports standalone assets. The comment is
-        // new, so every row now bound to it was bound by this request: emit
-        // one issue.attachment_bound per row (plugin issue.attachment.created).
-        const bound = (
-          await svc.listAttachments(currentIssue.id, currentIssue.companyId)
-        )
-          .filter((row) => row.issueCommentId === comment.id)
-          .map((row) => ({
-            companyId: row.companyId,
-            issueId: row.issueId,
-            attachmentId: row.id,
-            commentId: comment.id,
-            contentType: row.contentType ?? null,
-            byteSize: row.byteSize ?? null,
-          }));
-        for (const row of bound) {
-          await logActivity(db, {
-            companyId: currentIssue.companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "issue.attachment_bound",
-            entityType: "issue",
-            entityId: currentIssue.id,
-            details: attachmentBoundActivityDetails(row),
-          });
-        }
-      }
-
-      await issueReferencesSvc.syncComment(comment.id);
-=======
       const keyedComment = req.actor.type === "board" && Boolean(req.actor.userId && req.body.clientRequestId);
       const buildCommentActivity = (commentReferenceDiff: ReturnType<typeof issueReferencesSvc.diffIssueReferenceSummary>) => ({
         companyId: currentIssue.companyId,
@@ -20627,7 +20542,6 @@ export function issueRoutes(
         referenceSummaryBefore: commentReferenceSummaryBefore, activity: buildCommentActivity,
       });
       else await issueReferencesSvc.syncComment(comment.id);
->>>>>>> upstream
       await externalObjectsSvc.syncCommentSafely(comment.id);
       if (
         currentIssue.assigneeAgentId &&
@@ -20686,66 +20600,6 @@ export function issueRoutes(
           );
       }
 
-<<<<<<< fork
-      await logActivity(db, {
-        companyId: currentIssue.companyId,
-        actorType: actor.actorType,
-        actorId: actor.actorId,
-        agentId: actor.agentId,
-        runId: actor.runId,
-        agentApiKeyId: actor.agentApiKeyId,
-        responsibleUserIdOverride: authenticatedActorResponsibleUserId(req),
-        action: "issue.comment_added",
-        entityType: "issue",
-        entityId: currentIssue.id,
-        details: {
-          commentId: comment.id,
-          bodySnippet: comment.body.slice(0, 120),
-          identifier: currentIssue.identifier,
-          issueTitle: currentIssue.title,
-          ...(commentAttachmentIds.length > 0 ? { attachmentCount: commentAttachmentIds.length } : {}),
-          authorizationReason: commentAuthorizationReason,
-          ...(isDirectParentReportDecision(commentAccessDecision)
-            ? { directParentReportGrant: true }
-            : {}),
-          ...(resumeRequested === true
-            ? { resumeIntent: true, followUpRequested: true }
-            : {}),
-          ...(reopened
-            ? {
-                reopened: true,
-                reopenedFrom: reopenFromStatus,
-                source: "comment",
-              }
-            : {}),
-          ...(scheduledRetrySupersededByComment
-            ? {
-                scheduledRetrySupersededByComment: true,
-                scheduledRetryRunId:
-                  scheduledRetryForHumanComment?.runId ?? null,
-                ...(cancelledScheduledRetryRunId
-                  ? { cancelledScheduledRetryRunId }
-                  : {}),
-              }
-            : {}),
-          ...(interruptedRunId ? { interruptedRunId } : {}),
-          ...summarizeIssueReferenceActivityDetails({
-            addedReferencedIssues:
-              commentReferenceDiff.addedReferencedIssues.map(
-                summarizeIssueRelationForActivity,
-              ),
-            removedReferencedIssues:
-              commentReferenceDiff.removedReferencedIssues.map(
-                summarizeIssueRelationForActivity,
-              ),
-            currentReferencedIssues:
-              commentReferenceDiff.currentReferencedIssues.map(
-                summarizeIssueRelationForActivity,
-              ),
-          }),
-        },
-      });
-=======
       if (!keyedComment) {
         const commentReferenceSummaryAfter =
           await issueReferencesSvc.listIssueReferenceSummary(currentIssue.id);
@@ -20755,7 +20609,6 @@ export function issueRoutes(
         );
         await logActivity(db, buildCommentActivity(commentReferenceDiff));
       }
->>>>>>> upstream
 
       const expiredInteractions = await issueThreadInteractionService(
         db,

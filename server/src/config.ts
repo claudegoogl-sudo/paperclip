@@ -394,7 +394,6 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
   const gitRestorePointRetentionDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_RETENTION_DAYS", 90));
   const gitRestorePointTerminalDelayDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_TERMINAL_DELAY_DAYS", 3);
   const gitRestorePointIdleDays = nonNegativeIntegerEnv("PAPERCLIP_GIT_RESTORE_POINT_IDLE_DAYS", 7);
-<<<<<<< fork
   const boardApiKeyAuthEventRetentionEnabled =
     process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED !== "false";
   // Auth events: 90 days. A quarter's look-back outlives the audit cycle that
@@ -415,9 +414,7 @@ export function loadConfig(override?: PaperclipConfig | null): Config {
     1,
     Number(process.env.PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_INTERVAL_MINUTES) || 60,
   );
-=======
   const taskDirectoryOrphanGraceDays = Math.max(1, nonNegativeIntegerEnv("PAPERCLIP_TASK_DIRECTORY_ORPHAN_GRACE_DAYS", 7));
->>>>>>> upstream
   const bindValidationErrors = validateConfiguredBindMode({
     deploymentMode,
     deploymentExposure,

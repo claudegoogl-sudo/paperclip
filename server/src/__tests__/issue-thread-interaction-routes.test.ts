@@ -249,15 +249,7 @@ function registerModuleMocks() {
       revalidateMutationScope: vi.fn(async (scope: unknown) => ({ allowed: true, scope })),
     }),
     logActivity: mockLogActivity,
-<<<<<<< fork
-    projectInteractionForPluginEvent: (interaction: { id?: unknown; kind?: unknown } | null | undefined) =>
-      interaction && typeof interaction.id === "string" && typeof interaction.kind === "string"
-        ? { id: interaction.id, kind: interaction.kind, questions: [] }
-        : null,
-    projectService: () => ({}),
-=======
     projectService: () => mockProjectService,
->>>>>>> upstream
     routineService: () => ({
       syncRunStatusForIssue: vi.fn(async () => undefined),
     }),

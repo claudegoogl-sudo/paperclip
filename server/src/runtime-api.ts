@@ -1,7 +1,5 @@
 import os from "node:os";
-<<<<<<< fork
 import { classifyEgressIp } from "./services/plugin-egress-ip-classifier.js";
-=======
 import type { Server } from "node:http";
 import { isIP } from "node:net";
 
@@ -39,7 +37,6 @@ export function registerLocalRuntimeApiServer(server: Server): void {
     runtimeApiListenerClosed = false;
   }
 }
->>>>>>> upstream
 
 function normalizeHost(value: string | null | undefined): string {
   return (value ?? "").trim();

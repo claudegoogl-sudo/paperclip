@@ -1,29 +1,4 @@
 import fs from "node:fs";
-<<<<<<< fork
-import { beforeEach, describe, expect, it, vi } from "vitest";
-
-const ensurePostgresDatabase = vi.hoisted(() => vi.fn(async () => {}));
-const applyPendingMigrations = vi.hoisted(() => vi.fn(async () => {}));
-const prepareEmbeddedPostgresNativeRuntime = vi.hoisted(() => vi.fn(async () => {}));
-
-// startEmbeddedPostgresTestDatabase() is the unit under test; everything it
-// calls out to (real DB setup, native runtime prep) is faked so the test
-// exercises only the port-collision retry loop.
-vi.mock("./client.js", () => ({
-  ensurePostgresDatabase,
-  applyPendingMigrations,
-  // The port-collision retry path calls this for best-effort cleanup of the
-  // abandoned attempt; the merge dropped it from the factory, which made the
-  // import itself fail under the mock.
-  closeRegisteredClients: vi.fn(async () => {}),
-}));
-
-vi.mock("./embedded-postgres-native.js", () => ({
-  prepareEmbeddedPostgresNativeRuntime,
-}));
-
-type FakeCtorOptions = {
-=======
 import os from "node:os";
 import path from "node:path";
 import postgres from "postgres";
@@ -56,7 +31,6 @@ afterAll(() => {
 // conflict, then rejects with an empty message (the real rejection shape). The
 // option type matches the real constructor so no type cast is needed.
 type FakeOptions = {
->>>>>>> upstream
   databaseDir: string;
   port: number;
   onLog?: (message: unknown) => void;
@@ -112,11 +86,6 @@ describe("startEmbeddedPostgresTestDatabase port collision retry", () => {
     applyPendingMigrations.mockClear();
   });
 
-<<<<<<< fork
-  it("retries with a fresh port and dataDir, cleaning up the abandoned attempt", async () => {
-    const { startEmbeddedPostgresTestDatabase } = await import("./test-embedded-postgres.js");
-    configureStartAttempts(1);
-=======
   it("does not start a replacement when a copied cluster cannot stop", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async () => {
     delete process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
     const ready = await startEmbeddedPostgresTestDatabase("paperclip-template-stop-ready-");
@@ -145,7 +114,6 @@ describe("startEmbeddedPostgresTestDatabase port collision retry", () => {
     // the suite runs under PAPERCLIP_TEST_POSTGRES_TEMPLATE=0. The first
     // start then builds the template if the support probe did not.
     delete process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
->>>>>>> upstream
 
     const db = await startEmbeddedPostgresTestDatabase("paperclip-retry-test-");
 
@@ -194,13 +162,6 @@ describe("startEmbeddedPostgresTestDatabase port collision retry", () => {
 
     const { startEmbeddedPostgresTestDatabase } = await import("./test-embedded-postgres.js");
 
-<<<<<<< fork
-    await expect(startEmbeddedPostgresTestDatabase("paperclip-no-retry-test-")).rejects.toThrow(
-      /Postgres cannot run as a root user/,
-    );
-    expect(startAttempts.callCount).toBe(1);
-    expect(fs.existsSync(startAttempts.constructedDataDirs[0])).toBe(false);
-=======
   it("fails the suite when PostgreSQL cannot allocate semaphores", async () => {
     const original = process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
     process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE = "0";
@@ -259,7 +220,6 @@ describe("startEmbeddedPostgresTestDatabase port collision retry", () => {
       const { ctor, constructed } = makeFakeCtor(0);
       __setEmbeddedPostgresCtorProviderForTests(async () => ctor);
       resetTemplateState();
->>>>>>> upstream
 
     vi.doUnmock("embedded-postgres");
     vi.resetModules();
