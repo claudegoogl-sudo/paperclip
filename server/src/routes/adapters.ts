@@ -251,11 +251,11 @@ function registerWithSessionManagement(adapter: ServerAdapterModule): void {
 // ---------------------------------------------------------------------------
 
 export function adapterRoutes(options: {
-  db: Db;
+  db?: Db;
   getNativeRunnerEnabled?: () => Promise<boolean>;
   getOpenAiDotEnabled?: () => Promise<boolean>;
   resolveRunnerTarget?: (companyId: string, environmentId?: string) => Promise<RunnerTarget>;
-}) {
+} = {}) {
   const { db } = options;
   const router = Router();
   const settings = adapterSettingsService(options.db);
@@ -457,7 +457,7 @@ export function adapterRoutes(options: {
 
       // Audit: runtime install executes third-party code in this process, so
       // the actor and resolved package identity are recorded even on success.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.installed",
         entityType: "adapter",
         entityId: adapterModule.type,
@@ -483,7 +483,7 @@ export function adapterRoutes(options: {
       // Audit: a failed install is still an attempted code execution — the
       // responder needs the attempt and its failure reason even when the
       // mutation never landed.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.installed",
         entityType: "adapter",
         entityId: canonicalName,
@@ -577,7 +577,7 @@ export function adapterRoutes(options: {
       logger.info({ type: adapterType, disabled }, "Adapter enabled/disabled");
     }
 
-    await logInstanceActivity(db, req, {
+    if (db) await logInstanceActivity(db, req, {
       action: "instance.adapter.disabled",
       entityType: "adapter",
       entityId: adapterType,
@@ -618,7 +618,7 @@ export function adapterRoutes(options: {
 
     logger.info({ type: adapterType, paused, changed }, "Adapter override toggle");
 
-    await logInstanceActivity(db, req, {
+    if (db) await logInstanceActivity(db, req, {
       action: "instance.adapter.overridden",
       entityType: "adapter",
       entityId: adapterType,
@@ -700,7 +700,7 @@ export function adapterRoutes(options: {
 
     logger.info({ type: adapterType }, "External adapter unregistered and removed");
 
-    await logInstanceActivity(db, req, {
+    if (db) await logInstanceActivity(db, req, {
       action: "instance.adapter.uninstalled",
       entityType: "adapter",
       entityId: adapterType,
@@ -758,7 +758,7 @@ export function adapterRoutes(options: {
 
       logger.info({ type, version: newVersion }, "External adapter reloaded at runtime");
 
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reloaded",
         entityType: "adapter",
         entityId: type,
@@ -771,7 +771,7 @@ export function adapterRoutes(options: {
       logger.error({ err, type }, "Failed to reload external adapter");
 
       // Audit: a failed reload is an attempted runtime code swap — record it.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reloaded",
         entityType: "adapter",
         entityId: type,
@@ -850,7 +850,7 @@ export function adapterRoutes(options: {
 
       logger.info({ type, version: newVersion }, "Adapter reinstalled from npm");
 
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reinstalled",
         entityType: "adapter",
         entityId: type,
@@ -863,7 +863,7 @@ export function adapterRoutes(options: {
       logger.error({ err, type }, "Failed to reinstall adapter");
 
       // Audit: a failed reinstall is a re-attempted code execution — record it.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reinstalled",
         entityType: "adapter",
         entityId: type,

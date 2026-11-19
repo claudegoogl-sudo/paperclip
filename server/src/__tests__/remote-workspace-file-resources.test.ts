@@ -349,7 +349,8 @@ describeDatabase("remote workspace ordinary file routes", () => {
     const f = await savedFileFixture(true);
     const requestTemp = await fs.mkdtemp(path.join(os.tmpdir(), "saved-file-location-request-"));
     directories.push(requestTemp);
-    const { createApp } = await import("../app.js");
+    const { createApp: createAppWithDispatcher } = await import("../app.js");
+    const createApp = async (...args: Parameters<typeof createAppWithDispatcher>) => (await createAppWithDispatcher(...args)).app;
     const app = await createApp(db, { uiMode: "none", serverPort: 3100, storageService: f.storage,
       deploymentMode: "local_trusted", deploymentExposure: "public", bindHost: "127.0.0.1",
       allowedHostnames: ["127.0.0.1", "localhost"], authReady: false, companyDeletionEnabled: false,
