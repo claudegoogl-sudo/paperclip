@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -8,13 +9,9 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { applyPendingMigrations, closeRegisteredClients, ensurePostgresDatabase } from "./client.js";
 import {
-  EMBEDDED_POSTGRES_HOST,
-  buildEmbeddedPostgresConnectionString,
-  buildEmbeddedPostgresConstructorOptions,
-  resolveEmbeddedPostgresPasswordForStartup,
-  rotateEmbeddedPostgresAuthIfNeeded,
-  socketDirectoryPathFor,
-} from "./embedded-postgres-auth.js";
+  createEmbeddedPostgresLogBuffer,
+  formatEmbeddedPostgresError,
+} from "./embedded-postgres-error.js";
 import { prepareEmbeddedPostgresNativeRuntime } from "./embedded-postgres-native.js";
 import { loadWithoutEmbeddedPostgresExitHooks } from "./embedded-postgres-lifecycle.js";
 import { ownTestPostgres, TestPostgresShutdownError, type TestPostgresInstance } from "./test-postgres-owner.js";
@@ -27,14 +24,6 @@ import { checkTestPostgresAdmin, startTestPostgresDatabase, testPostgresAdminUrl
 // gives about 10x headroom over the clean time, so a contended run still
 // passes while a genuine hang still fails fast.
 export const EMBEDDED_POSTGRES_TEST_TIMEOUT_MS = 90_000;
-// Bound the teardown path centrally. On a loaded CI runner, embedded-postgres's
-// stop() (which does SIGINT + awaits the postmaster exit event) can take longer
-// than vitest's 10s default hookTimeout. The escalation path below caps total
-// cleanup at gracefulTimeoutMs + sigkillReapTimeoutMs (15s by default), well
-// inside the symmetric 20s hookTimeout that server/vitest.config.ts now sets.
-export const EMBEDDED_POSTGRES_GRACEFUL_STOP_TIMEOUT_MS = 10_000;
-export const EMBEDDED_POSTGRES_SIGKILL_REAP_TIMEOUT_MS = 5_000;
-export const EMBEDDED_POSTGRES_SIGKILL_POLL_INTERVAL_MS = 100;
 
 type EmbeddedPostgresInstance = ReturnType<typeof ownTestPostgres>;
 
@@ -44,9 +33,7 @@ type EmbeddedPostgresCtor = new (opts: {
   password: string;
   port: number;
   persistent: boolean;
-  authMethod?: "scram-sha-256" | "password" | "md5";
   initdbFlags?: string[];
-  postgresFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => TestPostgresInstance;
@@ -84,6 +71,125 @@ async function loadEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
   return mod.default as unknown as EmbeddedPostgresCtor;
 }
 
+let embeddedPostgresCtorProvider: EmbeddedPostgresCtorProvider = loadEmbeddedPostgresCtor;
+
+// Test seam. Replace the embedded-postgres constructor provider so a test can
+// simulate a failed start without the native runtime. Pass `null` to restore
+// the default provider. This module is test support only, so the seam is safe.
+export function __setEmbeddedPostgresCtorProviderForTests(
+  provider: EmbeddedPostgresCtorProvider | null,
+): void {
+  embeddedPostgresCtorProvider = provider ?? loadEmbeddedPostgresCtor;
+}
+
+async function getEmbeddedPostgresCtor(): Promise<EmbeddedPostgresCtor> {
+  return await embeddedPostgresCtorProvider();
+}
+
+// --- Fork: orphaned datadir sweep (ported onto upstream v2026.1117.0; not auto-invoked here) ---
+const EMBEDDED_POSTGRES_VERSION_MARKER = "PG_VERSION";
+
+function ownerPidMarkerPath(dataDir: string): string {
+  return `${dataDir}.owner-pid`;
+}
+
+function parsePidFileContents(contents: string): number | null {
+  const firstLine = contents.split(/\r?\n/, 1)[0]?.trim();
+  if (!firstLine) return null;
+  const pid = Number.parseInt(firstLine, 10);
+  return Number.isInteger(pid) && pid > 0 ? pid : null;
+}
+
+function readPidFile(filePath: string): number | null {
+  try {
+    return parsePidFileContents(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+// Exact liveness, not a guess: process.kill(pid, 0) sends no signal, it only
+// probes whether the pid exists. ESRCH means it's gone. Anything else (alive,
+// EPERM because it's owned by another user, or an unexpected error) fails
+// closed as "alive" so we never remove a datadir we're unsure about.
+export function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
+  }
+}
+
+export type ReclaimableDataDirCandidate = {
+  hasVersionMarker: boolean;
+  postmasterPid: number | null;
+  ownerPid: number | null;
+};
+
+// Pure decision function, unit-testable without touching a real cluster:
+// hand it what a directory listing says about one entry (does it look like a
+// Postgres datadir, and which pid(s) claim to own it) plus a liveness probe.
+//
+// postmasterPid (written by Postgres itself once it finishes booting) is
+// preferred when present. Most of the orphans this exists to clean up never
+// get that far - they're killed mid-initdb, before Postgres ever writes
+// postmaster.pid - so we fall back to ownerPid, a marker this module writes
+// itself immediately after mkdtemp naming the creating process. If neither
+// marker is present at all, there is no owner on record, so it's an orphan
+// from before this fix (or the exceedingly narrow window between mkdtemp and
+// the marker write) and it's safe to reclaim.
+export function isReclaimableEmbeddedPostgresDataDir(
+  candidate: ReclaimableDataDirCandidate,
+  probeIsPidAlive: (pid: number) => boolean = isPidAlive,
+): boolean {
+  if (!candidate.hasVersionMarker) return false;
+  const ownerPid = candidate.postmasterPid ?? candidate.ownerPid;
+  if (ownerPid === null) return true;
+  return !probeIsPidAlive(ownerPid);
+}
+
+function readReclaimCandidate(entryPath: string): ReclaimableDataDirCandidate | null {
+  let hasVersionMarker: boolean;
+  try {
+    hasVersionMarker = fs.statSync(path.join(entryPath, EMBEDDED_POSTGRES_VERSION_MARKER)).isFile();
+  } catch {
+    return null;
+  }
+  if (!hasVersionMarker) return null;
+
+  return {
+    hasVersionMarker,
+    postmasterPid: readPidFile(path.join(entryPath, "postmaster.pid")),
+    ownerPid: readPidFile(ownerPidMarkerPath(entryPath)),
+  };
+}
+
+// Best-effort only: a failure to reclaim orphaned datadirs must never fail a
+// test run that would otherwise pass, so every layer of this degrades to a
+// no-op rather than throwing into the caller.
+export function sweepOrphanedEmbeddedPostgresDataDirs(tmpDir: string = os.tmpdir()): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(tmpDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    try {
+      if (!entry.isDirectory()) continue;
+      const entryPath = path.join(tmpDir, entry.name);
+      const candidate = readReclaimCandidate(entryPath);
+      if (!candidate || !isReclaimableEmbeddedPostgresDataDir(candidate)) continue;
+      fs.rmSync(entryPath, { recursive: true, force: true });
+      fs.rmSync(ownerPidMarkerPath(entryPath), { force: true });
+    } catch {
+      // Leave this entry for the next sweep rather than failing the caller.
+    }
+  }
+}
+
 async function getAvailablePort(): Promise<number> {
   const reservedPorts = getReservedTestPorts();
   for (let attempt = 0; attempt < 20; attempt += 1) {
@@ -115,20 +221,11 @@ async function getAvailablePort(): Promise<number> {
   );
 }
 
-const MAX_RECENT_STARTUP_LOG_LINES = 40;
-
-function recordStartupLogLine(recentLogs: string[], message: unknown): void {
-  const text = typeof message === "string" ? message : String(message ?? "");
-  for (const rawLine of text.split(/\r?\n/)) {
-    const line = rawLine.trim();
-    if (!line) continue;
-    recentLogs.push(line);
-    if (recentLogs.length > MAX_RECENT_STARTUP_LOG_LINES) recentLogs.shift();
-  }
-}
+const EMBEDDED_POSTGRES_USER = "paperclip";
+const EMBEDDED_POSTGRES_PASSWORD = "paperclip";
+const EMBEDDED_POSTGRES_INITDB_FLAGS = ["--encoding=UTF8", "--locale=C", "--lc-messages=C"];
 
 async function createEmbeddedPostgresTestInstance(tempDirPrefix: string) {
-  sweepOrphanedEmbeddedPostgresDataDirs();
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), tempDirPrefix));
   try {
     return await createEmbeddedPostgresTestInstanceAt(dataDir);
@@ -160,7 +257,15 @@ async function createEmbeddedPostgresTestInstanceAt(dataDir: string) {
     onError: (message) => logBuffer.append(message),
   }), dataDir);
 
-  return { dataDir, port, instance, recentLogs, startupPasswordResolution };
+  return { dataDir, port, instance, getRecentLogs: () => logBuffer.getRecentLogs() };
+}
+
+function adminConnectionStringFor(port: number): string {
+  return `postgres://${EMBEDDED_POSTGRES_USER}:${EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${port}/postgres`;
+}
+
+function databaseConnectionStringFor(port: number): string {
+  return `postgres://${EMBEDDED_POSTGRES_USER}:${EMBEDDED_POSTGRES_PASSWORD}@127.0.0.1:${port}/paperclip`;
 }
 
 async function cleanupEmbeddedPostgresTestDirs(dataDir: string): Promise<void> {
@@ -290,161 +395,154 @@ function embeddedPostgresPackageVersion(): string {
     const manifest = require("embedded-postgres/package.json") as { version?: unknown };
     return typeof manifest.version === "string" ? manifest.version : "unknown";
   } catch {
-    return null;
+    return "unknown";
   }
 }
 
-// Exact liveness, not a guess: process.kill(pid, 0) sends no signal, it only
-// probes whether the pid exists. ESRCH means it's gone. Anything else (alive,
-// EPERM because it's owned by another user, or an unexpected error) fails
-// closed as "alive" so we never remove a datadir we're unsure about.
-export function isPidAlive(pid: number): boolean {
+// Hash of everything that determines the contents of a migrated cluster. Reads
+// every migration file, which costs a few milliseconds per process.
+export function computeEmbeddedPostgresTemplateKey(
+  migrationsDir: string = migrationsDirectory(),
+  input: { packageVersion?: string; initdbFlags?: string[]; user?: string } = {},
+): string {
+  const hash = createHash("sha256");
+  hash.update(`embedded-postgres=${input.packageVersion ?? embeddedPostgresPackageVersion()}\n`);
+  hash.update(`initdb=${(input.initdbFlags ?? EMBEDDED_POSTGRES_INITDB_FLAGS).join(" ")}\n`);
+  hash.update(`user=${input.user ?? EMBEDDED_POSTGRES_USER}\n`);
+  const journalPath = path.join(migrationsDir, "meta", "_journal.json");
+  if (fs.existsSync(journalPath)) {
+    hash.update(`journal\n`);
+    hash.update(fs.readFileSync(journalPath));
+    hash.update(`\n`);
+  }
+  const migrationFiles = fs
+    .readdirSync(migrationsDir)
+    .filter((name) => name.endsWith(".sql"))
+    .sort((a, b) => a.localeCompare(b));
+  for (const name of migrationFiles) {
+    hash.update(`${name}\n`);
+    hash.update(fs.readFileSync(path.join(migrationsDir, name)));
+    hash.update(`\n`);
+  }
+  return hash.digest("hex").slice(0, 24);
+}
+
+// The uid on POSIX, else the user name. Part of the cache root's name so two
+// users on one host never share a root.
+function templateOwnerTag(): string {
+  const uid = process.getuid?.();
+  if (uid !== undefined) return String(uid);
+  let username = "user";
   try {
-    process.kill(pid, 0);
-    return true;
+    username = os.userInfo().username;
+  } catch {
+    // Fall through to the generic tag.
+  }
+  return username.replace(/[^A-Za-z0-9_.-]/g, "_");
+}
+
+function templateRootDir(): string {
+  return path.join(os.tmpdir(), `${TEMPLATE_ROOT_DIR_NAME}-${templateOwnerTag()}`);
+}
+
+// Why `dir` cannot be trusted as a private directory of the current user, or
+// null when it can. Uses `lstat` so a symlink planted at the path is rejected
+// rather than followed. On Windows (no uid) only the directory check applies.
+function describePrivateDirectoryProblem(dir: string): string | null {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(dir);
   } catch (error) {
-    return (error as NodeJS.ErrnoException)?.code !== "ESRCH";
+    return `cannot be inspected (${(error as NodeJS.ErrnoException).code ?? "unknown error"})`;
   }
+  if (stat.isSymbolicLink()) return "is a symbolic link";
+  if (!stat.isDirectory()) return "is not a directory";
+  const uid = process.getuid?.();
+  if (uid === undefined) return null;
+  if (stat.uid !== uid) return `is owned by uid ${stat.uid}, not the current user (uid ${uid})`;
+  if ((stat.mode & 0o022) !== 0) {
+    return `is writable by group or others (mode ${(stat.mode & 0o777).toString(8)})`;
+  }
+  return null;
 }
 
-export type StopEmbeddedPostgresOptions = {
-  gracefulTimeoutMs?: number;
-  sigkillReapTimeoutMs?: number;
-  sigkillPollIntervalMs?: number;
-  // Injection seams for the regression test: a fake clock and a fake killer
-  // let us assert timing + escalation without spawning real processes that
-  // would slow down the suite or trip the very hookTimeout this fix targets.
-  now?: () => number;
-  sleep?: (ms: number) => Promise<void>;
-  sendSignal?: (pid: number, signal: NodeJS.Signals) => void;
-  probeIsPidAlive?: (pid: number) => boolean;
-};
-
-async function defaultSleep(ms: number): Promise<void> {
-  await new Promise<void>((resolve) => {
-    const handle = setTimeout(resolve, ms);
-    handle.unref?.();
-  });
-}
-
-// Bound teardown so a loaded CI runner can't overrun vitest's hookTimeout on
-// cleanup. Graceful shutdown (instance.stop() = SIGINT + await postmaster
-// exit) is bounded by gracefulTimeoutMs; if it doesn't settle in time we read
-// postmaster.pid out of the datadir, SIGKILL the postmaster, then poll for the
-// pid to actually be gone (the kernel reaping is asynchronous). Total worst
-// case is gracefulTimeoutMs + sigkillReapTimeoutMs, which must remain under
-// the hookTimeout set in server/vitest.config.ts (20s today) plus headroom.
-//
-// Returns true if graceful stop completed within budget, false if we had to
-// escalate to SIGKILL (so callers / tests can distinguish the two paths).
-export async function stopEmbeddedPostgresBounded(
-  instance: EmbeddedPostgresInstance,
-  dataDir: string | null,
-  options: StopEmbeddedPostgresOptions = {},
-): Promise<boolean> {
-  const gracefulTimeoutMs = options.gracefulTimeoutMs ?? EMBEDDED_POSTGRES_GRACEFUL_STOP_TIMEOUT_MS;
-  const sigkillReapTimeoutMs = options.sigkillReapTimeoutMs ?? EMBEDDED_POSTGRES_SIGKILL_REAP_TIMEOUT_MS;
-  const sigkillPollIntervalMs = options.sigkillPollIntervalMs ?? EMBEDDED_POSTGRES_SIGKILL_POLL_INTERVAL_MS;
-  const now = options.now ?? Date.now;
-  const sleep = options.sleep ?? defaultSleep;
-  const sendSignal = options.sendSignal ?? ((pid, signal) => process.kill(pid, signal));
-  const probeIsPidAlive = options.probeIsPidAlive ?? isPidAlive;
-
-  const gracefulSettled = await Promise.race([
-    instance.stop().then(
-      () => true,
-      () => false,
-    ),
-    new Promise<boolean>((resolve) => {
-      const handle = setTimeout(() => resolve(false), gracefulTimeoutMs);
-      handle.unref?.();
-    }),
-  ]);
-  if (gracefulSettled) return true;
-  if (!dataDir) return false;
-
-  const postmasterPid = readPidFile(path.join(dataDir, "postmaster.pid"));
-  if (postmasterPid === null || !probeIsPidAlive(postmasterPid)) return false;
-
+// Creates the cache root with mode 0700 and verifies it is private to the
+// current user. Returns null, after one warning, when it is not: the cache is
+// then unused for this process and every suite takes the fresh path.
+function prepareTemplateRootDir(): string | null {
+  const rootDir = templateRootDir();
   try {
-    sendSignal(postmasterPid, "SIGKILL");
-  } catch {
-    return false;
-  }
-
-  const deadline = now() + sigkillReapTimeoutMs;
-  while (now() < deadline) {
-    if (!probeIsPidAlive(postmasterPid)) return false;
-    await sleep(sigkillPollIntervalMs);
-  }
-  return false;
-}
-
-export type ReclaimableDataDirCandidate = {
-  hasVersionMarker: boolean;
-  postmasterPid: number | null;
-  ownerPid: number | null;
-};
-
-// Pure decision function, unit-testable without touching a real cluster:
-// hand it what a directory listing says about one entry (does it look like a
-// Postgres datadir, and which pid(s) claim to own it) plus a liveness probe.
-//
-// postmasterPid (written by Postgres itself once it finishes booting) is
-// preferred when present. Most of the orphans this exists to clean up never
-// get that far - they're killed mid-initdb, before Postgres ever writes
-// postmaster.pid - so we fall back to ownerPid, a marker this module writes
-// itself immediately after mkdtemp naming the creating process. If neither
-// marker is present at all, there is no owner on record, so it's an orphan
-// from before this fix (or the exceedingly narrow window between mkdtemp and
-// the marker write) and it's safe to reclaim.
-export function isReclaimableEmbeddedPostgresDataDir(
-  candidate: ReclaimableDataDirCandidate,
-  probeIsPidAlive: (pid: number) => boolean = isPidAlive,
-): boolean {
-  if (!candidate.hasVersionMarker) return false;
-  const ownerPid = candidate.postmasterPid ?? candidate.ownerPid;
-  if (ownerPid === null) return true;
-  return !probeIsPidAlive(ownerPid);
-}
-
-function readReclaimCandidate(entryPath: string): ReclaimableDataDirCandidate | null {
-  let hasVersionMarker: boolean;
-  try {
-    hasVersionMarker = fs.statSync(path.join(entryPath, EMBEDDED_POSTGRES_VERSION_MARKER)).isFile();
-  } catch {
+    fs.mkdirSync(rootDir, { recursive: true, mode: 0o700 });
+    const problem = describePrivateDirectoryProblem(rootDir);
+    if (problem !== null) {
+      warnTemplateOnce("root", `template cache root ${rootDir} ${problem}; using fresh clusters`);
+      return null;
+    }
+    // A root created by an earlier version may be wider than 0700. It is
+    // ours (checked above), so narrow it.
+    if (process.getuid !== undefined && (fs.lstatSync(rootDir).mode & 0o777) !== 0o700) {
+      fs.chmodSync(rootDir, 0o700);
+    }
+    return rootDir;
+  } catch (error) {
+    warnTemplateOnce(
+      "root",
+      `template cache root ${rootDir} could not be prepared: ${(error as Error).message}; using fresh clusters`,
+    );
     return null;
   }
-  if (!hasVersionMarker) return null;
-
-  return {
-    hasVersionMarker,
-    postmasterPid: readPidFile(path.join(entryPath, "postmaster.pid")),
-    ownerPid: readPidFile(ownerPidMarkerPath(entryPath)),
-  };
 }
 
-// Best-effort only: a failure to reclaim orphaned datadirs must never fail a
-// test run that would otherwise pass, so every layer of this degrades to a
-// no-op rather than throwing into the caller.
-export function sweepOrphanedEmbeddedPostgresDataDirs(tmpDir: string = os.tmpdir()): void {
+// A template is usable when it is a private directory of the current user
+// that holds a cleanly stopped cluster: `PG_VERSION` present, no
+// `postmaster.pid`. The ownership check repeats the root's check so a
+// template is never copied from a directory this user does not own.
+function isUsableTemplate(dir: string): boolean {
+  if (describePrivateDirectoryProblem(dir) !== null) return false;
+  return fs.existsSync(path.join(dir, "PG_VERSION")) && !fs.existsSync(path.join(dir, "postmaster.pid"));
+}
+
+// Records a use of the template so `pruneStaleTemplates` measures idle time,
+// not age. Best effort.
+function touchTemplate(dir: string): void {
+  try {
+    const now = new Date();
+    fs.utimesSync(dir, now, now);
+  } catch {
+    // The template still works without the refreshed timestamp.
+  }
+}
+
+const warnedTemplateTopics = new Set<string>();
+
+function warnTemplateOnce(topic: string, message: string): void {
+  if (warnedTemplateTopics.has(topic)) return;
+  warnedTemplateTopics.add(topic);
+  console.warn(`[embedded-postgres] ${message}`);
+}
+
+// Best-effort removal of templates for other keys that have not been used for
+// a week, plus abandoned build directories. Every reuse refreshes a template's
+// timestamp, so a template that any process resolved in the last week stays.
+// A suite never depends on the template after its copy is made, so pruning
+// can only affect a process that resolved the path and has not copied yet;
+// that process then rebuilds the template instead of failing. Never throws.
+function pruneStaleTemplates(rootDir: string, keepDir: string): void {
   let entries: fs.Dirent[];
   try {
-    entries = fs.readdirSync(tmpDir, { withFileTypes: true });
+    entries = fs.readdirSync(rootDir, { withFileTypes: true });
   } catch {
     return;
   }
-
+  const now = Date.now();
   for (const entry of entries) {
+    const entryPath = path.join(rootDir, entry.name);
+    if (entryPath === keepDir || !entry.isDirectory()) continue;
     try {
-      if (!entry.isDirectory()) continue;
-      const entryPath = path.join(tmpDir, entry.name);
-      const candidate = readReclaimCandidate(entryPath);
-      if (!candidate || !isReclaimableEmbeddedPostgresDataDir(candidate)) continue;
-      fs.rmSync(entryPath, { recursive: true, force: true });
-      fs.rmSync(ownerPidMarkerPath(entryPath), { force: true });
+      const age = now - fs.statSync(entryPath).mtimeMs;
+      if (age > TEMPLATE_PRUNE_AGE_MS) fs.rmSync(entryPath, { recursive: true, force: true });
     } catch {
-      // Leave this entry for the next sweep rather than failing the caller.
+      // Another process may be using or removing it; leave it alone.
     }
   }
 }
@@ -599,18 +697,7 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
   let started: { dataDir: string; instance: EmbeddedPostgresInstance } | null = null;
 
   try {
-    const created = await createEmbeddedPostgresTestInstance(
-      "paperclip-embedded-postgres-probe-",
-    );
-    dataDir = created.dataDir;
-    instance = created.instance;
-    await instance.initialise();
-    await instance.start();
-    await rotateEmbeddedPostgresAuthIfNeeded({
-      dataDir,
-      port: created.port,
-      currentPassword: created.startupPasswordResolution.password,
-    });
+    started = await startEmbeddedPostgresWithRetry("paperclip-embedded-postgres-probe-");
     return { supported: true };
   } catch (error) {
     const failure = formatEmbeddedPostgresError(error, {
@@ -621,10 +708,10 @@ async function probeEmbeddedPostgresSupport(): Promise<EmbeddedPostgresTestSuppo
     }
     throw failure;
   } finally {
-    if (instance) {
-      await stopEmbeddedPostgresBounded(instance, dataDir).catch(() => {});
+    if (started) {
+      const { dataDir, instance } = started;
+      await stopEmbeddedPostgresBounded(instance, () => cleanupEmbeddedPostgresTestDirs(dataDir));
     }
-    if (dataDir) cleanupEmbeddedPostgresTestDirs(dataDir);
   }
 }
 
@@ -640,8 +727,13 @@ export async function getEmbeddedPostgresTestSupport(): Promise<EmbeddedPostgres
   return await embeddedPostgresSupportPromise;
 }
 
-const MAX_PORT_COLLISION_ATTEMPTS = 5;
-const PORT_COLLISION_LOG_PATTERN = /address already in use/i;
+// Starts the cluster for one suite: from the host template when one is
+// available, otherwise a fresh `initdb`. Template failures fall back to the
+// fresh path so the cache can only make a suite faster, never fail it.
+async function startEmbeddedPostgresClusterForSuite(
+  tempDirPrefix: string,
+): Promise<{ port: number; dataDir: string; instance: EmbeddedPostgresInstance; mode: EmbeddedPostgresStartMode }> {
+  const templateDir = await getEmbeddedPostgresTemplateDir();
 
   if (templateDir !== null) {
     try {
@@ -675,10 +767,12 @@ export async function startEmbeddedPostgresTestDatabase(
   const { port, dataDir, instance, mode } = await startEmbeddedPostgresClusterForSuite(tempDirPrefix);
   lastStartMode = mode;
 
-  for (let attempt = 1; attempt <= MAX_PORT_COLLISION_ATTEMPTS; attempt += 1) {
-    let dataDir: string | null = null;
-    let instance: EmbeddedPostgresInstance | null = null;
-    let recentLogs: string[] = [];
+  try {
+    // Both calls are no-ops on a template copy and keep the returned database
+    // identical to the fresh path even if the template were ever stale.
+    await ensurePostgresDatabase(adminConnectionStringFor(port), "paperclip");
+    const connectionString = databaseConnectionStringFor(port);
+    await applyPendingMigrations(connectionString);
 
     return {
       connectionString,
@@ -704,8 +798,4 @@ export async function startEmbeddedPostgresTestDatabase(
       }`,
     );
   }
-
-  throw new Error(
-    `Failed to start embedded PostgreSQL test database: ${formatEmbeddedPostgresError(lastError)}`,
-  );
 }

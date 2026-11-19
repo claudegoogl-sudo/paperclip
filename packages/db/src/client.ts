@@ -390,7 +390,23 @@ export function createDb(url: string, options?: DatabaseClientOptions) {
 }
 
 function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: object) {
-  const sql = postgres(url, postgresJsOptions(resolved));
+  // Pool-size precedence (fork carryover over upstream 824.1): explicit
+  // options win, then the upstream DATABASE_POOL_MAX variable, then the fork's
+  // PAPERCLIP_DB_POOL_MAX, then the fork default. Restored so existing
+  // deployments keep their configured sizing.
+  const maxConnections =
+    resolved.maxConnections
+    ?? envPositiveInteger(process.env, "DATABASE_POOL_MAX")
+    ?? resolveDbPoolOptions().max;
+  const { statementTimeoutMs } = resolveDbPoolOptions();
+  const { connectionString, sqlOptions } = resolveEmbeddedPostgresConnection(url);
+  const driverOptions = postgresJsOptions({ ...resolved, maxConnections });
+  const driverConnection = (driverOptions.connection ?? {}) as Record<string, unknown>;
+  const sql = postgres(connectionString, {
+    ...driverOptions,
+    connection: { ...driverConnection, statement_timeout: statementTimeoutMs },
+    ...sqlOptions,
+  });
   if (resolved.prepare === true) installPreparedQueries(sql);
   const key = hostPortKeyOrNull(url);
   if (key) registerClient(key, sql);
@@ -398,7 +414,7 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   // postgres.js calls that error "write CONNECTION_CLOSED" too, so the
   // message cannot establish that replay is safe. Leave retries to callers
   // that know the complete operation is idempotent.
-  const db = installDatabaseWorkSignals(drizzlePg(sql, { schema }), owner);
+  const db = installDatabaseWorkSignals(drizzlePg(enableQueryCancellation(sql), { schema }), owner);
   installDatabaseResponseCapture(db, schema);
   dedicatedDbFactories.set(db, () => createDbClient(url, {
     ...resolved, maxConnections: 1, applicationName: "paperclip-workspace-finalization-lock",

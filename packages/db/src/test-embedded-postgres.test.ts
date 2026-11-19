@@ -32,89 +32,89 @@ afterAll(() => {
 // option type matches the real constructor so no type cast is needed.
 type FakeOptions = {
   databaseDir: string;
+  user: string;
+  password: string;
   port: number;
+  persistent: boolean;
+  initdbFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 };
 
-const startAttempts = vi.hoisted(() => ({
-  constructedDataDirs: [] as string[],
-  // How many leading start() calls should simulate a port collision before
-  // one finally succeeds. Configured per-test via configureStartAttempts().
-  failuresBeforeSuccess: 0,
-  callCount: 0,
-}));
+const BIND_CONFLICT_LOG = 'could not bind IPv4 address "127.0.0.1": Address already in use';
 
-vi.mock("embedded-postgres", () => {
+function makeFakeCtor(failFirst: number) {
+  const constructed: FakeOptions[] = [];
+  let started = 0;
+
   class FakeEmbeddedPostgres {
-    private readonly options: FakeCtorOptions;
-
-    constructor(options: FakeCtorOptions) {
+    private readonly options: FakeOptions;
+    constructor(options: FakeOptions) {
       this.options = options;
-      startAttempts.constructedDataDirs.push(options.databaseDir);
+      constructed.push(options);
     }
-
     async initialise(): Promise<void> {}
-
     async start(): Promise<void> {
-      startAttempts.callCount += 1;
-      if (startAttempts.callCount <= startAttempts.failuresBeforeSuccess) {
-        // Mirrors real embedded-postgres: on a port collision the postgres
-        // process exits immediately, stderr carries the real reason, and the
-        // start() promise settles via a bare reject() with no error object.
-        this.options.onLog?.("could not bind IPv4 socket: Address already in use\n");
-        throw undefined;
+      started += 1;
+      if (started <= failFirst) {
+        // Mirror the real failure: Postgres logs the reason, then `start()`
+        // rejects with an Error whose message is empty.
+        this.options.onLog?.(BIND_CONFLICT_LOG);
+        throw new Error();
       }
     }
-
     async stop(): Promise<void> {}
   }
 
-  return { default: FakeEmbeddedPostgres };
-});
-
-function configureStartAttempts(failuresBeforeSuccess: number): void {
-  startAttempts.constructedDataDirs = [];
-  startAttempts.failuresBeforeSuccess = failuresBeforeSuccess;
-  startAttempts.callCount = 0;
+  return { ctor: FakeEmbeddedPostgres, constructed };
 }
 
-describe("startEmbeddedPostgresTestDatabase port collision retry", () => {
-  beforeEach(() => {
-    configureStartAttempts(0);
-    ensurePostgresDatabase.mockClear();
-    applyPendingMigrations.mockClear();
+describe("startEmbeddedPostgresWithRetry", () => {
+  afterEach(() => {
+    __setEmbeddedPostgresCtorProviderForTests(null);
   });
 
-  it("retries with a fresh port and dataDir, cleaning up the abandoned attempt", async () => {
-    const { startEmbeddedPostgresTestDatabase } = await import("./test-embedded-postgres.js");
-    configureStartAttempts(1);
+  it("recovers from a transient port conflict and returns on a later attempt", async () => {
+    const { ctor, constructed } = makeFakeCtor(2);
+    __setEmbeddedPostgresCtorProviderForTests(async () => ctor);
 
-    const db = await startEmbeddedPostgresTestDatabase("paperclip-retry-test-");
+    const started = await startWithRetry("paperclip-retry-recover-");
 
-    expect(startAttempts.callCount).toBe(2);
-    expect(startAttempts.constructedDataDirs).toHaveLength(2);
-    const [abandonedDataDir, successfulDataDir] = startAttempts.constructedDataDirs;
-    expect(abandonedDataDir).not.toBe(successfulDataDir);
-    expect(fs.existsSync(abandonedDataDir)).toBe(false);
-    expect(fs.existsSync(successfulDataDir)).toBe(true);
+    // The first two attempts fail, the third succeeds.
+    expect(constructed).toHaveLength(3);
 
-    await db.cleanup();
-    expect(fs.existsSync(successfulDataDir)).toBe(false);
+    // Each attempt uses a fresh data directory. The two failed directories are
+    // removed. The returned directory still exists.
+    const dataDirs = constructed.map((options) => options.databaseDir);
+    expect(new Set(dataDirs).size).toBe(3);
+    expect(fs.existsSync(dataDirs[0])).toBe(false);
+    expect(fs.existsSync(dataDirs[1])).toBe(false);
+    expect(started.dataDir).toBe(dataDirs[2]);
+    expect(fs.existsSync(started.dataDir)).toBe(true);
+
+    // Each attempt allocates a port.
+    for (const options of constructed) {
+      expect(Number.isInteger(options.port)).toBe(true);
+      expect(options.port).toBeGreaterThan(0);
+    }
+
+    // Clean up the returned attempt.
+    await started.instance.stop();
+    fs.rmSync(started.dataDir, { recursive: true, force: true });
   });
 
-  it("gives up after the bounded number of attempts and cleans up every abandoned dataDir", async () => {
-    const { startEmbeddedPostgresTestDatabase } = await import("./test-embedded-postgres.js");
-    configureStartAttempts(Number.POSITIVE_INFINITY);
+  it("throws with the real Postgres output after the attempt bound", async () => {
+    const { ctor, constructed } = makeFakeCtor(Number.POSITIVE_INFINITY);
+    __setEmbeddedPostgresCtorProviderForTests(async () => ctor);
 
-    await expect(startEmbeddedPostgresTestDatabase("paperclip-retry-exhausted-")).rejects.toThrow(
-      /Failed to start embedded PostgreSQL test database/,
-    );
+    await expect(startWithRetry("paperclip-retry-fail-")).rejects.toThrow(/after \d+ attempts/);
 
-    expect(startAttempts.callCount).toBe(5);
-    expect(startAttempts.constructedDataDirs).toHaveLength(5);
-    for (const dataDir of startAttempts.constructedDataDirs) {
-      expect(fs.existsSync(dataDir)).toBe(false);
+    // The retry stops at the bound and does not loop forever.
+    expect(constructed).toHaveLength(MAX_ATTEMPTS);
+
+    // Every failed attempt removes its data directory.
+    for (const options of constructed) {
+      expect(fs.existsSync(options.databaseDir)).toBe(false);
     }
   });
 
@@ -436,17 +436,51 @@ describeWithPostgres("startEmbeddedPostgresTestDatabase template path", () => {
         } finally {
           await database.cleanup();
         }
-        async initialise(): Promise<void> {}
-        async start(): Promise<void> {
-          startAttempts.callCount += 1;
-          throw new Error("Postgres cannot run as a root user.");
-        }
-        async stop(): Promise<void> {}
+        // Nothing was published into the rejected root, and the reason was logged once.
+        expect(fs.readdirSync(rootDir)).toEqual([]);
+        expect(warnings.filter((line) => line.includes("template cache root"))).toHaveLength(1);
+        expect(warnings[0]).toContain("writable by group or others");
+
+        // The probe still reports support, from the throwaway cluster.
+        resetTemplateState();
+        expect(await getEmbeddedPostgresTestSupport()).toEqual({ supported: true });
+      } finally {
+        console.warn = warn;
+        scratch.restore();
       }
-      return { default: FailingEmbeddedPostgres };
     });
 
-    const { startEmbeddedPostgresTestDatabase } = await import("./test-embedded-postgres.js");
+    it("uses fresh clusters when the cache root path is a symbolic link", { timeout: EMBEDDED_POSTGRES_TEST_TIMEOUT_MS }, async () => {
+      delete process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
+      const scratch = useScratchTmpdir("paperclip-template-root-");
+      const warn = console.warn;
+      console.warn = () => {};
+      try {
+        const target = path.join(scratch.scratch, "elsewhere");
+        fs.mkdirSync(target, { mode: 0o700 });
+        fs.symlinkSync(target, templateRootDir(), "dir");
+
+        resetTemplateState();
+        const database = await startEmbeddedPostgresTestDatabase("paperclip-template-root-copy-");
+        try {
+          expect(lastStartMode()).toBe("fresh");
+        } finally {
+          await database.cleanup();
+        }
+        expect(fs.readdirSync(target)).toEqual([]);
+      } finally {
+        console.warn = warn;
+        scratch.restore();
+      }
+    });
+  });
+});
+
+describe("support probe when the template cannot be built", () => {
+  afterEach(() => {
+    __setEmbeddedPostgresCtorProviderForTests(null);
+    resetTemplateState();
+  });
 
   it("fails the suite when PostgreSQL cannot allocate semaphores", async () => {
     const original = process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
@@ -507,7 +541,21 @@ describeWithPostgres("startEmbeddedPostgresTestDatabase template path", () => {
       __setEmbeddedPostgresCtorProviderForTests(async () => ctor);
       resetTemplateState();
 
-    vi.doUnmock("embedded-postgres");
-    vi.resetModules();
+      expect(await getEmbeddedPostgresTestSupport()).toEqual({ supported: true });
+      // One build attempt, then the throwaway probe, both under the scratch root.
+      expect(constructed).toHaveLength(2);
+      for (const options of constructed) expect(options.databaseDir.startsWith(scratch.scratch)).toBe(true);
+      expect(constructed[0]?.databaseDir).toContain("paperclip-embedded-postgres-template-build-");
+      expect(constructed[1]?.databaseDir).toContain("paperclip-embedded-postgres-probe-");
+      expect(warnings.filter((line) => line.includes("template build failed"))).toHaveLength(1);
+      // Nothing was published.
+      const rootDir = templateRootDir();
+      expect(fs.existsSync(rootDir) ? fs.readdirSync(rootDir) : []).toEqual([]);
+    } finally {
+      console.warn = warn;
+      scratch.restore();
+      if (originalTemplateSetting === undefined) delete process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE;
+      else process.env.PAPERCLIP_TEST_POSTGRES_TEMPLATE = originalTemplateSetting;
+    }
   });
 });

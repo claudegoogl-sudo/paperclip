@@ -90,7 +90,7 @@ export function formatEmbeddedPostgresError(
 ): Error {
   const baseError = toError(error, input.fallbackMessage);
   const recentLogs = input.recentLogs ?? [];
-  const parts = [baseError.message];
+  const parts = [scrubConnectionString(baseError.message)];
   const hint = detectEmbeddedPostgresHint([baseError.message, ...recentLogs]);
   const recentSummary = summarizeRecentLogs(recentLogs);
 

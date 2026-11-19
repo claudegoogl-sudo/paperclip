@@ -6001,4 +6001,189 @@ export const SECURITY_POSTURE_REJECTIONS = [
     columns: ["company_id", "created_at", "id", "primary_agent_id", "primary_agent_initialized", "updated_at", "user_id"],
     reason: "UI preference (primary agent selection); not an authorization input.",
   },
+  {
+    table: "agent_file_roots",
+    columns: ["agent_id", "company_id", "entries", "generation", "updated_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "agents",
+    columns: ["harness_verified_at", "harness_verified_digest"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "budget_evaluation_work",
+    columns: ["agent_id", "company_id", "created_at", "id", "project_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "budget_policies",
+    columns: ["evaluation_version"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "budget_resume_claims",
+    columns: ["actor_source", "actor_user_id", "claimed_at", "company_id", "created_at", "incident_id", "reason", "request_id", "run_id", "settled_at", "state"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "chat_voice_inbound_calls",
+    columns: ["cleanup_confirmed_at", "cleanup_next_attempt_at", "provider_account_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "company_skill_mutation_receipts",
+    columns: ["company_id", "created_at", "fingerprint", "key", "response", "skill_id", "version_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "company_skill_repository_snapshots",
+    columns: ["maintenance_at", "migration_at", "restore", "restore_retry_at", "storage", "upload"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "company_skill_versions",
+    columns: ["migration_at", "package_file_map", "package_snapshot_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "controller_instances",
+    columns: ["boot_id", "epoch", "fenced_at", "fenced_by_epoch", "lease_expires_at", "pid", "process_space", "renewed_at", "started_at", "stopped_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "cost_adjustments",
+    columns: ["previous_usage_json"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "cost_events",
+    columns: ["reported_usage_json"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "execution_admission_project_charges",
+    columns: ["admission_id", "company_id", "project_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "execution_admissions",
+    columns: ["admitted_project_ids", "attempt", "company_id", "context_revision", "created_at", "id", "primary_project_id", "run_id", "settled_at", "settlement_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "execution_workspace_snapshots",
+    columns: ["byte_size", "company_id", "created_at", "delete_after", "epoch", "execution_workspace_id", "format", "generation", "id", "key", "last_error", "manifest_digest", "metadata", "object_key", "parent_snapshot_id", "sha256", "source_operation_id", "source_run_id", "status", "updated_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "heartbeat_runs",
+    columns: ["controller_process", "legacy_process_settlement", "process_host_hash"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "issue_thread_interaction_idempotency_keys",
+    columns: ["company_id", "created_at", "id", "idempotency_key", "interaction_id", "issue_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "issues",
+    columns: ["origin_issue_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "mcp_attachment_uploads",
+    columns: ["cleanup_verified_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "mcp_oauth_client_changes",
+    columns: ["client_id", "operation", "revision"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "mcp_oauth_client_mirror_state",
+    columns: ["device_cutover_at", "device_cutover_stack_id", "enabled", "id", "receipt", "remote_responsibility", "revision"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "mcp_oauth_device_requests",
+    columns: ["ingress_owner"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "mcp_oauth_grants",
+    columns: ["revocation_index_receipt", "revocation_revision"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "mcp_oauth_tokens",
+    columns: ["revocation_revision"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "native_harness_backups",
+    columns: ["company_id", "created_at", "id", "issue_id", "manifest_sha256", "reference", "run_id", "scope_digest", "status", "updated_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "native_provider_artifact_references",
+    columns: ["artifact_id", "backup_id", "company_id", "created_at", "id", "run_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "native_provider_artifacts",
+    columns: ["closure_digest", "company_id", "created_at", "descriptor", "id", "reference", "status", "updated_at", "upload_token"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "native_run_finalizations",
+    columns: ["controller_host_hash", "lease_holder"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "native_runner_checkpoints",
+    columns: ["company_id", "issue_id", "material", "part", "run_id", "updated_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "project_task_execution_policies",
+    columns: ["company_id", "created_at", "max_concurrent_tasks", "project_id", "updated_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "projects",
+    columns: ["git_authorization_grant_id", "git_authorized_by_user_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "routine_runs",
+    columns: ["created_by_run_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "sandbox_creation_operations",
+    columns: ["company_id", "config", "created_at", "driver_key", "environment_id", "execution_workspace_id", "id", "issue_id", "lease_id", "metadata", "next_attempt_at", "original_environment_id", "plugin_id", "provider", "request_key", "run_id", "state", "updated_at"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "skill_package_deletions",
+    columns: ["archive_key", "company_id", "delete_after", "id", "manifest_key", "provider"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "status_cards",
+    columns: ["next_eval_reason"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "tool_mcp_gateway_tokens",
+    columns: ["responsible_user_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
+  {
+    table: "user_workspace_preferences",
+    columns: ["classic_workspace_enabled", "coordinator_workspace_enabled", "created_at", "id", "updated_at", "user_id"],
+    reason: "Added by the v2026.1117.0 upstream sync; provisional triage: not read as an authorization predicate by any consumer found in the merge review. Needs security review (PLA-13021 follow-up).",
+  },
 ];
