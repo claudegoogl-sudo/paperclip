@@ -3151,6 +3151,167 @@
       "when": 1794185816322,
       "tag": "0451_budget_resume_claims",
       "breakpoints": true
+    },
+    {
+      "idx": 452,
+      "version": "7",
+      "when": 1786984000000,
+      "tag": "0452_activity_log_run_id_set_null",
+      "checksum": null
+    },
+    {
+      "idx": 453,
+      "version": "7",
+      "when": 1786984100000,
+      "tag": "0453_backfill_plugin_secret_bindings",
+      "checksum": null
+    },
+    {
+      "idx": 454,
+      "version": "7",
+      "when": 1786984200000,
+      "tag": "0454_secret_binding_egress_allowlist",
+      "checksum": null
+    },
+    {
+      "idx": 455,
+      "version": "7",
+      "when": 1786984300000,
+      "tag": "0455_egress_would_deny_observations",
+      "checksum": null
+    },
+    {
+      "idx": 456,
+      "version": "7",
+      "when": 1786984400000,
+      "tag": "0456_activity_log_company_entity_created_idx",
+      "checksum": null
+    },
+    {
+      "idx": 457,
+      "version": "7",
+      "when": 1786984500000,
+      "tag": "0457_usage_limit_parks",
+      "checksum": null
+    },
+    {
+      "idx": 458,
+      "version": "7",
+      "when": 1786984600000,
+      "tag": "0458_heartbeat_runs_context_issue_idx",
+      "checksum": null
+    },
+    {
+      "idx": 459,
+      "version": "7",
+      "when": 1786984700000,
+      "tag": "0459_run_history_retention",
+      "checksum": null
+    },
+    {
+      "idx": 460,
+      "version": "7",
+      "when": 1786984800000,
+      "tag": "0460_secret_binding_posture_audit",
+      "checksum": null
+    },
+    {
+      "idx": 461,
+      "version": "7",
+      "when": 1786984900000,
+      "tag": "0461_activity_log_actor_provenance",
+      "checksum": null
+    },
+    {
+      "idx": 462,
+      "version": "7",
+      "when": 1786985000000,
+      "tag": "0462_cost_events_denormalise_run_identifier",
+      "checksum": null
+    },
+    {
+      "idx": 463,
+      "version": "7",
+      "when": 1786985100000,
+      "tag": "0463_plugin_webhook_deliveries_retention",
+      "checksum": null
+    },
+    {
+      "idx": 464,
+      "version": "7",
+      "when": 1786985200000,
+      "tag": "0464_agent_runtime_state_session_params",
+      "checksum": null
+    },
+    {
+      "idx": 465,
+      "version": "7",
+      "when": 1786985300000,
+      "tag": "0465_plugin_config_egress_allowlist",
+      "checksum": null
+    },
+    {
+      "idx": 466,
+      "version": "7",
+      "when": 1786985400000,
+      "tag": "0466_plugin_config_egress_would_deny_observations",
+      "checksum": null
+    },
+    {
+      "idx": 467,
+      "version": "7",
+      "when": 1786985500000,
+      "tag": "0467_agent_api_keys_expires_at",
+      "checksum": null
+    },
+    {
+      "idx": 468,
+      "version": "7",
+      "when": 1786985600000,
+      "tag": "0468_board_api_keys_scope_config",
+      "checksum": null
+    },
+    {
+      "idx": 469,
+      "version": "7",
+      "when": 1786985700000,
+      "tag": "0469_task_bridge_auto_renew",
+      "checksum": null
+    },
+    {
+      "idx": 470,
+      "version": "7",
+      "when": 1786985800000,
+      "tag": "0470_board_api_key_auth_events",
+      "checksum": null
+    },
+    {
+      "idx": 471,
+      "version": "7",
+      "when": 1786985900000,
+      "tag": "0471_plugin_private_egress_optin",
+      "breakpoints": true
+    },
+    {
+      "idx": 472,
+      "version": "7",
+      "when": 1790018363070,
+      "tag": "0472_instance_admission_holds",
+      "breakpoints": true
+    },
+    {
+      "idx": 473,
+      "version": "7",
+      "when": 1790796608172,
+      "tag": "0473_secret_binding_posture_audit_actor_nullif",
+      "breakpoints": true
+    },
+    {
+      "idx": 474,
+      "version": "7",
+      "when": 1794388358305,
+      "tag": "0474_plugin_tool_grants",
+      "breakpoints": true
     }
   ]
 }
