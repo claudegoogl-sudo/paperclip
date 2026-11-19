@@ -4281,6 +4281,9 @@ export function createPluginWorkerHandle(
       childProcess.kill("SIGKILL");
     } catch {
       // Process may already be dead.
+    }
+  }
+
   // Retire the current process on a fail-closed route violation. Unlike
   // `killProcess`, this is not a deliberate stop: the exit replaces the process
   // with a fresh one. A deliberate stop already in progress wins, so a plugin

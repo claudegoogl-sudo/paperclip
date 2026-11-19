@@ -136,6 +136,17 @@ import {
 } from "@paperclipai/db";
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
+import {
+  RUN_HISTORY_PRUNE_BATCH_SIZE,
+  RUN_HISTORY_PRUNE_MAX_BATCHES,
+  startRunHistoryRetention,
+} from "./services/run-history-retention.js";
+import {
+  PLUGIN_WEBHOOK_DELIVERY_PRUNE_BATCH_SIZE,
+  PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
+  startPluginWebhookDeliveryRetention,
+} from "./services/plugin-webhook-delivery-retention.js";
+import { startBoardApiKeyAuthEventRetention } from "./services/board-api-key-auth-event-retention.js";
 import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
 import { loadCloudBootstrapConfig, loadConfig, type Config } from "./config.js";
@@ -178,6 +189,7 @@ import {
   toolAccessService,
   workspaceOperationService,
 } from "./services/index.js";
+import { markServerShutdownStarted } from "./services/server-shutdown-state.js";
 import { questionResponseDeliveryService, registerQuestionResponseDeliveryWork } from "./services/question-response-delivery.js";
 import { deliverNativeQuestionResponse } from "./services/native-runtime/native-question-bridge.js";
 import { registerStatusCardEvaluationWork, statusCardEvaluationService } from "./services/status-card-evaluation.js";
@@ -200,7 +212,18 @@ import {
 } from "./services/adapter-registry-bootstrap.js";
 import { reapOrphanedMcpProcessesOnStartup } from "./services/mcp-orphan-reaper.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
-import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl, resolveLocalRuntimeApiUrl } from "./runtime-api.js";
+import {
+  EGRESS_POSTURE_SWEEP_INTERVAL_MS,
+  startEgressPostureSweep,
+} from "./services/egress-posture.js";
+import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
+import {
+  buildRuntimeApiCandidateUrls,
+  chooseAgentApiUrl,
+  choosePrimaryRuntimeApiUrl,
+  isInsecureNonLoopbackApiUrl,
+  resolveLocalRuntimeApiUrl,
+} from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { bufferPluginLogEntry } from "./services/plugin-host-services.js";
@@ -1083,7 +1106,29 @@ async function startServerWithDatabaseTeardown(
     getRetention: async () => (await backupSettingsSvc.getGeneral()).backupRetention,
     logger,
   });
-  const pluginWorkerManager = createPluginWorkerManager();
+  const pluginRunContextRegistry = createPluginRunContextRegistry();
+  // One process-wide stream bus. Verified worker stream notifications publish
+  // here and the plugin SSE bridge (`GET /api/plugins/:pluginId/bridge/stream/:channel`)
+  // fans them out to subscribed UIs. Without this wiring the SSE
+  // bridge was a silently-dead surface — the endpoint 501'd and no worker
+  // notification ever reached a subscriber.
+  const pluginStreamBus = createPluginStreamBus();
+  const pluginWorkerManager = createPluginWorkerManager({
+    runContextRegistry: pluginRunContextRegistry,
+    // Worker ctx.logger notifications persist to plugin_logs on the same
+    // buffered path as the logger.log host service (§26.1), so the operator
+    // logs panel can show plugin errors.
+    workerLogPersist: (entry) => bufferPluginLogEntry({ db, ...entry }),
+    onStreamNotification: ({ pluginId, method, params }) => {
+      const published = publishWorkerStreamNotification(pluginStreamBus, pluginId, method, params);
+      if (!published) {
+        logger.warn(
+          { pluginId, method },
+          "unrecognized plugin stream notification could not be published",
+        );
+      }
+    },
+  });
   const heartbeat = config.heartbeatSchedulerEnabled
     ? heartbeatService(db as any, { pluginWorkerManager })
     : null;
@@ -1102,7 +1147,7 @@ async function startServerWithDatabaseTeardown(
   const idleDeadlineOwners: IdleDeadlineOwners = {};
   // createApp fills the chat Retry callback; the continuation worker reads it.
   const budgetResumeDelivery: BudgetResumeDelivery = {};
-  const app = await createApp(db as any, {
+  const { app, pluginToolDispatcher } = await createApp(db as any, {
     idleDeadlineOwners,
     budgetResumeDelivery,
     prepareIdleDatabaseBackup: idleDatabaseBackupEnabled
@@ -1666,6 +1711,19 @@ async function startServerWithDatabaseTeardown(
   server.on("close", registerGitHubBotCloudSetupPoller(db, async () => {
     if (githubCanRun()) await githubConnectionEvents.pollOnce({ forSetup: true });
   }));
+
+  // Sweep MCP child processes (e.g. Playwright MCP) that were orphaned to init
+  // by a prior crash or watchdog kill. Runs regardless of heartbeat scheduling
+  // so leaked strays never accumulate across restarts. Safe matching only:
+  // MCP command + ppid==1.
+  try {
+    const reaped = await reapOrphanedMcpProcessesOnStartup();
+    if (reaped.length > 0) {
+      logger.warn({ reapedPids: reaped }, "startup swept orphaned MCP child processes");
+    }
+  } catch (err) {
+    logger.error({ err }, "startup MCP orphan sweep failed");
+  }
 
   await timeStartupRecovery("tool_reviews", async () => {
     if (config.heartbeatSchedulerEnabled) {

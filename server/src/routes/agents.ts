@@ -1796,6 +1796,70 @@ export function agentRoutes(
   }
 
   /**
+   * Requested scope for every `agent_config:update` decision. Always carries
+   * the target agent id so an `agents:configure` grant scoped to
+   * `{targetAgentIds:[...]}` can match; an unscoped grant (scope null) still
+   * matches any requested scope, so existing unscoped grants are unchanged.
+   */
+  // agentConfigUpdateScope() lives in services/authorization.ts (shared with routes/secrets.ts).
+
+  /**
+   * Agent callers that update ANOTHER agent may change only the model
+   * selection. Everything else (env, command, runtimeConfig, name, ...) and
+   * replaceAdapterConfig are rejected. Self-updates and board callers are
+   * not affected.
+   */
+  const CROSS_AGENT_ADAPTER_CONFIG_ALLOWED_KEYS = new Set(["model", "fallbackModel"]);
+  function assertAgentCrossAgentPatchIsModelOnly(
+    req: Request,
+    targetAgent: { id: string },
+    body: Record<string, unknown>,
+  ) {
+    if (req.actor.type !== "agent") return;
+    if (req.actor.agentId === targetAgent.id) return;
+    const rejected: string[] = [];
+    for (const key of Object.keys(body)) {
+      if (key !== "adapterConfig") rejected.push(key);
+    }
+    const adapterConfig = asRecord(body.adapterConfig);
+    if (hasOwn(body, "adapterConfig") && !adapterConfig) rejected.push("adapterConfig");
+    if (adapterConfig) {
+      for (const key of Object.keys(adapterConfig)) {
+        if (!CROSS_AGENT_ADAPTER_CONFIG_ALLOWED_KEYS.has(key)) rejected.push(`adapterConfig.${key}`);
+      }
+    }
+    if (rejected.length === 0) return;
+    logger.warn(
+      { actorAgentId: req.actor.agentId, targetAgentId: targetAgent.id, rejectedFields: rejected.sort() },
+      "agent.cross_agent_update.denied_fields",
+    );
+    throw forbidden(
+      `Agent callers may only change adapterConfig.model / adapterConfig.fallbackModel on another agent (rejected: ${rejected.join(", ")})`,
+    );
+  }
+
+  /**
+   * Cross-agent write guard. Agent callers may only change *another* agent through
+   * the model-only path of `PATCH /agents/:id` (see assertAgentCrossAgentPatchIsModelOnly).
+   * Every other agent-config write route (instructions, profile, skills sync,
+   * config rollback) is self-only for agent callers, even when an
+   * `agents:configure` grant (scoped or unscoped) would allow it. Board callers
+   * and self-updates are unaffected.
+   */
+  function assertNoCrossAgentAgentWrite(
+    req: Request,
+    targetAgent: { id: string; companyId: string },
+    route: string,
+  ) {
+    if (req.actor.type !== "agent" || req.actor.agentId === targetAgent.id) return;
+    logger.warn(
+      { actorAgentId: req.actor.agentId, targetAgentId: targetAgent.id, route },
+      "agent.cross_agent_write.denied",
+    );
+    throw forbidden(`Agent callers may not use ${route} on another agent`);
+  }
+
+  /**
    * Terminating an agent is a board-only governed action. The denial gives
    * other actors a ready profile link, so they can send a person to the control.
    */

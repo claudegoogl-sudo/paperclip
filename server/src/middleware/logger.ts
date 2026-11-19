@@ -156,6 +156,11 @@ function requestLogUrl(req: {
  * use the shared `logger`. Combines upstream's private-webhook closed
  * projections with the fork's secret-pattern redaction.
  */
+function abortedRequestMessage(req: IncomingMessage, res: ServerResponse) {
+  if (!req.readableAborted && res.writableFinished) return null;
+  return `${req.method} ${requestLogUrl(req)} — request aborted${res.headersSent ? " during response" : " before response"}`;
+}
+
 export function createHttpLogger(baseLogger: pino.Logger) {
   return pinoHttp({
     logger: baseLogger,
