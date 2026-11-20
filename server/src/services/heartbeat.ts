@@ -35,7 +35,7 @@ import {
 } from "./heartbeat/scheduling.js";
 import { createHostRunAdmission } from "./heartbeat/host-admission.js";
 import { canApplyTaskWorkspaceSelectionAtAdmission, taskWorkspaceRuntimeSelectionEnabled } from "./execution-workspace-policy.js";
-import { agentExecutionsHaveStopped } from "./agent-execution-stop.js";
+import { agentExecutionsHaveStopped, AGENT_STOP_TERMINAL_RUN_STATUSES, runMayHaveLiveProcess } from "./agent-execution-stop.js";
 import {
   cancelHeartbeatNativeRun,
   terminateHeartbeatRunProcess,
@@ -4064,7 +4064,9 @@ export function heartbeatService(
           and(eq(environmentLeases.status, "retained"), eq(environmentLeases.cleanupStatus, "failed")))));
     const needsRelease = new Set(leasesToRelease.map(lease => lease.runId));
     for (const run of runs) {
-      if (!isHeartbeatRunTerminalStatus(run.status) || liveRunExecutions.has(run.id) ||
+      // Lease cleanup retries stay independent of the history window.
+      if (!needsRelease.has(run.id) && !runMayHaveLiveProcess(run)) continue;
+      if (!AGENT_STOP_TERMINAL_RUN_STATUSES.includes(run.status) || liveRunExecutions.has(run.id) ||
           adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
           (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
       if (needsRelease.has(run.id)) {
