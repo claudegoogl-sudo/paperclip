@@ -17,14 +17,15 @@ export const AGENT_STOP_TERMINAL_RUN_STATUSES: readonly string[] =
 export const AGENT_STOP_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function runMayHaveLiveProcess(
-  run: { status: string; processPid?: number | null; processGroupId?: number | null; startedAt?: Date | null; createdAt?: Date | null; controllerLeaseExpiresAt?: Date | null },
+  run: { status: string; processPid?: number | null; processGroupId?: number | null; startedAt?: Date | null; finishedAt?: Date | null; createdAt?: Date | null; controllerLeaseExpiresAt?: Date | null },
   now = new Date(),
 ) {
   if (!AGENT_STOP_TERMINAL_RUN_STATUSES.includes(run.status)) return true;
   if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > now) return true;
   // Age is no proof that a process stopped: any recorded process keeps its checks.
   if (run.processPid || run.processGroupId) return true;
-  const at = run.startedAt ?? run.createdAt;
+  // Age counts from when the run ended, not from when it started.
+  const at = run.finishedAt ?? run.startedAt ?? run.createdAt;
   return !at || now.getTime() - at.getTime() < AGENT_STOP_HISTORY_WINDOW_MS;
 }
 
