@@ -6,6 +6,26 @@ import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
+/**
+ * One terminal list for both the heartbeat stop step and the stop-proof check.
+ * `interrupted` (host restart reaped it, no process) and `succeeded_dirty`
+ * (finished, workspace dirty) both mean the run process has ended.
+ */
+export const AGENT_STOP_TERMINAL_RUN_STATUSES: readonly string[] =
+  ["succeeded", "succeeded_dirty", "failed", "cancelled", "timed_out", "interrupted"];
+/** Terminal runs older than this cannot still own a live process; skip them. */
+export const AGENT_STOP_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+export function runMayHaveLiveProcess(
+  run: { status: string; startedAt?: Date | null; createdAt?: Date | null; controllerLeaseExpiresAt?: Date | null },
+  now = new Date(),
+) {
+  if (!AGENT_STOP_TERMINAL_RUN_STATUSES.includes(run.status)) return true;
+  if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > now) return true;
+  const at = run.startedAt ?? run.createdAt;
+  return !at || now.getTime() - at.getTime() < AGENT_STOP_HISTORY_WINDOW_MS;
+}
+
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
   if (!agentIds.length) return true;
@@ -33,7 +53,8 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
         new Date(observed).getTime() === coordinator.controllerProcessStartedAt.getTime()) return false;
   }
   for (const run of runs) {
-    if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) return false;
+    if (!runMayHaveLiveProcess(run, now)) continue;
+    if (!AGENT_STOP_TERMINAL_RUN_STATUSES.includes(run.status)) return false;
     if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return false;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {

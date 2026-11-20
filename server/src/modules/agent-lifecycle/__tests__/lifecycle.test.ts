@@ -357,6 +357,25 @@ const support = await getEmbeddedPostgresTestSupport();
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)))[0]).toMatchObject({ leaseOwner: null, leaseExpiresAt: null });
   });
 
+  it("ignores old interrupted, succeeded_dirty and legacy cancelled runs but blocks on recent ones", async () => {
+    const agent = await hire();
+    const old = new Date(Date.now() - 30 * 24 * 3600_000);
+    const base = { companyId, agentId: agent.id, invocationSource: "on_demand" as const, startedAt: old, finishedAt: old };
+    await db.insert(heartbeatRuns).values([
+      { ...base, status: "interrupted", runtimeMode: "legacy" },
+      { ...base, status: "succeeded_dirty", runtimeMode: "legacy" },
+      { ...base, status: "cancelled", runtimeMode: "legacy" },
+    ]);
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    // A recent succeeded_dirty run is terminal and must not block either.
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, invocationSource: "on_demand",
+      status: "succeeded_dirty", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date() });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, invocationSource: "on_demand",
+      status: "running", runtimeMode: "legacy", startedAt: new Date() });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+  });
+
   it("does not advance termination while a cancelled process still runs", async () => {
     const agent = await hire();
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id,
