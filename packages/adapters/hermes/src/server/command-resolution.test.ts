@@ -76,6 +76,8 @@ test("execute renders prompt API base from adapter env PAPERCLIP_API_URL", async
       },
       config: {
         hermesCommand: cliPath,
+        // Internal allowlisted provider: provider=auto fails closed (bridge-key guard).
+        provider: "anthropic",
         env: {
           PAPERCLIP_API_URL: { type: "plain", value: "http://127.0.0.1:3101" },
         },
