@@ -106,3 +106,4 @@
 - [ ] All Paperclip CI gates are green
 - [ ] Greptile is 5/5 with no open P2s, recommendations, or follow-ups
 - [ ] I will address all Greptile and reviewer comments before requesting merge
+- [ ] Each commit has a `Verified:` trailer (see `docs/verification-stamp.md`; observe mode)
