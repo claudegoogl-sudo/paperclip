@@ -29,6 +29,7 @@ import {
   routines,
   routineTriggers,
   secretAccessEvents,
+  issueThreadInteractions,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -729,6 +730,29 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run?.triggerPayload).toMatchObject({
       transientFailure: { clearedAt: expect.any(String) },
     });
+  });
+
+  it("runless stale-blocked release spares blocked issues with a pending interaction card", async () => {
+    for (const withCard of [false, true]) {
+      const { companyId, issueSvc, routine, svc } = await seedFixture();
+      const blockedIssue = await issueSvc.create(companyId, {
+        projectId: routine.projectId,
+        title: routine.title,
+        description: routine.description,
+        status: "blocked",
+        priority: routine.priority,
+        assigneeAgentId: routine.assigneeAgentId,
+        originKind: "routine_execution",
+        originId: routine.id,
+      });
+      await db.update(issues).set({ updatedAt: new Date(Date.now() - 7 * 60 * 60 * 1000) }).where(eq(issues.id, blockedIssue.id));
+      if (withCard) {
+        await db.insert(issueThreadInteractions).values({ companyId, issueId: blockedIssue.id, kind: "request_confirmation", status: "pending" });
+      }
+      await svc.runRoutine(routine.id, { source: "manual" }, {});
+      const [after] = await db.select().from(issues).where(eq(issues.id, blockedIssue.id));
+      expect(after?.status).toBe(withCard ? "blocked" : "cancelled");
+    }
   });
 
   it("filters listed routines by project", async () => {

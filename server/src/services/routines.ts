@@ -25,6 +25,7 @@ import {
   heartbeatRuns,
   issueInboxArchives,
   issueRelations,
+  issueThreadInteractions,
   issues,
   pluginManagedResources,
   plugins,
@@ -1714,6 +1715,11 @@ export function routineService(
               sql`not exists (
                 select 1 from ${issueRelations} ir
                 where ir.related_issue_id = ${issues.id} and ir.type = 'blocks'
+              )`,
+              // A pending thread interaction (card) means a human is deliberately asked: not stale.
+              sql`not exists (
+                select 1 from ${issueThreadInteractions} iti
+                where iti.issue_id = ${issues.id} and iti.status = 'pending'
               )`,
             ),
           ),
