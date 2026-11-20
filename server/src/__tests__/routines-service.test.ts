@@ -747,7 +747,7 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       });
       await db.update(issues).set({ updatedAt: new Date(Date.now() - 7 * 60 * 60 * 1000) }).where(eq(issues.id, blockedIssue.id));
       if (withCard) {
-        await db.insert(issueThreadInteractions).values({ companyId, issueId: blockedIssue.id, kind: "request_confirmation", status: "pending" });
+        await db.insert(issueThreadInteractions).values({ companyId, issueId: blockedIssue.id, kind: "request_confirmation", status: "pending", payload: {} });
       }
       await svc.runRoutine(routine.id, { source: "manual" }, {});
       const [after] = await db.select().from(issues).where(eq(issues.id, blockedIssue.id));
