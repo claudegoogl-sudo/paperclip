@@ -7,7 +7,7 @@ def run(cmd, cwd=None):
         return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=120,
                               env={**os.environ, "CLICOLOR_FORCE": "0", "NO_COLOR": "1"}).stdout
     except Exception:
-        return ""
+        return None
 
 def job_shas(jobs):
     out = {}
@@ -23,23 +23,29 @@ def job_shas(jobs):
             pass
     return out
 
-TRAILER = re.compile(r"^Verified:\s*(.+?)\s*$", re.M)
+TRAILER = re.compile(r"^Verified:[ \t]*(.+?)[ \t]*$", re.M)
+TOOLS = ("pa-ci", "pa-ci-ab", "pa-job", "pa-e2e")
+STAMP = re.compile(r"^(pa-ci|pa-ci-ab|pa-job|pa-e2e) ([A-Za-z0-9._-]+)$")
+NONE = re.compile(r"^none - \S.*$")
 
 def classify(sha, msg, jobs):
+    if msg is None:
+        return "probe-error", "could not read commit message"
     m = TRAILER.findall(msg)
     if not m:
         return "unstamped", ""
     v = m[-1]
-    if v.lower().startswith("none"):
+    if NONE.match(v):
         return "none", v
-    p = v.split()
-    if len(p) < 2 or p[0] not in ("pa-ci", "pa-ci-ab", "pa-job", "pa-e2e"):
+    t = STAMP.match(v)
+    if not t:
         return "invalid", v + " (bad format)"
-    for name in (p[1], p[1] + "-pr"):
-        if jobs.get(name) == sha:
-            return "valid", v
-    missing = p[1] not in jobs and p[1] + "-pr" not in jobs
-    return "invalid", v + (" (job missing)" if missing else " (other sha)")
+    tool, name = t.groups()
+    # pa-ci-ab: NAME given, the PR side job is NAME-pr. Other tools: exact name.
+    job = name + "-pr" if tool == "pa-ci-ab" else name
+    if job not in jobs:
+        return "invalid", v + " (job missing)"
+    return ("valid", v) if jobs[job] == sha else ("invalid", v + " (other sha)")
 
 def main():
     a = argparse.ArgumentParser()
@@ -53,17 +59,22 @@ def main():
     run(["git", "fetch", "-q", "origin", "master"], o.repo)
     rows = []
     log = run(["git", "log", f"--since={o.days} days ago", "--format=%H%x1f%s%x1f%B%x1e", "origin/master"], o.repo)
-    for rec in (x for x in log.split("\x1e") if x.strip()):
+    if log is None:
+        rows.append(("master", "-", "git log failed", "probe-error", "could not read master log"))
+    for rec in (x for x in (log or "").split("\x1e") if x.strip()):
         sha, subj, body = rec.strip().split("\x1f", 2)
         rows.append(("master", sha, subj) + classify(sha, body, jobs))
-    prs = json.loads(run(["gh", "pr", "list", "--json", "number,headRefOid", "--limit", "100"], o.repo) or "[]")
-    for pr in prs:
-        sha = pr["headRefOid"]
+    raw = run(["gh", "api", "--paginate", "repos/{owner}/{repo}/pulls?state=open&per_page=100",
+               "--jq", '.[] | "\\(.number) \\(.head.sha)"'], o.repo)
+    prs = [ln.split() for ln in (raw or "").splitlines() if ln.strip()]
+    if raw is None:
+        rows.append(("PRlist", "-", "gh pr list failed", "probe-error", "could not list PRs"))
+    for number, sha in prs:
         body = run(["git", "log", "-1", "--format=%B", sha], o.repo)
         if not body:
-            run(["git", "fetch", "-q", "origin", f"pull/{pr['number']}/head"], o.repo)
+            run(["git", "fetch", "-q", "origin", f"pull/{number}/head"], o.repo)
             body = run(["git", "log", "-1", "--format=%B", sha], o.repo)
-        rows.append((f"PR#{pr['number']}", sha, body.split("\n")[0]) + classify(sha, body, jobs))
+        rows.append((f"PR#{number}", sha, (body or "").split("\n")[0]) + classify(sha, body or None, jobs))
     cnt = {}
     for r in rows:
         cnt[r[3]] = cnt.get(r[3], 0) + 1
@@ -75,8 +86,9 @@ def main():
             f.write("\t".join([r[0], r[1][:12], r[3], r[4], r[2][:80]]) + "\n")
     print(summary)
 
-try:
-    main()
-except Exception as e:
-    print("verification-stamps: probe error (observe only):", e)
-sys.exit(0)
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("verification-stamps: probe error (observe only):", e)
+    sys.exit(0)
