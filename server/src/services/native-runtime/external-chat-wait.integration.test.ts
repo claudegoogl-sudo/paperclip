@@ -1379,7 +1379,7 @@ describe("native external-chat response wait", () => {
       resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
     }).where(eq(heartbeatRuns.id, child.id));
     expect(await heartbeatService(db).scheduleBoundedRetry(child.id, { retryReason: "interaction_continuation_infra_retry",
-      wakeReason: "interaction_continuation_infra_retry", maxAttempts: 3 })).toMatchObject({ outcome: "retry_exhausted" });
+      wakeReason: "interaction_continuation_infra_retry", maxAttempts: 2 })).toMatchObject({ outcome: "retry_exhausted" });
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId: fixture.companyId, agentId: fixture.agentId,
       source: "automation", status: "claimed" }).returning();
     const context = { ...child.contextSnapshot, retryOfRunId: child.id, scheduledRetryAttempt: 3,
