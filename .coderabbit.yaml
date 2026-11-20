@@ -1,0 +1,26 @@
+# CodeRabbit configuration. Observe-mode additions only (PLA-13072).
+# Unlisted keys keep their defaults / the current app settings. Do not add auto-fix here.
+# NOTE: for a PR from a branch of this repo by a trusted author CodeRabbit reads THIS file from the
+# PR head (docs: configuration/branch, "Auto"). A PR can therefore change its own review rules.
+# The guard is pa-ci-ab (warns when this file or REVIEW.md changes).
+language: en-US
+reviews:
+  auto_review:
+    enabled: true
+    base_branches:
+      - master
+  path_instructions:
+    - path: "**/*"
+      instructions: |
+        Apply the rules in REVIEW.md at the repo root. Report fork-only hunks, security controls,
+        redaction, migrations, review/CI gate changes and startup sweeps first. Treat style as a nit.
+    - path: "packages/db/src/migrations/**"
+      instructions: "Migrations are append-only. Flag any edit to an existing migration, risky locks, costly backfills, non-idempotent steps."
+    - path: "{vitest.config.ts,**/vitest.config.ts,scripts/run-vitest-stable.mjs,scripts/*shard*,.github/**,scripts/check-*}"
+      instructions: "Gate files. Flag any change that skips, ignores, loosens or removes a test, lane, shard or check. Require a written reason."
+    - path: "{REVIEW.md,.coderabbit.yaml}"
+      instructions: "Review rules. Flag any change that weakens a rule or narrows what is reviewed."
+knowledge_base:
+  code_guidelines:
+    filePatterns:
+      - REVIEW.md
