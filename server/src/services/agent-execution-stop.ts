@@ -13,15 +13,17 @@ import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
  */
 export const AGENT_STOP_TERMINAL_RUN_STATUSES: readonly string[] =
   ["succeeded", "succeeded_dirty", "failed", "cancelled", "timed_out", "interrupted"];
-/** Terminal runs older than this cannot still own a live process; skip them. */
+/** Terminal runs older than this WITH NO recorded process evidence are skipped. */
 export const AGENT_STOP_HISTORY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function runMayHaveLiveProcess(
-  run: { status: string; startedAt?: Date | null; createdAt?: Date | null; controllerLeaseExpiresAt?: Date | null },
+  run: { status: string; processPid?: number | null; processGroupId?: number | null; startedAt?: Date | null; createdAt?: Date | null; controllerLeaseExpiresAt?: Date | null },
   now = new Date(),
 ) {
   if (!AGENT_STOP_TERMINAL_RUN_STATUSES.includes(run.status)) return true;
   if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > now) return true;
+  // Age is no proof that a process stopped: any recorded process keeps its checks.
+  if (run.processPid || run.processGroupId) return true;
   const at = run.startedAt ?? run.createdAt;
   return !at || now.getTime() - at.getTime() < AGENT_STOP_HISTORY_WINDOW_MS;
 }

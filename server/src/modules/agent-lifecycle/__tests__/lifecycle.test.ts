@@ -367,6 +367,12 @@ const support = await getEmbeddedPostgresTestSupport();
       { ...base, status: "cancelled", runtimeMode: "legacy" },
     ]);
     expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+    // Old cancelled run with a live recorded PID must still block (age is no proof).
+    const [alive] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, invocationSource: "on_demand",
+      status: "cancelled", runtimeMode: "legacy", startedAt: old, finishedAt: new Date(), processPid: process.pid }).returning();
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, alive.id));
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
     // A recent succeeded_dirty run is terminal and must not block either.
     await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, invocationSource: "on_demand",
       status: "succeeded_dirty", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date() });
