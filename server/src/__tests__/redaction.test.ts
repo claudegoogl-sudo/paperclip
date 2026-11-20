@@ -44,7 +44,6 @@ const receiptSchemaValue = (notice: Record<string, any>) => notice.details.find(
 
 describe("redaction", () => {
   // PRP v3 case skipped: known fork-vs-upstream drift, follow-up PLA-13088
-  it.skip("preserves structured panel activation and redacts adjacent secrets in PRP v3 (Skipped: known fork-vs-upstream drift, follow-up PLA-13088)", () => {});
   it.each([1, 2] as const)("preserves structured panel activation and redacts adjacent secrets in PRP v%s", version => {
     const event = { schema: `paperclip.prp.event.v${version}`, schemaVersion: version,
       eventType: "runtime.activity.recorded", payload: { namespace: "example.runtime", activityKey: "desktop.used" } };
@@ -53,7 +52,6 @@ describe("redaction", () => {
       .toEqual({ prpEvent: { ...event, payload: { ...event.payload, apiKey: REDACTED_EVENT_VALUE } } });
   });
   // PRP v3 case skipped: known fork-vs-upstream drift, follow-up PLA-13088
-  it.skip("preserves credential update metadata and masks adjacent secrets in PRP v3 (Skipped: known fork-vs-upstream drift, follow-up PLA-13088)", () => {});
   it.each([1, 2] as const)("preserves credential update metadata and masks adjacent secrets in PRP v%s", version => {
     const event = { schema: `paperclip.prp.event.v${version}`, schemaVersion: version,
       eventType: "auth.credentials.updated", payload: { schema: "paperclip.auth.credentials.updated.v1",
@@ -976,6 +974,9 @@ describe("redaction of long letter/digit runs", () => {
   });
 
   // Skipped: known fork-vs-upstream drift, follow-up PLA-13088
+  it("phase value cap: short dotted phase names stay readable", () => {
+    expect(redactEventPayload({ phase: "task.run.measured" })).toEqual({ phase: "task.run.measured" });
+  });
   it.skip("scans long dash-separated runs in linear time", () => {
     for (const run of ["a-".repeat(60_000), "a--".repeat(40_000)]) {
       expect(redactWithinTimeBudget(`${run} Authorization: Bearer dash-run-secret`))

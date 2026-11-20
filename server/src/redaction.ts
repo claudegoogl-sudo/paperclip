@@ -401,7 +401,9 @@ const CLI_SECRET_FLAG_RE = new RegExp(
 // redaction still applies.
 const VERSION_STRING_KEYS = new Set(["fromVersion", "toVersion"]);
 // Lifecycle phase names (e.g. "task.run.measured") are dotted lowercase identifiers, not JWTs.
-const PHASE_NAME_VALUE_RE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*){1,3}$/;
+const PHASE_NAME_MAX_LENGTH = 64;
+const PHASE_NAME_SHAPE_RE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*){1,3}$/;
+const PHASE_NAME_VALUE_RE = { test: (v: string) => v.length <= PHASE_NAME_MAX_LENGTH && PHASE_NAME_SHAPE_RE.test(v) };
 const SEMVER_VALUE_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:"|')?${SECRET_FIELD_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
