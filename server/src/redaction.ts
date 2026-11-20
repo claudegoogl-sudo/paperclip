@@ -400,6 +400,8 @@ const CLI_SECRET_FLAG_RE = new RegExp(
 // Skip the JWT value check for these plugin-version keys only; key-name
 // redaction still applies.
 const VERSION_STRING_KEYS = new Set(["fromVersion", "toVersion"]);
+// Lifecycle phase names (e.g. "task.run.measured") are dotted lowercase identifiers, not JWTs.
+const PHASE_NAME_VALUE_RE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*){1,3}$/;
 const SEMVER_VALUE_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:"|')?${SECRET_FIELD_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
@@ -1057,10 +1059,15 @@ function sanitizeRecordWithLeaf(
       (JWT_VALUE_RE.test(value) || looksLikeCredentialJwt(value)) &&
       !isPublicExecutorToolSelector(value) &&
       !PUBLIC_RECEIPT_TEXT_IDS.has(value) &&
-      !isPaperclipSchemaDiscriminator(key, value)
+      !isPaperclipSchemaDiscriminator(key, value) &&
+      !(key === "phase" && PHASE_NAME_VALUE_RE.test(value))
     ) {
       redacted[redactedKey] = REDACTED_EVENT_VALUE;
 
+      continue;
+    }
+    if (key === "phase" && typeof value === "string" && PHASE_NAME_VALUE_RE.test(value)) {
+      redacted[redactedKey] = leaf(value);
       continue;
     }
     redacted[redactedKey] = sanitizeValue(value, leaf);
