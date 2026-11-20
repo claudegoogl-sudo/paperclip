@@ -976,8 +976,18 @@ export function enforceAgentKeyScopeMiddleware(): RequestHandler {
  * here turns that test red instead of letting production silently write NULL
  * provenance forever — the failure mode an audit control cannot afford.
  */
-export function registerActorContext(app: Application, db: Db, opts: ActorMiddlewareOptions): void {
+export function registerActorContext(
+  app: Application,
+  db: Db,
+  opts: ActorMiddlewareOptions,
+  afterActor?: RequestHandler,
+): void {
   app.use(actorMiddleware(db, opts));
+  // Optional hook that must see the freshly resolved req.actor and run before
+  // any scope consumer (e.g. the Cloud control override). Authenticating once
+  // here, instead of mounting a second actorMiddleware, keeps one credential
+  // capture per request.
+  if (afterActor) app.use(afterActor);
   // Must run after actorMiddleware, which is what populates req.actor. Must
   // run before route handlers so scoped-key requests never reach a route the
   // scope does not permit.

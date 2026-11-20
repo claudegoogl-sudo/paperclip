@@ -75,7 +75,7 @@ import {
 import type { InspectDatabaseBackupHealthOptions } from "./services/database-backup-health.js";
 import type { StorageService } from "./storage/types.js";
 import { httpLogger, errorHandler, requestQueryCancellation } from "./middleware/index.js";
-import { actorMiddleware, registerActorContext } from "./middleware/auth.js";
+import { registerActorContext } from "./middleware/auth.js";
 import { skillAccessRequestContext } from "./services/skill-access.js";
 import { boardMutationGuard } from "./middleware/board-mutation-guard.js";
 import {
@@ -700,16 +700,6 @@ export async function createApp(
   // board/agent bearer authentication. Mount before actorMiddleware so its
   // per-session Bearer cannot be mistaken for an agent API key.
   app.use(voiceWebhookRoutes(db, chatChannels.voice));
-  app.use(
-    actorMiddleware(db, {
-      deploymentMode: opts.deploymentMode,
-      resolveSession: opts.resolveSession,
-    }),
-  );
-  // After the actor middleware on purpose: a valid Cloud control assertion
-  // REPLACES whatever actor the request otherwise resolved to, and only on
-  // the one endpoint it authorizes (see the middleware for the contract).
-  app.use(cloudControlMiddleware());
   // The dedicated proxy IP or CIDR allowlist for requests that arrive through
   // a TLS-terminating proxy. The global `TRUST_PROXY` setting never satisfies
   // anything that reads this list; an operator sets it to the real
@@ -733,7 +723,12 @@ export async function createApp(
     // (SR-7); the board-key auth-event log reads it only to derive
     // source_ip. Never derived from the global TRUST_PROXY setting.
     authEventTrustedProxies: setupTokenLoginProxyAllowlist,
-  });
+  },
+  // After the actor middleware on purpose: a valid Cloud control assertion
+  // REPLACES whatever actor the request otherwise resolved to, and only on
+  // the one endpoint it authorizes (see the middleware for the contract).
+  // Runs before the scope consumers registerActorContext mounts next.
+  cloudControlMiddleware());
   app.use(connectionEventWakeRoutes(db));
   app.use(skillAccessRequestContext);
   app.use("/api/auth", authRoutes(db));
