@@ -38,6 +38,15 @@ vi.mock("../services/adapter-settings.js", async () => ({
   ...await vi.importActual<typeof import("../services/adapter-settings.js")>("../services/adapter-settings.js"),
   initializeAdapterSettings: vi.fn(async () => null),
 }));
+// Fork-only security sweeps own real timers; startup wiring tests assert no stray scheduler timers.
+vi.mock("../services/egress-posture.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/egress-posture.js")>()),
+  startEgressPostureSweep: vi.fn(() => 0 as unknown as NodeJS.Timeout),
+}));
+vi.mock("../services/task-bridge-renewal.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/task-bridge-renewal.js")>()),
+  startTaskBridgeRenewalSweep: vi.fn(() => () => {}),
+}));
 vi.mock("../services/cloud-runtime-config.js", () => ({ initializeCloudRuntimeConfig: cloudRuntimeStartupMocks.initialize }));
 const managedEnvironmentMocks = vi.hoisted(() => {
   const recovery = { run: vi.fn(), onStop: vi.fn(), stop: vi.fn(async () => {}) };
