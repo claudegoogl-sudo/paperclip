@@ -59,6 +59,10 @@ vi.mock("../services/board-api-key-auth-event-retention.js", async (importOrigin
   ...(await importOriginal<typeof import("../services/board-api-key-auth-event-retention.js")>()),
   startBoardApiKeyAuthEventRetention: vi.fn(() => 0 as unknown as NodeJS.Timeout),
 }));
+vi.mock("../services/plugin-run-context-registry.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/plugin-run-context-registry.js")>()),
+  createPluginRunContextRegistry: vi.fn(() => new Proxy({}, { get: () => vi.fn() })),
+}));
 vi.mock("../services/cloud-runtime-config.js", () => ({ initializeCloudRuntimeConfig: cloudRuntimeStartupMocks.initialize }));
 const managedEnvironmentMocks = vi.hoisted(() => {
   const recovery = { run: vi.fn(), onStop: vi.fn(), stop: vi.fn(async () => {}) };
