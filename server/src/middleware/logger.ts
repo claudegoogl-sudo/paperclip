@@ -59,7 +59,13 @@ function resolveServerLogDir(): string {
   const envOverride = process.env.PAPERCLIP_LOG_DIR?.trim();
   if (envOverride) return resolveHomeAwarePath(envOverride);
 
-  const fileLogDir = readConfigFile()?.logging.logDir?.trim();
+  let fileLogDir: string | undefined;
+  try {
+    fileLogDir = readConfigFile()?.logging.logDir?.trim();
+  } catch {
+    // Config snapshot not initialised yet (early import, tests): use the default log dir.
+    fileLogDir = undefined;
+  }
   if (fileLogDir) return resolveHomeAwarePath(fileLogDir);
 
   return resolveDefaultLogsDir();
