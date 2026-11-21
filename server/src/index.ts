@@ -1466,7 +1466,6 @@ async function startServerWithDatabaseTeardown(
     drainRunIds?: string[];
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
-  let heartbeatForkSweepInterval: ReturnType<typeof setInterval> | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     const finishIdleWork = beginIdleTrackedWork();
@@ -2182,19 +2181,25 @@ async function startServerWithDatabaseTeardown(
         snapshot => ({ issueWaits: snapshot.issueWaits }));
       trackHeartbeatSchedulerWork(Promise.all([scheduled.timers.ready, scheduled.monitors.ready, scheduled.routines.ready]));
       // Fork-only periodic recovery (ported back after the v2026.1117.0 merge).
-      heartbeatForkSweepInterval = setInterval(() => {
-        if (heartbeatSchedulerStopped || isIdleTaskDrainActive() || isWarmStandby()) return;
-        void (async () => {
-          const wakes = await heartbeat.sweepStrandedDeferredWakes();
-          if (wakes.promoted > 0 || wakes.resolved > 0) {
-            logger.warn({ ...wakes }, "periodic stranded deferred-wake sweep promoted or resolved wakes");
+      // Fork-only periodic recovery, registered as delivery work (upstream forbids bare timers here).
+      trackHeartbeatSchedulerWork(deliveryWork.register("fork-recovery-sweep", {
+        retryMs: config.heartbeatSchedulerIntervalMs,
+        run: async () => {
+          if (heartbeatSchedulerStopped || isIdleTaskDrainActive() || isWarmStandby()) return;
+          try {
+            const wakes = await heartbeat.sweepStrandedDeferredWakes();
+            if (wakes.promoted > 0 || wakes.resolved > 0) {
+              logger.warn({ ...wakes }, "periodic stranded deferred-wake sweep promoted or resolved wakes");
+            }
+            const alerts = await heartbeat.reconcileHighCommentVolumeAlerts();
+            if (alerts.alerted > 0 || alerts.failed > 0) {
+              logger.warn({ ...alerts }, "periodic high-comment-volume monitor raised alerts");
+            }
+          } catch (err) {
+            logger.error({ err }, "periodic fork recovery sweep failed");
           }
-          const alerts = await heartbeat.reconcileHighCommentVolumeAlerts();
-          if (alerts.alerted > 0 || alerts.failed > 0) {
-            logger.warn({ ...alerts }, "periodic high-comment-volume monitor raised alerts");
-          }
-        })().catch((err) => logger.error({ err }, "periodic fork recovery sweep failed"));
-      }, config.heartbeatSchedulerIntervalMs);
+        },
+      }).ready);
     };
     trackHeartbeatSchedulerWork(runStartupHousekeeping().then(() => {
       if (!heartbeatSchedulerStopped) startHeartbeatScheduler();
@@ -2369,10 +2374,6 @@ async function startServerWithDatabaseTeardown(
       markServerShutdownStarted(signal);
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
       heartbeatSchedulerStopped = true;
-      if (heartbeatForkSweepInterval) {
-        clearInterval(heartbeatForkSweepInterval);
-        heartbeatForkSweepInterval = null;
-      }
 
       const heartbeatShutdown = await coordinateHeartbeatSchedulerShutdown({
         signal,
