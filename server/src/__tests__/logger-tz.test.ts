@@ -15,7 +15,7 @@ import { describe, expect, it, vi, beforeEach } from "vitest";
  *    applies translateTime to a known epoch under different TZ values.
  */
 
-const mockTransport = vi.hoisted(() => vi.fn(() => ({ write: vi.fn() })));
+const mockTransport = vi.hoisted(() => vi.fn((_options: { target: string; options: Record<string, unknown> }) => ({ write: vi.fn() })));
 const mockPino = vi.hoisted(() => {
   const fn = vi.fn(() => ({
     info: vi.fn(),
@@ -60,22 +60,9 @@ describe("logger translateTime respects TZ environment variable", () => {
     await import("../middleware/logger.js");
 
     expect(mockTransport).toHaveBeenCalledOnce();
-    // Fork delta: the logger always uses a multi-target transport (stdout
-    // pretty + server.log file) instead of upstream's dev-only single target.
-    const transport = mockTransport.mock.calls[0][0] as {
-      target?: string;
-      options?: Record<string, unknown>;
-      targets?: Array<{ target: string; options: Record<string, unknown> }>;
-    };
-    const prettyTargets = transport.targets
-      ? transport.targets.filter((t) => t.target === "pino-pretty")
-      : transport.target === "pino-pretty"
-        ? [{ target: transport.target, options: transport.options! }]
-        : [];
-    expect(prettyTargets.length).toBeGreaterThan(0);
-    for (const t of prettyTargets) {
-      expect(t.options.translateTime).toBe("SYS:HH:MM:ss");
-    }
+    const transport = mockTransport.mock.calls[0]![0];
+    expect(transport.target).toBe("pino-pretty");
+    expect(transport.options.translateTime).toBe("SYS:HH:MM:ss");
   });
 
   it("keeps the pretty transport and info level in production (fork file logging)", async () => {

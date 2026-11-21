@@ -135,7 +135,6 @@ vi.mock("../services/index.js", () => ({
   }),
   workProductService: () => ({}),
   // Upstream v2026.824.1 additions pulled in by the merged routes/issues.ts.
-  companySkillService: () => ({}),
   companySearchService: () => ({}),
   inboxAgentPolicyService: () => ({}),
   ISSUE_LIST_DEFAULT_LIMIT: 500,

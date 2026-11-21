@@ -1,5 +1,6 @@
 import { afterEach, expect, it, vi } from "vitest";
 import { retryChatControlAdmission } from "./chat-control-admission-retry.js";
+import { NativeChatReviewPresentationContentionError } from "./native-runtime/native-chat-review-presentation.js";
 
 afterEach(() => vi.useRealTimers());
 
@@ -53,4 +54,15 @@ it("sleeps a bounded, varying jittered delay between attempts", async () => {
   }
   expect(new Set(delays).size).toBeGreaterThan(1);
   expect(delays.slice(0, 5)).toEqual([50, 75, 100, 125, 150]);
+});
+
+it("bounds typed chat-presentation contention with the same fifty delays", async () => {
+  vi.useFakeTimers();
+  const error = new NativeChatReviewPresentationContentionError();
+  const attempt = vi.fn().mockRejectedValue(error);
+  const rejected = expect(retryChatControlAdmission(attempt)).rejects.toBe(error);
+  await vi.advanceTimersByTimeAsync(5_000);
+  await rejected;
+  expect(attempt).toHaveBeenCalledTimes(51);
+  expect(vi.getTimerCount()).toBe(0);
 });

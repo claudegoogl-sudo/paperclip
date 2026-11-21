@@ -1,3 +1,4 @@
+import { notifyRetentionWork, writeJoinRequestChange } from "../services/retention-work-notifications.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import {
   createHash,
@@ -1381,6 +1382,7 @@ async function loadCompanyUserDirectory(db: Db, companyId: string) {
     .select({
       principalId: companyMemberships.principalId,
       status: companyMemberships.status,
+      membershipRole: companyMemberships.membershipRole,
     })
     .from(companyMemberships)
     .where(
@@ -1398,6 +1400,7 @@ async function loadCompanyUserDirectory(db: Db, companyId: string) {
   return members.map((member) => ({
     principalId: member.principalId,
     status: "active" as const,
+    membershipRole: member.membershipRole,
     user: userMap.get(member.principalId) ?? null,
   }));
 }
@@ -3173,7 +3176,7 @@ export function accessRoutes(
     const approvedAt = new Date();
     const approvedByUserId =
       input.invite.invitedByUserId ?? (isLocalImplicit(input.req) ? "local-board" : null);
-    const approved = await db
+    const approved = await writeJoinRequestChange(db, tx => tx
       .update(joinRequests)
       .set({
         status: "approved",
@@ -3183,7 +3186,7 @@ export function accessRoutes(
       })
       .where(eq(joinRequests.id, input.joinRequest.id))
       .returning()
-      .then((rows) => rows[0] ?? null);
+      .then((rows) => rows[0] ?? null));
 
     await logActivity(db, {
       companyId: input.companyId,
@@ -3919,6 +3922,7 @@ export function accessRoutes(
                   )
                 );
 
+              await notifyRetentionWork(tx, "join_request");
               const row = await tx
                 .insert(joinRequests)
                 .values({
@@ -3949,7 +3953,7 @@ export function accessRoutes(
                 .then((rows) => rows[0]);
               return row;
             })
-        : await db
+        : await writeJoinRequestChange(db, tx => tx
             .update(joinRequests)
             .set({
               requestIp: requestIp(req),
@@ -3972,7 +3976,7 @@ export function accessRoutes(
             })
             .where(eq(joinRequests.id, replayJoinRequestId as string))
             .returning()
-            .then((rows) => rows[0]);
+            .then((rows) => rows[0]));
 
       if (!created) {
         throw conflict("Join request not found");
@@ -4316,7 +4320,7 @@ export function accessRoutes(
         );
       }
 
-      const approved = await db
+      const approved = await writeJoinRequestChange(db, tx => tx
         .update(joinRequests)
         .set({
           status: "approved",
@@ -4328,7 +4332,7 @@ export function accessRoutes(
         })
         .where(eq(joinRequests.id, requestId))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]));
 
       await logActivity(db, {
         companyId,
@@ -4375,7 +4379,7 @@ export function accessRoutes(
       if (existing.status !== "pending_approval")
         throw conflict("Join request is not pending");
 
-      const rejected = await db
+      const rejected = await writeJoinRequestChange(db, tx => tx
         .update(joinRequests)
         .set({
           status: "rejected",
@@ -4386,7 +4390,7 @@ export function accessRoutes(
         })
         .where(eq(joinRequests.id, requestId))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]));
 
       await logActivity(db, {
         companyId,

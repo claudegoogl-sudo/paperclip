@@ -1,4 +1,6 @@
 import { dispatchCapabilityEscalationResolution } from "./plugin-capability-escalation.js";
+import { notifyToolReviewChange } from "./tool-review-work-notifications.js";
+import { writeApprovalChange } from "./approval-work-notifications.js";
 import { approvalResolutionRecords, resolvableApprovalStatuses as resolvableStatuses } from "../lib/approval-records.js";
 import { notifyHireApproved } from "./hire-hook.js";
 
@@ -55,19 +57,22 @@ export function approvalRecords(db: Db) {
     },
 
     create: (companyId: string, data: Omit<typeof approvals.$inferInsert, "companyId">) =>
-      db
+      writeApprovalChange(db, companyId, tx => tx
         .insert(approvals)
         .values({ ...data, companyId })
         .returning()
-        .then((rows) => rows[0]),
+        .then((rows) => rows[0])),
 
     // Cancel an open (pending/revision_requested) approval without a board
     // decision — e.g. when its paired agent is terminated during duplicate
     // cleanup. Idempotent: a no-op on already-resolved approvals.
     cancel: async (id: string, reason?: string | null) => {
       const now = new Date();
-      const updated = await db
-        .update(approvals)
+      const [existing] = await db.select({ companyId: approvals.companyId }).from(approvals).where(eq(approvals.id, id));
+      if (!existing) return null;
+      const updated = await writeApprovalChange(db, existing.companyId, async tx => {
+        await notifyToolReviewChange(tx, existing.companyId);
+        return tx.update(approvals)
         .set({
           status: "cancelled",
           decisionNote: reason ?? null,
@@ -77,6 +82,7 @@ export function approvalRecords(db: Db) {
         .where(and(eq(approvals.id, id), inArray(approvals.status, resolvableStatuses)))
         .returning()
         .then((rows) => rows[0] ?? null);
+      }, { approvalId: id });
       return updated;
     },
 
@@ -87,7 +93,7 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return db
+      return writeApprovalChange(db, existing.companyId, tx => tx
         .update(approvals)
         .set({
           status: "revision_requested",
@@ -98,7 +104,7 @@ export function approvalRecords(db: Db) {
         })
         .where(eq(approvals.id, id))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]), { approvalId: id });
     },
 
     resubmit: async (id: string, payload?: Record<string, unknown>) => {
@@ -108,7 +114,7 @@ export function approvalRecords(db: Db) {
       }
 
       const now = new Date();
-      return db
+      return writeApprovalChange(db, existing.companyId, tx => tx
         .update(approvals)
         .set({
           status: "pending",
@@ -120,7 +126,7 @@ export function approvalRecords(db: Db) {
         })
         .where(eq(approvals.id, id))
         .returning()
-        .then((rows) => rows[0]);
+        .then((rows) => rows[0]), { approvalId: id });
     },
 
     withdraw: async (
