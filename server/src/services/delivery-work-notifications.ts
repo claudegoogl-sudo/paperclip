@@ -24,6 +24,7 @@ export const DELIVERY_QUEUES = {
   orphanBlockers: "orphan-blockers",
   activeRecoveryActions: "active-recovery-actions",
   strandedAssignments: "stranded-assignments",
+  forkRecoverySweep: "fork-recovery-sweep",
   resolvedDependencies: "resolved-dependencies",
   taskWatchdogs: "task-watchdogs",
   staleIssueLocks: "stale-issue-locks",

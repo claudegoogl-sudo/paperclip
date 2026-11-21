@@ -2182,7 +2182,7 @@ async function startServerWithDatabaseTeardown(
       trackHeartbeatSchedulerWork(Promise.all([scheduled.timers.ready, scheduled.monitors.ready, scheduled.routines.ready]));
       // Fork-only periodic recovery (ported back after the v2026.1117.0 merge).
       // Fork-only periodic recovery, registered as delivery work (upstream forbids bare timers here).
-      trackHeartbeatSchedulerWork(deliveryWork.register("fork-recovery-sweep", {
+      trackHeartbeatSchedulerWork(deliveryWork.register(DELIVERY_QUEUES.forkRecoverySweep, {
         retryMs: config.heartbeatSchedulerIntervalMs,
         run: async () => {
           if (heartbeatSchedulerStopped || isIdleTaskDrainActive() || isWarmStandby()) return;
