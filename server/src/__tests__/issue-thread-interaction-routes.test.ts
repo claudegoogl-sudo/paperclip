@@ -739,7 +739,7 @@ describe("issue thread interaction routes", () => {
     const path = (key = "launch-post", revisionId = RUN_1) =>
       `/api/issues/${ISSUE_ID}/documents/${encodeURIComponent(key)}/revisions/${encodeURIComponent(revisionId)}`;
     const board = { type: "board", userId: "reviewer", companyIds: ["company-1"], source: "session" };
-    const agent = { type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", runId: RUN_2 };
+    const agent = { type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", runId: RUN_2, source: "agent_key" };
 
     it.each([{ name: "board", actor: board }, { name: "agent", actor: agent }])(
       "returns the requested immutable revision for an authorized $name",
@@ -3604,7 +3604,7 @@ describe("issue thread interaction routes", () => {
     it("keeps agents subject to assignment authorization even for an unassigned task", async () => {
       mockIssueService.getById.mockResolvedValue(createIssue({ status: "todo" }));
       denyAction("tasks:assign");
-      const actor = { type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", runId: RUN_2 };
+      const actor = { type: "agent", agentId: ASSIGNEE_AGENT_ID, companyId: "company-1", runId: RUN_2, source: "agent_key" };
       const response = await request(await createApp(actor)).post(path).send({});
       expect(response.status).toBe(403);
       expect(mockAccessDecide).toHaveBeenCalledWith(expect.objectContaining({ action: "tasks:assign", actor }));
