@@ -182,6 +182,7 @@ function registerModuleMocks() {
     questionResponseDeliveryService: () => mockQuestionResponseDeliveries,
   }));
   vi.doMock("../services/index.js", () => ({
+    projectInteractionForPluginEvent: vi.fn((interaction: unknown) => interaction),
     companyService: () => ({
       getById: vi.fn(async () => ({ id: "company-1" })),
     }),
