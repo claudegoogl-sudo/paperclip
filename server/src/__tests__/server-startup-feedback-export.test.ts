@@ -197,6 +197,8 @@ const {
     reconcileTaskWatchdogs: vi.fn(async () => ({ triggered: 0 })),
     scanSilentActiveRuns: vi.fn(async () => ({ created: 0, escalated: 0 })),
     sweepStaleIssueLocks: vi.fn(async () => ({ cleared: 0 })),
+    sweepStrandedDeferredWakes: vi.fn(async () => ({ promoted: 0, resolved: 0 })),
+    reconcileHighCommentVolumeAlerts: vi.fn(async () => ({ created: 0, resolved: 0 })),
     sweepPendingCleanupLeases: vi.fn(async () => ({ swept: 0, destroyed: 0, capped: 0 })),
     tickAgentTimers: vi.fn(async () => ({ checked: 0, enqueued: 0, skipped: 0 })),
     nextAgentTimerAt: vi.fn(async () => null),
