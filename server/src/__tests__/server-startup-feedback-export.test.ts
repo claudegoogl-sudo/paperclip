@@ -382,7 +382,8 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
 }));
 
 vi.mock("../app.js", () => ({
-  createApp: createAppMock,
+  // Fork createApp returns { app, pluginToolDispatcher }; createAppMock keeps returning the bare app for assertions.
+  createApp: async (...args: Parameters<typeof createAppMock>) => ({ app: await createAppMock(...args), pluginToolDispatcher: undefined }),
 }));
 
 // Startup owns registration. Durable budget/accounting state and coordinator
