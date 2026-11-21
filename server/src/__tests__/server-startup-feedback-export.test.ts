@@ -47,6 +47,18 @@ vi.mock("../services/task-bridge-renewal.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/task-bridge-renewal.js")>()),
   startTaskBridgeRenewalSweep: vi.fn(() => () => {}),
 }));
+vi.mock("../services/run-history-retention.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/run-history-retention.js")>()),
+  startRunHistoryRetention: vi.fn(() => 0 as unknown as NodeJS.Timeout),
+}));
+vi.mock("../services/plugin-webhook-delivery-retention.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/plugin-webhook-delivery-retention.js")>()),
+  startPluginWebhookDeliveryRetention: vi.fn(() => 0 as unknown as NodeJS.Timeout),
+}));
+vi.mock("../services/board-api-key-auth-event-retention.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/board-api-key-auth-event-retention.js")>()),
+  startBoardApiKeyAuthEventRetention: vi.fn(() => 0 as unknown as NodeJS.Timeout),
+}));
 vi.mock("../services/cloud-runtime-config.js", () => ({ initializeCloudRuntimeConfig: cloudRuntimeStartupMocks.initialize }));
 const managedEnvironmentMocks = vi.hoisted(() => {
   const recovery = { run: vi.fn(), onStop: vi.fn(), stop: vi.fn(async () => {}) };
