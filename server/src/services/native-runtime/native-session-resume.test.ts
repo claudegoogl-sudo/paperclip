@@ -956,13 +956,18 @@ const recoveryFakeCodex = resolve(
         ),
         previousDriverSessionId: checkpoint.sessionId,
       });
-      const [epoch] = await readdir(join(root, "authority-epochs"));
+      // The synced executor rolls an undelivered attach rotation back: the
+      // archived epoch is moved back to runner/ and authority-epochs is removed.
+      // Either location must hold the exact damaged bytes.
+      const epochs = await readdir(join(root, "authority-epochs")).catch(() => [] as string[]);
       const digest = (value: Buffer) =>
         createHash("sha256").update(value).digest("hex");
       expect(
         digest(
           await readFile(
-            join(root, "authority-epochs", epoch!, "runner-state.json"),
+            epochs.length > 0
+              ? join(root, "authority-epochs", epochs[0]!, "runner-state.json")
+              : join(root, "runner", "runner-state.json"),
           ),
         ),
       ).toBe(digest(damagedRunnerBytes));
