@@ -956,24 +956,21 @@ const recoveryFakeCodex = resolve(
         ),
         previousDriverSessionId: checkpoint.sessionId,
       });
-      // The synced executor rolls an undelivered attach rotation back: the
-      // archived epoch is moved back to runner/ and authority-epochs is removed.
-      // Either location must hold the exact damaged bytes.
-      const epochs = await readdir(join(root, "authority-epochs")).catch(() => [] as string[]);
+      // The synced executor rolls an undelivered attach rotation back and
+      // removes authority-epochs; the exact damaged runner bytes are preserved
+      // in the continuity-breaks archive instead.
       const digest = (value: Buffer) =>
         createHash("sha256").update(value).digest("hex");
-      expect(
-        digest(
-          await readFile(
-            epochs.length > 0
-              ? join(root, "authority-epochs", epochs[0]!, "runner-state.json")
-              : join(root, "runner", "runner-state.json"),
-          ),
-        ),
-      ).toBe(digest(damagedRunnerBytes));
       const [continuityArchive] = await readdir(
         join(root, "continuity-breaks"),
       );
+      expect(
+        digest(
+          await readFile(
+            join(root, "continuity-breaks", continuityArchive!, "runner", "runner-state.json"),
+          ),
+        ),
+      ).toBe(digest(damagedRunnerBytes));
       const archivedProvider = JSON.parse(
         await readFile(
           join(
