@@ -401,6 +401,8 @@ const CLI_SECRET_FLAG_RE = new RegExp(
 // redaction still applies.
 const VERSION_STRING_KEYS = new Set(["fromVersion", "toVersion"]);
 // Lifecycle phase names (e.g. "task.run.measured") are dotted lowercase identifiers, not JWTs.
+// Public PRP envelope discriminator; exact value only, under key "type" only.
+const PRP_EVENT_ENVELOPE_TYPE = "paperclip.prp.event";
 const PHASE_NAME_MAX_LENGTH = 64;
 const PHASE_NAME_SHAPE_RE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*){1,3}$/;
 const PHASE_NAME_VALUE_RE = { test: (v: string) => v.length <= PHASE_NAME_MAX_LENGTH && PHASE_NAME_SHAPE_RE.test(v) };
@@ -1062,13 +1064,17 @@ function sanitizeRecordWithLeaf(
       !isPublicExecutorToolSelector(value) &&
       !PUBLIC_RECEIPT_TEXT_IDS.has(value) &&
       !isPaperclipSchemaDiscriminator(key, value) &&
-      !(key === "phase" && PHASE_NAME_VALUE_RE.test(value))
+      !(key === "phase" && PHASE_NAME_VALUE_RE.test(value)) &&
+      !(key === "type" && value === PRP_EVENT_ENVELOPE_TYPE)
     ) {
       redacted[redactedKey] = REDACTED_EVENT_VALUE;
 
       continue;
     }
-    if (key === "phase" && typeof value === "string" && PHASE_NAME_VALUE_RE.test(value)) {
+    if (
+      (key === "phase" && typeof value === "string" && PHASE_NAME_VALUE_RE.test(value)) ||
+      (key === "type" && value === PRP_EVENT_ENVELOPE_TYPE)
+    ) {
       redacted[redactedKey] = leaf(value);
       continue;
     }
@@ -1196,7 +1202,8 @@ export function redactSensitiveText(input: string): string {
         const whitespaceMatch = input.match(/^(\s*)[\s\S]*?(\s*)$/);
         const leading = whitespaceMatch?.[1] ?? "";
         const trailing = whitespaceMatch?.[2] ?? "";
-        return leading + JSON.stringify(sanitizeJsonValue(parsed)) + trailing;
+        const sanitizedJson = JSON.stringify(sanitizeJsonValue(parsed));
+        return leading + sanitizedJson + trailing;
       } catch {
         // SECURITY-CRITICAL: any structural-walk failure (e.g. a pathologically
         // nested document that JSON.parse accepts but overflows the recursive
