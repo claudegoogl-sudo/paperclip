@@ -223,8 +223,9 @@ describe.skipIf(!recoveryPostgresSupport.supported)("repository catalog bootstra
     expect(successors[0].scheduledRetryAt!.getTime()).toBeGreaterThanOrEqual(f.retryAt.getTime());
     expect(await db.select().from(connectionGrants).where(eq(connectionGrants.id, f.grant.id))).toEqual([f.grant]);
     f.recover();
-    const due = new Date(successors[0].scheduledRetryAt!.getTime() + 1);
-    await new Promise(resolve => setTimeout(resolve, Math.max(0, due.getTime() - Date.now())));
+    // The fork retry ladder waits at least 2 min (upstream: seconds); let the backoff elapse by moving the due time to now.
+    const due = new Date();
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: due }).where(eq(heartbeatRuns.id, successors[0].id));
     await heartbeat.promoteDueScheduledRetries(due);
     await heartbeat.resumeQueuedRunsForAgent(f.companyId, f.agentId);
     await vi.waitFor(async () => { expect(await heartbeat.getRun(successors[0].id)).toMatchObject({ status: "succeeded" }); }, { timeout: 15_000 });

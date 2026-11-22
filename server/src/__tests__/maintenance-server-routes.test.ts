@@ -47,6 +47,11 @@ async function settleClock(server: Awaited<ReturnType<typeof startMaintenanceSer
   }
   return server.settled();
 }
+// Diagnostic: on failure, name the extra statements instead of only the count difference.
+function expectNoNewQueries(server: { proxy: { queries: Array<{ sql: string }> } }, baseline: number) {
+  expect(server.proxy.queries.slice(baseline).map(query => query.sql.slice(0, 300))).toEqual([]);
+}
+
 function receipt(queries: Array<{ protocol: string; sql: string; fingerprint: string }>) {
   const groups = new Map<string, { fingerprint: string; protocol: string; calls: number; tables: string[] }>();
   for (const query of queries) {
@@ -88,7 +93,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(wallElapsedMs).toBeGreaterThanOrEqual(90_000);
       expect(real.now - before.now).toBeGreaterThanOrEqual(89_000);
       expect(real.idle.active).toBe(0);
-      expect(server.proxy.queries.length).toBe(queryCount);
+      expectNoNewQueries(server, queryCount);
       expect(real.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(real.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
       expect(real.network.nonDatabaseBytesWritten).toBe(before.network.nonDatabaseBytesWritten);
@@ -103,7 +108,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       const after = await server.snapshot();
       expect(after.now - real.now).toBe(2 * 60 * 60_000);
       expect(after.idle.active).toBe(0);
-      expect(server.proxy.queries.length).toBe(queryCount);
+      expectNoNewQueries(server, queryCount);
       expect(after.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(after.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
       expect(after.network.nonDatabaseBytesWritten).toBe(before.network.nonDatabaseBytesWritten);
@@ -145,7 +150,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(parked).toEqual(waiting);
       const baseline = server.proxy.queries.length;
       await server.realtime(); await delay(30_000); await server.freeze(); await settleClock(server);
-      expect(server.proxy.queries.length).toBe(baseline);
+      expectNoNewQueries(server, baseline);
       await server.api("POST", `/issues/${issue!.id}/tree-holds/${hold.hold.id}/release`, { reason: "Resume accepted Retry", metadata: { wakeAgents: false } });
       await server.realtime();
       let executed: Record<string, unknown> | undefined;
@@ -166,7 +171,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(server.proxy.queries.slice(quiet).filter(query => !query.sql.includes("controller_instances"))).toEqual([]);
       const leaseIdle = server.proxy.queries.length;
       for (let step = 0; step < 2; step++) { await server.advance(30_000); await settleClock(server); }
-      expect(server.proxy.queries.length).toBe(leaseIdle);
+      expectNoNewQueries(server, leaseIdle);
       await writeFile(path.join(server.directory, "receipt-measurement.json"), JSON.stringify({ phase: "ordinary-held-task-retry", companyId: company.id, issueId: issue!.id,
         requestId: retry.requestId, waiting, grace, parked, executed, count: count!.count, parkedRealMs: 30_000, parkedQueries: 0, settledClockMs: 120_000, settledQueries: 0,
         boundary: "actual Retry and subtree release HTTP, wakeAgents false, real clock through process/controller authority, real local process, no outcome seeded", frames: server.proxy.frames }, null, 2));
@@ -185,7 +190,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(suppressed).toMatchObject({ status: "active", cleanup_status: null });
       const baseline = server.proxy.queries.length, before = await server.snapshot();
       for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-      expect(server.proxy.queries.length).toBe(baseline);
+      expectNoNewQueries(server, baseline);
       expect((await server.snapshot()).outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       await server.api("PATCH", "/instance/settings/experimental", { enableWorktreeRunExecution: true });
       await server.advance(1_000); await settleClock(server);
@@ -362,7 +367,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       }
       const after = await server.snapshot();
       expect(after.now - start).toBe(2 * 60 * 60_000);
-      expect(server.proxy.queries.length).toBe(baseline);
+      expectNoNewQueries(server, baseline);
       expect(after.outgoingHttpRequests).toBe(0);
       expect(after.network.nonDatabaseConnections).toBe(0);
       expect(server.proxy.errors).toEqual([]);
@@ -386,7 +391,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       await server.resume(); await server.settled();
       const resumed = server.proxy.queries.length;
       for (let step = 0; step < 240; step++) { await server.advance(30_000); await server.settled(10); }
-      expect(server.proxy.queries.length).toBe(resumed);
+      expectNoNewQueries(server, resumed);
       expect((await server.snapshot()).outgoingHttpRequests).toBe(0);
       await writeFile(path.join(server.directory, "history-measurement.json"), JSON.stringify({ phase: "disabled-configured-history-drain",
         companyId: company.id, issueId: history.id, historyBaseline, resumedQueries: resumed,
@@ -490,7 +495,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(waiting).toMatchObject({ company_id: company.id, is_terminal: false, last_resolved_at: null });
         const draining = server.proxy.queries.length;
         for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(draining);
+        expectNoNewQueries(server, draining);
         await server.resume(); await server.advance(30_000); await server.settled();
         const [resolved] = await fixture.$client`select eo.company_id, eo.is_terminal, eo.status_key, floor(extract(epoch from eo.last_resolved_at) * 1000)::float8 as resolved_ms from external_objects eo
           join external_object_mentions em on em.object_id=eo.id where em.source_issue_id=${issue.id}`;
@@ -500,7 +505,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(providerRequests).toEqual(["/repos/maintenance/example/pulls/1"]);
         const settledQueries = server.proxy.queries.length, network = await server.snapshot();
         for (let step = 0; step < 240; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(settledQueries);
+        expectNoNewQueries(server, settledQueries);
         expect(providerRequests).toHaveLength(1);
         expect((await server.snapshot()).outgoingHttpRequests).toBe(network.outgoingHttpRequests);
         await writeFile(path.join(server.directory, "external-object-measurement.json"), JSON.stringify({
@@ -520,7 +525,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         await server.drain(); await server.settled();
         const retryDrainQueries = server.proxy.queries.length;
         for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(retryDrainQueries);
+        expectNoNewQueries(server, retryDrainQueries);
         expect(providerRequests.filter(url => url.endsWith("/2"))).toHaveLength(1);
         await server.resume(); await server.advance(30_000); await server.settled();
         const [retried] = await fixture.$client`select eo.is_terminal, eo.status_key, eo.last_error_code from external_objects eo
@@ -529,7 +534,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(providerRequests.filter(url => url.endsWith("/2"))).toHaveLength(2);
         const retrySettled = server.proxy.queries.length;
         for (let step = 0; step < 20; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(retrySettled);
+        expectNoNewQueries(server, retrySettled);
         await writeFile(path.join(server.directory, "retry-measurement.json"), JSON.stringify({ phase: "provider-failure-retry-across-drain",
           providerBoundary: "simulated GitHub HTTP 503 then merged", retryIssueId: retryIssue.id, failed, retried,
           drainedClockMs: 120_000, drainedQueries: 0, quietAfterRetryMs: 600_000, quietAfterRetryQueries: 0,
@@ -605,7 +610,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(acknowledgements).toHaveLength(1);
         const baseline = server.proxy.queries.length, requestCount = requests.length;
         for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(baseline); expect(requests).toHaveLength(requestCount);
+        expectNoNewQueries(server, baseline); expect(requests).toHaveLength(requestCount);
         await writeFile(path.join(server.directory, "github-measurement.json"), JSON.stringify({ phase: "ordinary-connection-activation-sealed-event",
           companyId: company.id, connectionId: connection!.id, grantId: grant!.id, delivery, requests, acknowledgements,
           quietClockMs: 120_000, quietQueries: 0, frames: server.proxy.frames,
@@ -887,7 +892,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         for (let step = 0; step < 240; step++) { await server.advance(30_000); await server.settled(10, 1); }
         const health = await fetch(`http://127.0.0.1:${server.port}/api/health`, { signal: AbortSignal.timeout(10_000) });
         expect(health.status).toBe(200); expect(await health.json()).toMatchObject({ warmStandby: true });
-        expect(server.proxy.queries.length).toBe(before);
+        expectNoNewQueries(server, before);
         expect(storageRequests).toEqual([]);
         expect((await server.snapshot()).network.nonDatabaseConnections).toBe(0);
         const now = Math.floor((await server.snapshot()).now / 1000);

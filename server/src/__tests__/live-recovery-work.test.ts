@@ -108,6 +108,15 @@ describe("residual recovery production matrix", () => {
     await heartbeat.registerRunDispatchWork(coordinator, admitted).ready;
     await heartbeat.registerScheduledRetryCancellationWork(coordinator, admitted).ready;
   }
+  // Fork retry ladder first delay is 2 min (upstream 30 s): let the backoff elapse, as in real time, then promote.
+  async function promoteRetry(retryId: string) {
+    const row = await getRun(retryId);
+    if (row.status !== "scheduled_retry") return;
+    const due = new Date();
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: due }).where(eq(heartbeatRuns.id, retryId));
+    await heartbeat.promoteDueScheduledRetries(due);
+    await heartbeat.resumeQueuedRuns();
+  }
   async function advance(ms: number) {
     if (!vi.isFakeTimers()) vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
     const until = Date.now() + ms;
@@ -298,6 +307,7 @@ describe("residual recovery production matrix", () => {
     await vi.waitFor(async () => {
       const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
       expect(retries).toHaveLength(1); retryId = retries[0].id;
+      await promoteRetry(retries[0].id);
       await heartbeat.drainActiveRunExecutions(); await other.drainActiveRunExecutions();
       expect((await getRun(retryId)).status).toBe("succeeded");
       expect((await getRun(retryId)).stdoutExcerpt).toContain("live-recovery-proof");
@@ -320,6 +330,7 @@ describe("residual recovery production matrix", () => {
     await vi.waitFor(async () => {
       const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
       expect(retries).toHaveLength(1);
+      await promoteRetry(retries[0].id);
       await heartbeat.drainActiveRunExecutions();
       expect((await getRun(retries[0].id)).status).toBe("succeeded");
     }, { timeout: 45_000 });

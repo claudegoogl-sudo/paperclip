@@ -3584,10 +3584,14 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(reaped).toMatchObject({ status: "failed", errorCode: "process_lost",
       error: "Process lost -- server may have restarted" });
     expect(reaped?.resultJson).toMatchObject({ processLossDiagnostic: { retryEligible: false } });
-    expect(await db.select().from(heartbeatRuns).where(and(
+    // No process-loss retry is promised. The fork's stranded-issue recovery may still queue an
+    // `issue.continuation_recovery` successor so the issue keeps a live path (2026-09-25 incident);
+    // that is a different mechanism from the spent process-loss retry budget.
+    const successors = await db.select().from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, companyId),
       eq(heartbeatRuns.retryOfRunId, runId),
-    ))).toEqual([]);
+    ));
+    expect(successors.filter(run => (run.contextSnapshot as { source?: string } | null)?.source !== "issue.continuation_recovery")).toEqual([]);
   });
 
   it("keeps an orphaned legacy run that reached adapter dispatch held for reconciliation", async () => {
