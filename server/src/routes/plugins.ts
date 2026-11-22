@@ -1339,7 +1339,9 @@ export function pluginRoutes(
     }
     // A run can have no project. Plugins then get an empty projectId, the same
     // value the tool gateway sends, so both paths give plugins one contract.
-    const runContext: ToolRunContext = { ...requestedRunContext, projectId: requestedProjectId ?? "" };
+    const runContext: ToolRunContext = hostResolvedRunContext
+      ? (requestedRunContext as ToolRunContext)
+      : { ...requestedRunContext, projectId: requestedProjectId ?? "" };
 
     assertCompanyAccess(req, runContext.companyId);
     let scopeError: string | null;
