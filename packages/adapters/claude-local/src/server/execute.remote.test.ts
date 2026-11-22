@@ -81,6 +81,7 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 import { execute } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
+const PROBE: string[] = [];
 describe("claude remote execution", () => {
   const cleanupDirs: string[] = [];
 
@@ -374,9 +375,10 @@ describe("claude remote execution", () => {
           strictHostKeyChecking: true,
         },
       },
-      onLog: async () => {},
+      onLog: async (_s: string, c: string) => { PROBE.push(c); },
     });
 
+    throw new Error("PROBE:"+PROBE.join("|"));
     expect(runChildProcess.mock.calls.filter(call => !call[2].includes("--version"))).toHaveLength(1);
     const call = runChildProcess.mock.calls.find(call => !call[2].includes("--version")) as unknown as [string, string, string[]] | undefined;
     expect(call?.[2]).toContain("--resume");
