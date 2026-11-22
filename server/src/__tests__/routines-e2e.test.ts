@@ -290,7 +290,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const { companyId, agentId, userId } = await seedFixture();
     const actors = [
       { type: "board", userId, source: "session", companyIds: [companyId] },
-      { type: "agent", agentId, companyId },
+      { type: "agent", source: "agent_key", agentId, companyId },
       { type: "none" },
     ];
     const fullId = "12345678-1234-4234-8234-123456789abc";
@@ -326,7 +326,7 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     await db.insert(routineTriggers).values({ id: triggerId, companyId, routineId, kind: "api" });
     for (const actor of [
       { type: "board", userId, source: "session", isInstanceAdmin: true, companyIds: [randomUUID()] },
-      { type: "agent", agentId: randomUUID(), companyId: randomUUID() },
+      { type: "agent", source: "agent_key", agentId: randomUUID(), companyId: randomUUID() },
       { type: "none" },
     ]) {
       const app = await createApp(actor);
@@ -350,8 +350,8 @@ describeEmbeddedPostgres("routine routes end-to-end", () => {
     const triggerId = randomUUID();
     await db.insert(routines).values({ id: routineId, companyId, assigneeAgentId: agentId, title: "Private routine" });
     await db.insert(routineTriggers).values({ id: triggerId, companyId, routineId, kind: "api" });
-    const owner = await createApp({ type: "agent", agentId, companyId });
-    const otherAgent = await createApp({ type: "agent", agentId: randomUUID(), companyId });
+    const owner = await createApp({ type: "agent", source: "agent_key", agentId, companyId });
+    const otherAgent = await createApp({ type: "agent", source: "agent_key", agentId: randomUUID(), companyId });
     const board = await createApp({ type: "board", userId, source: "session", companyIds: [companyId] });
     for (const app of [owner, otherAgent, board]) {
       const response = await request(app).get(`/api/routines/${routineId.toUpperCase()}`);

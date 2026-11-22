@@ -60,7 +60,13 @@ function setup() {
     jobStore: jobStore as never,
     workerManager: workerManager as never,
   });
+  // The scheduler only accepts work once started; a stub coordinator keeps
+  // this a unit test of the overlap logic.
+  const started = scheduler.start({
+    register: () => ({ ready: Promise.resolve(), wake: () => {}, stop: async () => {} }),
+  } as never);
   return {
+    started,
     job,
     advance,
     jobStore,
@@ -73,7 +79,8 @@ function setup() {
 
 describe("plugin job scheduler overlap prevention", () => {
   it("keeps a scheduled job active until its schedule pointer is advanced", async () => {
-    const { job, advance, jobStore, scheduler, setRows } = setup();
+    const { job, advance, jobStore, scheduler, setRows, started } = setup();
+    await started;
 
     const tickPromise = scheduler.tick();
     await vi.waitFor(() => expect(jobStore.updateRunTimestamps).toHaveBeenCalledTimes(1));
@@ -95,7 +102,8 @@ describe("plugin job scheduler overlap prevention", () => {
   });
 
   it("releases the job when advancing the schedule pointer fails", async () => {
-    const { job, jobStore, scheduler, setRows } = setup();
+    const { job, jobStore, scheduler, setRows, started } = setup();
+    await started;
     jobStore.updateRunTimestamps.mockRejectedValue(new Error("db down"));
 
     await scheduler.tick();

@@ -81,6 +81,7 @@ vi.mock("../middleware/logger.js", () => ({
   logger: {
     warn: vi.fn(),
     error: vi.fn(),
+    child: () => ({ debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() }),
   },
 }));
 
