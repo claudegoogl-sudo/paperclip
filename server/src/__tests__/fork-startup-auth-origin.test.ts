@@ -144,11 +144,18 @@ const {
     flushPendingFeedbackTraces: vi.fn(async () => ({ attempted: 0, sent: 0, failed: 0 })),
   };
   const feedbackServiceFactoryMock = vi.fn(() => feedbackExportServiceMock);
+  // startServer resolves the local runtime API URL from the bound listener, so
+  // the fake must report `listening` and a numeric address once listen() runs.
+  let boundAddress: { address: string; family: string; port: number } | null = null;
   const fakeServer = {
+    listening: false,
+    address: vi.fn(() => boundAddress),
     on: vi.fn().mockReturnThis(),
     once: vi.fn().mockReturnThis(),
     off: vi.fn().mockReturnThis(),
-    listen: vi.fn((_port: number, _host: string, callback?: () => void) => {
+    listen: vi.fn((port: number, host: string, callback?: () => void) => {
+      boundAddress = { address: host === "::" || host === "::1" ? host : "127.0.0.1", family: host.includes(":") ? "IPv6" : "IPv4", port };
+      fakeServer.listening = true;
       callback?.();
       return fakeServer;
     }),
