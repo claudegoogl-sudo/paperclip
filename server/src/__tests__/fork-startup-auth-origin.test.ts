@@ -4,6 +4,7 @@ import * as idleLocalWork from "../services/idle-local-work.js";
 import { idleBackupWakeMarker, markIdleBackupWakeRequired } from "../services/idle-database-backup.js";
 import { reconcileBuiltInAgentsOnStartup, reconcileCodexLocalManagedHomesOnStartup, reconcilePersistedRuntimeServicesOnStartup } from "../services/index.js";
 import { runDatabaseBackup } from "@paperclipai/db";
+import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
 import { registerLocalRuntimeApiServer } from "../runtime-api.js";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -60,11 +61,11 @@ const {
     },
   }) as never);
   const createBetterAuthInstanceMock = vi.fn(() => ({}));
-  const createDbMock = vi.fn(() => ({
+  const createDbMock = vi.fn(() => installDatabaseWorkSignals({
     select: vi.fn(() => ({
       from: vi.fn(() => ({ where: vi.fn(async () => []) })),
     })),
-  }) as never);
+  } as never) as never);
   const detectPortMock = vi.fn(async ({ port }: { port: number; hostname: string }) => port);
   const deriveAuthTrustedOriginsMock = vi.fn(() => []);
   const resolveHeartbeatSchedulingSuppressionMock = vi.fn(() => ({
