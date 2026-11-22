@@ -142,7 +142,7 @@ const support = await getEmbeddedPostgresTestSupport();
       const firstIdentity = await enroll();
       expect(wakeConnectionEvents(db)).toBe(true);
       await vi.advanceTimersByTimeAsync(6_000);
-      await observe(() => expect(acknowledged).toBe(1));
+      try { await observe(() => expect(acknowledged).toBe(1)); } catch (e) { console.log('DBG', JSON.stringify({requests,leases,acknowledged,errors:errors.map(x=>String((x as any)?.stack||x)),httpErrors:httpErrors.map(x=>String((x as any)?.stack||x))})); throw e; }
       expect(await db.select().from(connectionEventDeliveries).where(eq(connectionEventDeliveries.providerDeliveryId, eventId))).toMatchObject([{ status: "processed" }]);
       expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, grantId)))[0]!.providerTenant!.github!.webhookHealth).toBe("healthy");
       // The applied installation update publishes one credential-change hint.
