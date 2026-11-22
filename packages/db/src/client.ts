@@ -402,9 +402,16 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   const { connectionString, sqlOptions } = resolveEmbeddedPostgresConnection(url);
   const driverOptions = postgresJsOptions({ ...resolved, maxConnections });
   const driverConnection = (driverOptions.connection ?? {}) as Record<string, unknown>;
+  // An explicit `-c statement_timeout=...` in the URL options is the caller's
+  // choice and wins over the fork's default session timeout.
+  const urlSetsStatementTimeout = /(^|\s)-c\s*statement_timeout=/.test(
+    (() => { try { return new URL(connectionString).searchParams.get("options") ?? ""; } catch { return ""; } })(),
+  );
   const sql = postgres(connectionString, {
     ...driverOptions,
-    connection: { ...driverConnection, statement_timeout: statementTimeoutMs },
+    connection: urlSetsStatementTimeout
+      ? { ...driverConnection }
+      : { ...driverConnection, statement_timeout: statementTimeoutMs },
     ...sqlOptions,
   });
   if (resolved.prepare === true) installPreparedQueries(sql);

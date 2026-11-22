@@ -260,7 +260,10 @@ postgresTests("upgrade readiness persisted execution evidence", () => {
     expect(await readUpgradeReadiness(db, { activeRunIds: new Set(), counters: () => idle })).toMatchObject({ ready: true, activeRuns: 0 });
   });
   it("cancels a locked probe within its SQL budget and releases its connection", async () => {
+    // Fork default session timeout is 1min; this test proves the probe's own SQL budget, so disable it.
+    vi.stubEnv("PAPERCLIP_DB_STATEMENT_TIMEOUT_MS", "0");
     const probeDb = createDb(database.connectionString, { maxConnections: 1 });
+    vi.unstubAllEnvs();
     const lock = await db.$client.reserve();
     try {
       await lock.unsafe("begin");

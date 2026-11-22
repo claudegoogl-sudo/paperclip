@@ -192,7 +192,7 @@ describe("complete canonical native log privacy", () => {
     });
     const result = JSON.parse(chunk).event;
     expect(result.schema).toBe(envelope.event.schema);
-    expect(result.payload.header).toBe("Authorization: ***REDACTED***");
+    expect(result.payload.header).toBe("Authorization: Bearer ***REDACTED***");
     expect(result.payload.api_key).toBe("***REDACTED***");
     expect(result.payload.text).toContain('quoted "***REDACTED***" by ');
     expect(result.payload.text.includes("fixture-operator")).toBe(!enabled);

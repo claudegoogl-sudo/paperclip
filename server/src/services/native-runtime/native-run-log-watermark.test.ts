@@ -271,7 +271,7 @@ describe.skipIf(!support.supported)("native run log source watermarks", () => {
       expect(entry.payload.parts).toEqual(event.payload.parts);
       expect(entry.payload.image.source.data).toBe("[omitted base64 image data: 70000 chars]");
       expect(entry.payload.api_key).toBe("***REDACTED***");
-      expect(entry.payload.header).toBe("Authorization: ***REDACTED***");
+      expect(entry.payload.header).toBe("Authorization: Bearer ***REDACTED***");
     }
   });
 
@@ -301,7 +301,11 @@ describe.skipIf(!support.supported)("native run log source watermarks", () => {
     const event = { ...f.event(1), payload: { header: "Authorization: Bearer fixture-old-bearer-canary" } };
     await f.persist(event, 2);
     const store = f.store(), handle = await store.begin(f.binding);
-    const chunk = compactRunLogChunk(formatNativeRunLogEvent(event));
+    // The current redactor keeps the JSON valid; the legacy format swallowed the closing quote.
+    // Reproduce that persisted legacy shape explicitly so the old-prefix guard stays covered.
+    const current = compactRunLogChunk(formatNativeRunLogEvent(event));
+    const chunk = current.replace('Bearer ***REDACTED***"', "***REDACTED***");
+    expect(chunk).not.toBe(current);
     expect(() => JSON.parse(chunk)).toThrow();
     await store.append(handle, { stream: "stdout", ts: "immutable-old-privacy-format", seq: 1, sourceCursor: 2, chunk });
     await store.finalize(handle);

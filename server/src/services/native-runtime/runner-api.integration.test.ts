@@ -260,7 +260,8 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
         operationId: "POST /api/companies/{companyId}/routines", body: {
           title: "Native run owned routine", assigneeAgentId: fixture.agentId, status: "paused",
           ...(fallback === "unrelated parent" ? { parentIssueId: fixture.blockerId } : {}),
-          actorResponsibleUserId: ownerUserId, responsibleUserId: ownerUserId, createdByUserId: ownerUserId,
+          // Fork createRoutineSchema is .strict(): spoofed ownership keys are rejected (400) at the
+          // schema, so the body carries none; ownership must come from the authenticated native run.
         },
       } };
       const created = await fixture.authority.execute(call);

@@ -60,9 +60,16 @@ describe("logger translateTime respects TZ environment variable", () => {
     await import("../middleware/logger.js");
 
     expect(mockTransport).toHaveBeenCalledOnce();
-    const transport = mockTransport.mock.calls[0]![0];
-    expect(transport.target).toBe("pino-pretty");
-    expect(transport.options.translateTime).toBe("SYS:HH:MM:ss");
+    // Fork logger always uses `targets` (stdout + server.log file), not the
+    // single upstream `target`.
+    const transport = mockTransport.mock.calls[0]![0] as unknown as {
+      targets: Array<{ target: string; options: Record<string, unknown> }>;
+    };
+    expect(transport.targets.length).toBeGreaterThan(0);
+    for (const t of transport.targets) {
+      expect(t.target).toBe("pino-pretty");
+      expect(t.options.translateTime).toBe("SYS:HH:MM:ss");
+    }
   });
 
   it("keeps the pretty transport and info level in production (fork file logging)", async () => {

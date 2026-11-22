@@ -159,7 +159,10 @@ describe("post-result upgrade readiness", () => {
 
   it("bounds saved-result inspection across several locked candidates", async () => {
     const fixtures = [await seed(), await seed(), await seed()];
+    // Fork default session timeout is 1min; this test proves the probe's own SQL budget, so disable it.
+    vi.stubEnv("PAPERCLIP_DB_STATEMENT_TIMEOUT_MS", "0");
     const probeDb = createDb(database.connectionString, { maxConnections: 1 });
+    vi.unstubAllEnvs();
     const lock = await db.$client.reserve();
     try {
       await lock.unsafe("begin");
