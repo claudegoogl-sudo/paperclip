@@ -1015,7 +1015,7 @@ export function pluginRoutes(
     if (!UUID_REGEX.test(runContext.runId)) {
       return '"runContext.runId" does not belong to "runContext.companyId"';
     }
-    if (runContext.projectId !== undefined && !UUID_REGEX.test(runContext.projectId)) {
+    if (runContext.projectId && !UUID_REGEX.test(runContext.projectId)) {
       return '"runContext.projectId" does not belong to "runContext.companyId"';
     }
 
