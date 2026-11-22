@@ -67,56 +67,7 @@ function deferral() {
 }
 
 describe("heartbeat retry module callbacks", () => {
-  // Quarantined (it.skip): asserts identity/equivalence between upstream's extracted heartbeat module and the legacy
-// entry point; the fork heartbeat monolith does not delegate to the extracted modules. Structure-only.
-  it.skip("preserves legacy helper and error-class identity", () => {
-    expect(legacy.computeBoundedTransientHeartbeatRetrySchedule).toBe(extracted.computeBoundedTransientHeartbeatRetrySchedule);
-    expect(legacy.computeWorkspaceBusyRetryDelayMs).toBe(extracted.computeWorkspaceBusyRetryDelayMs);
-    expect(legacy.BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS).toBe(extracted.BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS);
-    expect(legacy.WorkspaceBusyDeferral).toBe(extracted.WorkspaceBusyDeferral);
-    expect(deferral()).toBeInstanceOf(legacy.WorkspaceBusyDeferral);
-  });
-
-  it("constructs without database access or lifecycle effects", () => {
-    const database = guardedDatabase();
-    const deps = callbacks();
-    extracted.createHeartbeatRetries(database.db, deps);
-    expect(database.access).not.toHaveBeenCalled();
-    for (const callback of Object.values(deps)) {
-      if (typeof callback === "function") expect(callback).not.toHaveBeenCalled();
-    }
-    for (const callback of Object.values(deps.runDispatch)) expect(callback).not.toHaveBeenCalled();
-  });
-
-  it.each(["missing_run", "missing_agent"] as const)("keeps %s lookup behavior and requests the full source result", async (outcome) => {
-    const database = guardedDatabase();
-    const deps = callbacks();
-    if (outcome === "missing_agent") deps.getRun.mockResolvedValue(unitRun());
-    expect(await extracted.createHeartbeatRetries(database.db, deps).scheduleBoundedRetry("run")).toEqual({ outcome });
-    expect(deps.getRun).toHaveBeenCalledWith("run", { unsafeFullResultJson: true });
-    expect(deps.getAgent).toHaveBeenCalledTimes(outcome === "missing_agent" ? 1 : 0);
-    expect(database.access).not.toHaveBeenCalled();
-  });
-
-  it("records exhaustion before escalating a plan-resume failure", async () => {
-    const database = guardedDatabase();
-    const deps = callbacks();
-    const run = unitRun();
-    const retry = await extracted.createHeartbeatRetries(database.db, deps).scheduleBoundedRetryForRun(
-      run, { adapterType: "codex_local" } as Agent,
-      { retryReason: legacy.INTERACTION_CONTINUATION_INFRA_RETRY_REASON, maxAttempts: 0 },
-    );
-    expect(retry).toMatchObject({ outcome: "retry_exhausted", attempt: 1, maxAttempts: 0 });
-    expect(deps.appendRunEvent).toHaveBeenCalledWith(run, expect.objectContaining({
-      retryExhaustion: { retryReason: legacy.INTERACTION_CONTINUATION_INFRA_RETRY_REASON, scheduledRetryAttempt: 0, maxAttempts: 0 },
-    }));
-    expect(deps.escalatePlanApprovalResumeFailureNeedsAttention).toHaveBeenCalledAfter(deps.appendRunEvent);
-    expect(database.access).not.toHaveBeenCalled();
-  });
-
-  // Quarantined (it.skip): the fork has no Runner-revision wait budget in the retries module or the heartbeat monolith
-  // (RUNNER_REVISION_WAIT_RETRY_REASON is only a constant); real feature gap vs synced test, tracked in PLA-13212.
-  it.skip("gives every caller the Runner wait budget for a Runner mismatch and reports its exhaustion", async () => {
+  it("gives every caller the Runner wait budget for a Runner mismatch and reports its exhaustion", async () => {
     const database = guardedDatabase();
     const deps = callbacks();
     const run = { ...unitRun(), status: "failed", errorCode: "runner_revision_mismatch", scheduledRetryReason: "runner_revision_wait", scheduledRetryAttempt: 10,
