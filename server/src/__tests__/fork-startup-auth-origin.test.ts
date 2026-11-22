@@ -388,14 +388,16 @@ vi.mock("../services/index.js", () => ({
 
 vi.mock("../services/chat-completion-delivery.js", async (importOriginal) => ({ ...(await importOriginal<Record<string, unknown>>()), chatCompletionDeliveryService: () => ({ hasPending: vi.fn(async () => false), sweepPending: completionSweepMock }) }));
 
-vi.mock("../services/connection-intent-delivery.js", () => ({
+vi.mock("../services/connection-intent-delivery.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   connectionIntentDeliveryService: vi.fn(() => ({
     hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({ scanned: 0, failed: 0 })),
   })),
 }));
 
-vi.mock("../services/question-response-delivery.js", () => ({
+vi.mock("../services/question-response-delivery.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   questionResponseDeliveryService: vi.fn(() => ({
     hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({
@@ -408,28 +410,33 @@ vi.mock("../services/question-response-delivery.js", () => ({
   })),
 }));
 
-vi.mock("../services/native-runtime/native-question-bridge.js", () => ({
+vi.mock("../services/native-runtime/native-question-bridge.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   deliverNativeQuestionResponse: vi.fn(async () => "not_native"),
   nativeQuestionCancellationIdentity: vi.fn(() => null),
   nativeQuestionRunToCancel: vi.fn(async () => null),
   validateNativeQuestionResponseInput: vi.fn(),
 }));
 
-vi.mock("../services/secret-proposals.js", () => ({
+vi.mock("../services/secret-proposals.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   createSecretProposalsService: vi.fn(() => ({
     sweepExpired: vi.fn(async () => 0),
   })),
 }));
 
-vi.mock("../storage/index.js", () => ({
+vi.mock("../storage/index.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   createStorageServiceFromConfig: vi.fn(() => ({ id: "storage-service" })),
 }));
 
-vi.mock("../services/feedback-share-client.js", () => ({
+vi.mock("../services/feedback-share-client.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   createFeedbackTraceShareClientFromConfig: vi.fn(() => ({ id: "feedback-share-client" })),
 }));
 
-vi.mock("../services/plugin-worker-manager.js", () => ({
+vi.mock("../services/plugin-worker-manager.js", async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
   createPluginWorkerManager: vi.fn(() => ({ id: "plugin-worker-manager" })),
 }));
 
