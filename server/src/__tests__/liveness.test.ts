@@ -124,6 +124,6 @@ describe("database-free process liveness", () => {
     expect(route).toBeGreaterThan(source.indexOf("privateHostnameGuard({"));
     expect(route).toBeGreaterThan(source.indexOf("app.use(cloudRuntimeIdentityMiddleware(db))"));
     expect(route).toBeLessThan(source.indexOf("app.use(cloudWarmStandbyMiddleware("));
-    expect(route).toBeLessThan(source.indexOf("actorMiddleware(db,"));
+    expect(route).toBeLessThan(source.indexOf("registerActorContext(app, db,"));
   });
 });
