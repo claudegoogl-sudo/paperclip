@@ -134,6 +134,8 @@ const {
   const executionWorkspaceServiceFactoryMock = vi.fn(() => executionWorkspaceServiceMock);
   const externalObjectsServiceMock = {
     refreshDueObjectsForActiveCompanies: vi.fn(async () => ({ companies: 0, checked: 0, refreshed: 0 })),
+    registerRefreshWork: vi.fn(() => ({ reconciliationSnapshot: vi.fn(async () => ({})), ready: Promise.resolve(), stop: vi.fn(), wake: vi.fn() })),
+    readIdleSchedule: vi.fn(async () => null),
   };
   const externalObjectsServiceFactoryMock = vi.fn(() => externalObjectsServiceMock);
   const routineServiceMock = {
