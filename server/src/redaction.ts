@@ -1190,7 +1190,9 @@ function sanitizeJsonValue(value: unknown): unknown {
 export function redactSensitiveText(input: string): string {
   if (structuralRedactionDepth < MAX_STRUCTURAL_REDACTION_DEPTH) {
     const parsed = tryParseJson(input);
-    if (parsed !== undefined) {
+    // A bare JSON number (e.g. numeric text "0.0010000") has no structure to walk;
+    // re-serializing it would drop trailing zeros. It goes through the free-form scrub instead.
+    if (parsed !== undefined && typeof parsed !== "number") {
       structuralRedactionDepth += 1;
       try {
         // Preserve any leading/trailing whitespace (notably the trailing

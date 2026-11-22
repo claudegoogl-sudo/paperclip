@@ -83709,7 +83709,9 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
-  describe("Lossless long Board publications", () => {
+  // These publish up to 100000 characters through real durable parts on real PostgreSQL; the fork redactor makes
+  // that slower than the 15s default on the shared test machines.
+  describe("Lossless long Board publications", { timeout: 90_000 }, () => {
     async function longFixture(
       provider: "slack" | "github" | "microsoft-teams",
     ) {
