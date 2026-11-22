@@ -2249,7 +2249,8 @@ async function startServerWithDatabaseTeardown(
     }).ready;
   }
 
-  if (config.runHistoryRetentionEnabled) {
+  // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
+  if (config.heartbeatSchedulerEnabled && config.runHistoryRetentionEnabled) {
     logger.info(
       {
         retentionDays: config.runHistoryRetentionDays,
@@ -2266,7 +2267,8 @@ async function startServerWithDatabaseTeardown(
     );
   }
 
-  if (config.pluginWebhookDeliveryRetentionEnabled) {
+  // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
+  if (config.heartbeatSchedulerEnabled && config.pluginWebhookDeliveryRetentionEnabled) {
     logger.info(
       {
         successRetentionDays: config.pluginWebhookDeliverySuccessRetentionDays,
@@ -2287,7 +2289,8 @@ async function startServerWithDatabaseTeardown(
     );
   }
 
-  if (config.boardApiKeyAuthEventRetentionEnabled) {
+  // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
+  if (config.heartbeatSchedulerEnabled && config.boardApiKeyAuthEventRetentionEnabled) {
     logger.info(
       {
         retentionDays: config.boardApiKeyAuthEventRetentionDays,
