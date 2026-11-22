@@ -265,6 +265,9 @@ export function createHttpLogger(baseLogger: pino.Logger) {
     if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
       return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
     }
+    if (isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Dot principal request failed" } };
+    }
     if (isPrivateMuseHttpRequest(requestClassificationUrl(req))) {
       return { ...value, err: { type: "Error", message: "External agent request failed" } };
     }
@@ -285,7 +288,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       const ctx = (res as any).__errorContext;
       return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
     }
-    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
+    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
       // Omit, rather than recursively redact, the entire provider payload —
       // before/after parsing, with or without error context.
       return {
