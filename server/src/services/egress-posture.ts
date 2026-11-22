@@ -108,6 +108,7 @@ export function egressPostureCarryIndex(
 export const EGRESS_POSTURE_DENY_ALL_ACTION = "secret.egress_posture_deny_all";
 
 export const EGRESS_POSTURE_SWEEP_INTERVAL_MS = 15 * 60 * 1000;
+export const EGRESS_POSTURE_FIRST_RUN_DELAY_MS = 60 * 1000;
 
 /**
  * Surfaces every binding sitting in the `deny_all` posture as an `activity_log`
@@ -236,6 +237,11 @@ export function startEgressPostureSweep(db: Db, intervalMs: number): NodeJS.Time
         logger.error({ err }, "egress posture sweep failed");
       });
   };
-  run();
+  // First run is deferred by a short bounded delay so the boot-time quiet window stays
+  // quiet; the sweep stays always-on and then follows the normal interval.
+  const firstRunDelayMs = Math.min(EGRESS_POSTURE_FIRST_RUN_DELAY_MS, intervalMs);
+  logger.info({ firstRunDelayMs }, "egress posture sweep first run scheduled");
+  const first = setTimeout(run, firstRunDelayMs);
+  first.unref?.();
   return setInterval(run, intervalMs);
 }
