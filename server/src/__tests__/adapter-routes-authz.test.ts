@@ -120,7 +120,12 @@ let unregisterServerAdapter: typeof import("../adapters/registry.js").unregister
 let setOverridePaused: typeof import("../adapters/registry.js").setOverridePaused;
 // Audit fan-out only needs a pass-through db handle: the audit service modules
 // are module-mocked, so the handle is never dereferenced.
-const mockDb: Parameters<typeof adapterRoutes>[0]["db"] = {} as never;
+// The fork persists the disable toggle inside db.transaction and lists companies
+// in the audit callback, so the handle needs a minimal transaction + select shape.
+const mockTx = { select: () => ({ from: async () => [] }) };
+const mockDb: Parameters<typeof adapterRoutes>[0]["db"] = {
+  transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx),
+} as never;
 
 function createAdapter(type = EXTERNAL_ADAPTER_TYPE): ServerAdapterModule {
   return {
