@@ -6,7 +6,7 @@ import { agents, agentApiKeys, agentSessionGoalActions, agentTaskSessions, authU
 import { access, mkdir, readdir, utimes, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { beforeAll, describe, it, vi } from "vitest";
+import { beforeAll, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 import { maintenanceDatabaseSupport } from "./helpers/maintenance/environment.js";
