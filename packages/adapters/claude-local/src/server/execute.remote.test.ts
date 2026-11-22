@@ -81,7 +81,6 @@ import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixt
 import { execute } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
-const PROBE: string[] = [];
 describe("claude remote execution", () => {
   const cleanupDirs: string[] = [];
 
@@ -341,7 +340,7 @@ describe("claude remote execution", () => {
           // no configured skills, but the operational skill is always mounted for
           // legacy adapters (upstream's resolveLegacyPaperclipDesiredSkillNames)
           // and its library manifest participates in the bundle hash.
-          promptBundleKey: "37290853dbb838d4a84b1197bbd64994b86ae34a033059e3bbaa7783cbdef827",
+          promptBundleKey: "8d952bb6dd3b24bb9be4ed2df422863428fee1dda2d341ec4bf2db00e56a8c70",
           remoteExecution: {
             transport: "ssh",
             host: "127.0.0.1",
@@ -375,10 +374,9 @@ describe("claude remote execution", () => {
           strictHostKeyChecking: true,
         },
       },
-      onLog: async (_s: string, c: string) => { PROBE.push(c); },
+      onLog: async () => {},
     });
 
-    throw new Error("PROBE:"+PROBE.join("|"));
     expect(runChildProcess.mock.calls.filter(call => !call[2].includes("--version"))).toHaveLength(1);
     const call = runChildProcess.mock.calls.find(call => !call[2].includes("--version")) as unknown as [string, string, string[]] | undefined;
     expect(call?.[2]).toContain("--resume");
@@ -624,7 +622,7 @@ describe("claude remote execution", () => {
       },
       runtime: {
         sessionId: "12345678-1234-4abc-9def-123456789012",
-        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "37290853dbb838d4a84b1197bbd64994b86ae34a033059e3bbaa7783cbdef827" },
+        sessionParams: { sessionId: "12345678-1234-4abc-9def-123456789012", cwd: workspaceDir, promptBundleKey: "8d952bb6dd3b24bb9be4ed2df422863428fee1dda2d341ec4bf2db00e56a8c70" },
         sessionDisplayId: "12345678-1234-4abc-9def-123456789012",
         taskKey: null,
       },
