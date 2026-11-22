@@ -116,7 +116,9 @@ describe("plugin job scheduler overlap prevention", () => {
     // The unsettled completion still blocks a manual run until it is persisted.
     await expect(scheduler.triggerJob(job.id)).rejects.toThrow(/already running/);
     await scheduler.tick();
-    expect(jobStore.updateRunTimestamps).toHaveBeenCalledTimes(2);
+    // The static job row stays due, so the tick may also start a fresh run.
+    expect(jobStore.updateRunTimestamps.mock.calls.length).toBeGreaterThanOrEqual(2);
+    await vi.waitFor(() => expect(scheduler.diagnostics().activeJobIds).toEqual([]));
 
     jobStore.createRun.mockResolvedValueOnce({ id: "run-3" });
     await expect(scheduler.triggerJob(job.id)).resolves.toMatchObject({ runId: "run-3" });
