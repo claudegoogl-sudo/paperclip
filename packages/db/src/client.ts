@@ -401,7 +401,7 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   const { statementTimeoutMs } = resolveDbPoolOptions();
   const { connectionString, sqlOptions } = resolveEmbeddedPostgresConnection(url);
   const driverOptions = postgresJsOptions({ ...resolved, maxConnections });
-  const driverConnection = (driverOptions.connection ?? {}) as Record<string, unknown>;
+  const driverConnection = (driverOptions.connection ?? {}) as Record<string, string | number | boolean | undefined>;
   // An explicit `-c statement_timeout=...` in the URL options is the caller's
   // choice and wins over the fork's default session timeout.
   const urlSetsStatementTimeout = /(^|\s)-c\s*statement_timeout=/.test(
