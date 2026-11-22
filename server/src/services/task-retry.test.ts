@@ -158,7 +158,9 @@ describe("durable task Retry admission", () => {
     await db.update(heartbeatRuns).set({ status: "failed", errorCode: "remote_workspace_restore_failed",
       startedAt: later, finishedAt: later }).where(eq(heartbeatRuns.id, second.run.id));
     await db.update(issues).set({ executionRunId: second.run.id }).where(eq(issues.id, f.input.issueId));
-    expect(await heartbeat.scheduleBoundedRetry(second.run.id, { now: later })).toMatchObject({ outcome: "retry_exhausted" });
+    // The fork keeps a longer transient ladder than upstream's two attempts, so bound this
+    // exhaustion check explicitly: the budget ends after the two attempts charged above.
+    expect(await heartbeat.scheduleBoundedRetry(second.run.id, { now: later, maxAttempts: 2 })).toMatchObject({ outcome: "retry_exhausted" });
     // Removing the successor's own receipt reproduces the dispatch refusal.
     const receipts = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.input.issueId));
     expect(receipts).toHaveLength(2);
