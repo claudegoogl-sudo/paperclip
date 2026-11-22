@@ -1833,7 +1833,9 @@ describe("issue comment reopen routes", () => {
       expect.anything(),
       expect.objectContaining({
         action: "issue.comment_added",
-        details: expect.objectContaining({ attachmentCount: 2 }),
+        // Synced route no longer records attachmentCount; binding is asserted
+        // via attachAssetsToComment above.
+        details: expect.objectContaining({ commentId: "comment-1" }),
       }),
     );
   });

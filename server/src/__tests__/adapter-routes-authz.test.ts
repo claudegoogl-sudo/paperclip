@@ -75,6 +75,13 @@ vi.mock("../services/activity-log.js", () => ({
   logActivity: mocks.logActivity,
 }));
 
+vi.mock("../services/adapter-settings.js", () => ({
+  adapterSettingsService: () => ({
+    getDisabledTypes: async () => mocks.getDisabledAdapterTypes(),
+    setDisabled: async (type: string, disabled: boolean) => mocks.setAdapterDisabled(type, disabled),
+  }),
+}));
+
 vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => ({ listCompanyIds: mocks.listCompanyIds }),
 }));
@@ -104,6 +111,13 @@ function registerRouteMocks() {
 
   vi.doMock("../services/activity-log.js", () => ({
     logActivity: mocks.logActivity,
+  }));
+
+  vi.doMock("../services/adapter-settings.js", () => ({
+    adapterSettingsService: () => ({
+      getDisabledTypes: async () => mocks.getDisabledAdapterTypes(),
+      setDisabled: async (type: string, disabled: boolean) => mocks.setAdapterDisabled(type, disabled),
+    }),
   }));
 
   vi.doMock("../services/instance-settings.js", () => ({
