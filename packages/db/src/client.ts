@@ -410,8 +410,8 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   const sql = postgres(connectionString, {
     ...driverOptions,
     connection: urlSetsStatementTimeout
-      ? { ...driverConnection }
-      : { ...driverConnection, statement_timeout: statementTimeoutMs },
+      ? ({ ...driverConnection } as Record<string, string | number | boolean | undefined>)
+      : ({ ...driverConnection, statement_timeout: statementTimeoutMs } as Record<string, string | number | boolean | undefined>),
     ...sqlOptions,
   });
   if (resolved.prepare === true) installPreparedQueries(sql);
