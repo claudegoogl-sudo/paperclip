@@ -1819,7 +1819,9 @@ export function agentRoutes(
     if (req.actor.agentId === targetAgent.id) return;
     const rejected: string[] = [];
     for (const key of Object.keys(body)) {
-      if (key !== "adapterConfig") rejected.push(key);
+      // `status` has its own gates further down the PATCH handler: pause and
+      // terminate are board-only, resume is grant-gated.
+      if (key !== "adapterConfig" && key !== "status") rejected.push(key);
     }
     const adapterConfig = asRecord(body.adapterConfig);
     if (hasOwn(body, "adapterConfig") && !adapterConfig) rejected.push("adapterConfig");
