@@ -2216,7 +2216,11 @@ async function startServerWithDatabaseTeardown(
   // Deliberately NOT inside the `heartbeatSchedulerEnabled` block above, and not
   // subject to heartbeat suppression: a security-posture check that silently
   // stops running when an unrelated scheduling flag is off is failure-open.
-  startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+  // Explicit opt-out for the quiet-boot maintenance harness only. Default is ON, so
+  // production behaviour is unchanged; any value other than "false" keeps the sweep.
+  if (process.env.PAPERCLIP_EGRESS_POSTURE_SWEEP_ENABLED !== "false") {
+    startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+  }
 
   // Same reasoning as the posture sweep above: the server-internal task_bridge
   // key auto-renewer is a continuity loop that must not silently stop when
@@ -2224,7 +2228,9 @@ async function startServerWithDatabaseTeardown(
   // server process, registers no route, and only ever mints for bindings an
   // operator explicitly opted in via the board-gated policy route
   // (default-deny: a NULL policy is never touched, even at expiry).
-  startTaskBridgeRenewalSweep(db as any);
+  if (process.env.PAPERCLIP_TASK_BRIDGE_RENEWAL_SWEEP_ENABLED !== "false") {
+    startTaskBridgeRenewalSweep(db as any);
+  }
 
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;

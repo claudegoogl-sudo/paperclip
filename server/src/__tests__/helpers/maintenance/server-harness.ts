@@ -184,6 +184,10 @@ export async function startMaintenanceServer(databaseUrl: string, options: Maint
         ...(configuration?.otelOrigin ? { OTEL_EXPORTER_OTLP_ENDPOINT: configuration.otelOrigin, OTEL_EXPORTER_OTLP_PROTOCOL: "http/json" } : {}),
         HEARTBEAT_SCHEDULER_ENABLED: String(options.enabled ?? true),
         PAPERCLIP_MAINTENANCE_FAKE_CLOCK: String(options.clock ?? false),
+        // Fork periodic sweeps are outside the upstream idle-quiet contract; opt out (production default stays ON).
+        PAPERCLIP_EGRESS_POSTURE_SWEEP_ENABLED: "false", PAPERCLIP_TASK_BRIDGE_RENEWAL_SWEEP_ENABLED: "false",
+        PAPERCLIP_RUN_HISTORY_RETENTION_ENABLED: "false", PAPERCLIP_PLUGIN_WEBHOOK_DELIVERY_RETENTION_ENABLED: "false",
+        PAPERCLIP_BOARD_KEY_AUTH_EVENT_RETENTION_ENABLED: "false",
         ...(options.suppressed ? { PAPERCLIP_IN_WORKTREE: "true" } : {}),
         ...(options.githubOrigin ? { PAPERCLIP_MAINTENANCE_GITHUB_ORIGIN: options.githubOrigin } : {}),
         ...(options.connector ? {

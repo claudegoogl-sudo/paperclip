@@ -49,11 +49,7 @@ async function settleClock(server: Awaited<ReturnType<typeof startMaintenanceSer
 }
 // Diagnostic: on failure, name the extra statements instead of only the count difference.
 function expectNoNewQueries(server: { proxy: { queries: Array<{ sql: string }> } }, baseline: number) {
-  // Fork-only periodic work, deliberate and outside the upstream idle contract:
-  // - startEgressPostureSweep (services/egress-posture.ts) scans company_secret_bindings for deny-all egress rows;
-  // - postgres.js array-type introspection (pg_catalog.pg_type) on the connection that sweep opens.
-  const forkPeriodic = (sql: string) => /from "company_secret_bindings" where \("company_secret_bindings"\."egress_allowlist_enforced"/.test(sql) || /from pg_catalog\.pg_type a/.test(sql);
-  expect(server.proxy.queries.slice(baseline).map(query => query.sql.slice(0, 300)).filter(sql => !forkPeriodic(sql))).toEqual([]);
+  expect(server.proxy.queries.slice(baseline).map(query => query.sql.slice(0, 300))).toEqual([]);
 }
 
 function receipt(queries: Array<{ protocol: string; sql: string; fingerprint: string }>) {
