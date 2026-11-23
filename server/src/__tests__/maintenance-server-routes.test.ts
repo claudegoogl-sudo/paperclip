@@ -88,7 +88,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(wallElapsedMs).toBeGreaterThanOrEqual(90_000);
       expect(real.now - before.now).toBeGreaterThanOrEqual(89_000);
       expect(real.idle.active).toBe(0);
-      expect(server.proxy.queries.length).toBe(queryCount);
+      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(queryCount).map(q => q.sql.slice(0, 300)))).toBe(queryCount);
       expect(real.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(real.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
       expect(real.network.nonDatabaseBytesWritten).toBe(before.network.nonDatabaseBytesWritten);
@@ -103,7 +103,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       const after = await server.snapshot();
       expect(after.now - real.now).toBe(2 * 60 * 60_000);
       expect(after.idle.active).toBe(0);
-      expect(server.proxy.queries.length).toBe(queryCount);
+      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(queryCount).map(q => q.sql.slice(0, 300)))).toBe(queryCount);
       expect(after.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(after.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
       expect(after.network.nonDatabaseBytesWritten).toBe(before.network.nonDatabaseBytesWritten);
@@ -145,7 +145,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(parked).toEqual(waiting);
       const baseline = server.proxy.queries.length;
       await server.realtime(); await delay(30_000); await server.freeze(); await settleClock(server);
-      expect(server.proxy.queries.length).toBe(baseline);
+      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
       await server.api("POST", `/issues/${issue!.id}/tree-holds/${hold.hold.id}/release`, { reason: "Resume accepted Retry", metadata: { wakeAgents: false } });
       await server.realtime();
       let executed: Record<string, unknown> | undefined;
@@ -185,7 +185,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(suppressed).toMatchObject({ status: "active", cleanup_status: null });
       const baseline = server.proxy.queries.length, before = await server.snapshot();
       for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-      expect(server.proxy.queries.length).toBe(baseline);
+      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
       expect((await server.snapshot()).outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       await server.api("PATCH", "/instance/settings/experimental", { enableWorktreeRunExecution: true });
       await server.advance(1_000); await settleClock(server);
@@ -362,7 +362,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       }
       const after = await server.snapshot();
       expect(after.now - start).toBe(2 * 60 * 60_000);
-      expect(server.proxy.queries.length).toBe(baseline);
+      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
       expect(after.outgoingHttpRequests).toBe(0);
       expect(after.network.nonDatabaseConnections).toBe(0);
       expect(server.proxy.errors).toEqual([]);
@@ -605,7 +605,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(acknowledgements).toHaveLength(1);
         const baseline = server.proxy.queries.length, requestCount = requests.length;
         for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(baseline); expect(requests).toHaveLength(requestCount);
+        expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline); expect(requests).toHaveLength(requestCount);
         await writeFile(path.join(server.directory, "github-measurement.json"), JSON.stringify({ phase: "ordinary-connection-activation-sealed-event",
           companyId: company.id, connectionId: connection!.id, grantId: grant!.id, delivery, requests, acknowledgements,
           quietClockMs: 120_000, quietQueries: 0, frames: server.proxy.frames,
