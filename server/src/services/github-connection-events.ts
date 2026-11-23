@@ -550,8 +550,10 @@ export function githubConnectionEventService(
       return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
     }
     const first = identity;
+    console.log("TS poll-start", performance.now().toFixed(1));
     const lease = await connector.leaseEvents({ subject: first.subject, companyId: first.companyId, eventWakeVersion: forcePolling ? 0 : 1 }).catch((e) => { console.log("DBG2 lease-throw", String((e as any)?.stack || e)); throw e; });
     console.log("DBG2 lease", lease ? lease.events.length : null);
+    console.log("TS lease-done", performance.now().toFixed(1));
     if (!lease) {
       emptyPolls += 1;
       nextPollAt = !hasConsumer || (!forcePolling && connector.eventWakeVersion?.() === 1) ? Number.POSITIVE_INFINITY
@@ -613,12 +615,14 @@ export function githubConnectionEventService(
     }
     console.log("DBG2 after-loop", JSON.stringify({ events: lease.events.length, ack: acknowledge.length, result, bindings: bindings.length, bindingIds: lease.events.map(e => e.bindingIds), mine: bindings.map(b => b.id) }));
     if (acknowledge.length > 0) {
+      console.log("TS ack-start", performance.now().toFixed(1));
       await connector.acknowledgeEvents({
         subject: first.subject,
         companyId: first.companyId,
         leaseId: lease.leaseId,
         deliveryIds: acknowledge,
       });
+      console.log("TS ack-done", performance.now().toFixed(1));
     }
     for (const deliveryId of lease.failedEventIds ?? []) {
       logger.warn({ deliveryId, reason: "inner_event_authentication_failed" },
