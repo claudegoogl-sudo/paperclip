@@ -63,7 +63,7 @@ const support = await getEmbeddedPostgresTestSupport();
           }
           identities.push(claims.iss);
           if (req.url === "/v1/connector/events/ack") {
-            console.log("TS http-ack-recv", performance.now().toFixed(1));
+            ((globalThis as any).__ts ??= []).push("http-ack-recv@" + performance.now().toFixed(1));
             acknowledged++; delivered.add(eventId);
             if (acknowledged === 2) await replacementAck;
             res.end(JSON.stringify({ acknowledged: 1 })); return;
@@ -142,10 +142,10 @@ const support = await getEmbeddedPostgresTestSupport();
       }
       const firstIdentity = await enroll();
       expect(wakeConnectionEvents(db)).toBe(true);
-      console.log("TS enroll-woken", performance.now().toFixed(1));
+      ((globalThis as any).__ts ??= []).push("enroll-woken@" + performance.now().toFixed(1));
       await vi.advanceTimersByTimeAsync(6_000);
-      console.log("TS advanced-6s", performance.now().toFixed(1));
-      try { await observe(() => expect(acknowledged).toBe(1)); } catch (e) { console.log('TS observe-timeout', performance.now().toFixed(1)); console.log('DBG', JSON.stringify({requests,leases,acknowledged,errors:errors.map(x=>String((x as any)?.stack||x)),httpErrors:httpErrors.map(x=>String((x as any)?.stack||x))})); throw e; }
+      ((globalThis as any).__ts ??= []).push("advanced-6s@" + performance.now().toFixed(1));
+      try { await observe(() => expect(acknowledged).toBe(1)); } catch (e) { ((globalThis as any).__ts ??= []).push('observe-timeout@' + performance.now().toFixed(1)); throw new Error('TSDUMP ' + JSON.stringify({ts:(globalThis as any).__ts,requests,leases,acknowledged,errors:errors.map(x=>String((x as any)?.message||x)),httpErrors:httpErrors.map(x=>String((x as any)?.message||x))})); console.log('DBG', JSON.stringify({requests,leases,acknowledged,errors:errors.map(x=>String((x as any)?.stack||x)),httpErrors:httpErrors.map(x=>String((x as any)?.stack||x))})); throw e; }
       expect(await db.select().from(connectionEventDeliveries).where(eq(connectionEventDeliveries.providerDeliveryId, eventId))).toMatchObject([{ status: "processed" }]);
       expect((await db.select().from(connectionGrants).where(eq(connectionGrants.id, grantId)))[0]!.providerTenant!.github!.webhookHealth).toBe("healthy");
       // The applied installation update publishes one credential-change hint.
