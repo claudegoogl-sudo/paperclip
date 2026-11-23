@@ -511,6 +511,21 @@ const spentFailureRetryAccounting = {
   maxTurnContinuations: 0,
 };
 
+
+import { PgUpdateBuilder as __PUB, PgInsertBuilder as __PIB } from "drizzle-orm/pg-core";
+{
+  const __set = (__PUB.prototype as any).set;
+  (__PUB.prototype as any).set = function (v: any, ...r: any[]) {
+    if (v && v.status === "cancelled") console.error("[PLA13219] CANCEL-SET " + JSON.stringify({ error: v.error }) + "\n" + new Error().stack?.split("\n").slice(2, 9).join("\n"));
+    return __set.call(this, v, ...r);
+  };
+  const __vals = (__PIB.prototype as any).values;
+  (__PIB.prototype as any).values = function (v: any, ...r: any[]) {
+    const x = Array.isArray(v) ? v[0] : v;
+    if (x && (x.retryOfRunId || x.contextSnapshot?.retryReason)) console.error("[PLA13219] RETRY-INSERT " + JSON.stringify({ status: x.status, retryOf: x.retryOfRunId, rr: x.contextSnapshot?.retryReason, src: x.contextSnapshot?.source }) + "\n" + new Error().stack?.split("\n").slice(2, 9).join("\n"));
+    return __vals.call(this, v, ...r);
+  };
+}
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<
