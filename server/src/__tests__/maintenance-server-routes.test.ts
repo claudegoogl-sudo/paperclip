@@ -47,6 +47,12 @@ async function settleClock(server: Awaited<ReturnType<typeof startMaintenanceSer
   }
   return server.settled();
 }
+// The egress posture sweep is deliberately always-on (a security check must not stop with heartbeat
+// scheduling), so its one SELECT and the connection type bootstrap it triggers are not scheduler work.
+const isNotPostureSweep = (query: { sql: string }) =>
+  !/company_secret_bindings.*egress_allowlist_enforced/s.test(query.sql) && !/pg_catalog\.pg_type a\s+left join/.test(query.sql);
+const qn = (server: { proxy: { queries: Array<{ sql: string }> } }) => server.proxy.queries.filter(isNotPostureSweep).length;
+
 function receipt(queries: Array<{ protocol: string; sql: string; fingerprint: string }>) {
   const groups = new Map<string, { fingerprint: string; protocol: string; calls: number; tables: string[] }>();
   for (const query of queries) {
@@ -75,7 +81,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
     try {
       if (state !== "empty") await server.api("PATCH", "/instance/settings/experimental", { enableExternalObjects: true, enableStatusCards: true });
       await settleClock(server); await server.freeze();
-      const before = await server.snapshot(), queryCount = server.proxy.queries.length, frames = server.proxy.frames, transport = server.proxy.transport;
+      const before = await server.snapshot(), queryCount = qn(server), frames = server.proxy.frames, transport = server.proxy.transport;
       expect(before.startup.phase).toBe("ready"); expect(before.idle.active).toBe(0);
       await server.realtime();
       const wallStart = performance.now();
@@ -88,7 +94,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(wallElapsedMs).toBeGreaterThanOrEqual(90_000);
       expect(real.now - before.now).toBeGreaterThanOrEqual(89_000);
       expect(real.idle.active).toBe(0);
-      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(queryCount).map(q => q.sql.slice(0, 300)))).toBe(queryCount);
+      expect(qn(server), JSON.stringify(server.proxy.queries.filter(isNotPostureSweep).slice(queryCount).map(q => q.sql.slice(0, 300)))).toBe(queryCount);
       expect(real.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(real.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
       expect(real.network.nonDatabaseBytesWritten).toBe(before.network.nonDatabaseBytesWritten);
@@ -103,7 +109,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       const after = await server.snapshot();
       expect(after.now - real.now).toBe(2 * 60 * 60_000);
       expect(after.idle.active).toBe(0);
-      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(queryCount).map(q => q.sql.slice(0, 300)))).toBe(queryCount);
+      expect(qn(server), JSON.stringify(server.proxy.queries.filter(isNotPostureSweep).slice(queryCount).map(q => q.sql.slice(0, 300)))).toBe(queryCount);
       expect(after.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(after.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
       expect(after.network.nonDatabaseBytesWritten).toBe(before.network.nonDatabaseBytesWritten);
@@ -138,14 +144,14 @@ describeDatabase("assembled maintenance server production wiring", () => {
       await settleClock(server);
       const [waiting] = await fixture.$client`select status, run_id, payload->'executionWait'->>'reason' as reason from agent_wakeup_requests where id=${retry.requestId}`;
       expect(waiting).toMatchObject({ status: "deferred_issue_execution", run_id: null, reason: "issue_tree_hold_active" });
-      const beforeGrace = server.proxy.queries.length;
+      const beforeGrace = qn(server);
       await server.realtime(); await delay(31_000); await server.freeze(); await settleClock(server);
       const grace = receipt(server.proxy.queries.slice(beforeGrace));
       const [parked] = await fixture.$client`select status, run_id, payload->'executionWait'->>'reason' as reason from agent_wakeup_requests where id=${retry.requestId}`;
       expect(parked).toEqual(waiting);
-      const baseline = server.proxy.queries.length;
+      const baseline = qn(server);
       await server.realtime(); await delay(30_000); await server.freeze(); await settleClock(server);
-      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
+      expect(qn(server), JSON.stringify(server.proxy.queries.filter(isNotPostureSweep).slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
       await server.api("POST", `/issues/${issue!.id}/tree-holds/${hold.hold.id}/release`, { reason: "Resume accepted Retry", metadata: { wakeAgents: false } });
       await server.realtime();
       let executed: Record<string, unknown> | undefined;
@@ -159,14 +165,14 @@ describeDatabase("assembled maintenance server production wiring", () => {
       const [count] = await fixture.$client`select count(*)::integer as count from heartbeat_runs where context_snapshot->>'taskRetryRequestId'=${retry.requestId}`;
       expect(count!.count).toBe(1);
       await server.updateIssue({ id: issue!.id, status: "done" }); await settleClock(server);
-      const quiet = server.proxy.queries.length;
+      const quiet = qn(server);
       for (let step = 0; step < 4; step++) { await server.advance(30_000); await settleClock(server); }
       // The controller instance lease may check once more that the boot no longer holds the
       // run's stamped records, then stops (it renews only while the boot holds work).
       expect(server.proxy.queries.slice(quiet).filter(query => !query.sql.includes("controller_instances"))).toEqual([]);
-      const leaseIdle = server.proxy.queries.length;
+      const leaseIdle = qn(server);
       for (let step = 0; step < 2; step++) { await server.advance(30_000); await settleClock(server); }
-      expect(server.proxy.queries.length).toBe(leaseIdle);
+      expect(qn(server)).toBe(leaseIdle);
       await writeFile(path.join(server.directory, "receipt-measurement.json"), JSON.stringify({ phase: "ordinary-held-task-retry", companyId: company.id, issueId: issue!.id,
         requestId: retry.requestId, waiting, grace, parked, executed, count: count!.count, parkedRealMs: 30_000, parkedQueries: 0, settledClockMs: 120_000, settledQueries: 0,
         boundary: "actual Retry and subtree release HTTP, wakeAgents false, real clock through process/controller authority, real local process, no outcome seeded", frames: server.proxy.frames }, null, 2));
@@ -183,9 +189,9 @@ describeDatabase("assembled maintenance server production wiring", () => {
       await server.advance(1_000); await settleClock(server);
       const [suppressed] = await fixture.$client`select status, cleanup_status from environment_leases where id=${leaseId}`;
       expect(suppressed).toMatchObject({ status: "active", cleanup_status: null });
-      const baseline = server.proxy.queries.length, before = await server.snapshot();
+      const baseline = qn(server), before = await server.snapshot();
       for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
+      expect(qn(server), JSON.stringify(server.proxy.queries.filter(isNotPostureSweep).slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
       expect((await server.snapshot()).outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       await server.api("PATCH", "/instance/settings/experimental", { enableWorktreeRunExecution: true });
       await server.advance(1_000); await settleClock(server);
@@ -355,14 +361,14 @@ describeDatabase("assembled maintenance server production wiring", () => {
     try {
       await server.settled();
       await server.freeze();
-      const baseline = server.proxy.queries.length, start = (await server.snapshot()).now;
+      const baseline = qn(server), start = (await server.snapshot()).now;
       for (let step = 0; step < 240; step++) {
         await server.advance(30_000);
         await server.settled(10);
       }
       const after = await server.snapshot();
       expect(after.now - start).toBe(2 * 60 * 60_000);
-      expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
+      expect(qn(server), JSON.stringify(server.proxy.queries.filter(isNotPostureSweep).slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline);
       expect(after.outgoingHttpRequests).toBe(0);
       expect(after.network.nonDatabaseConnections).toBe(0);
       expect(server.proxy.errors).toEqual([]);
@@ -380,17 +386,17 @@ describeDatabase("assembled maintenance server production wiring", () => {
         const [saved] = await persisted.$client`select company_id, status from issues where id=${history.id}`;
         expect(saved).toMatchObject({ company_id: company.id, status: "done" });
       } finally { await persisted.$client.end(); }
-      const historyBaseline = server.proxy.queries.length;
+      const historyBaseline = qn(server);
       await server.drain();
       for (let step = 0; step < 3; step++) { await server.advance(30_000); await server.settled(10); }
       await server.resume(); await server.settled();
-      const resumed = server.proxy.queries.length;
+      const resumed = qn(server);
       for (let step = 0; step < 240; step++) { await server.advance(30_000); await server.settled(10); }
-      expect(server.proxy.queries.length).toBe(resumed);
+      expect(qn(server)).toBe(resumed);
       expect((await server.snapshot()).outgoingHttpRequests).toBe(0);
       await writeFile(path.join(server.directory, "history-measurement.json"), JSON.stringify({ phase: "disabled-configured-history-drain",
         companyId: company.id, issueId: history.id, historyBaseline, resumedQueries: resumed,
-        postResumeClockMs: 2 * 60 * 60_000, measuredQueries: server.proxy.queries.length - resumed,
+        postResumeClockMs: 2 * 60 * 60_000, measuredQueries: qn(server) - resumed,
         frames: server.proxy.frames, outgoingHttpRequests: 0 }, null, 2));
     } finally { await server.stop(); }
   }, 150_000);
@@ -474,7 +480,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         await fixture.$client.unsafe(`create trigger maintenance_hold_issue before insert on issues for each row execute function maintenance_hold_issue()`);
         reserved = await fixture.$client.reserve();
         await reserved`select pg_advisory_lock(913701)`;
-        const before = server.proxy.queries.length;
+        const before = qn(server);
         pendingIssue = server.api<{ id: string }>("POST", `/companies/${company.id}/issues`, {
           title: "First write during idle drain", description: "https://github.com/maintenance/example/pull/1", status: "done",
         });
@@ -488,9 +494,9 @@ describeDatabase("assembled maintenance server production wiring", () => {
         const [waiting] = await fixture.$client`select eo.company_id, eo.is_terminal, eo.last_resolved_at from external_objects eo
           join external_object_mentions em on em.object_id=eo.id where em.source_issue_id=${issue.id}`;
         expect(waiting).toMatchObject({ company_id: company.id, is_terminal: false, last_resolved_at: null });
-        const draining = server.proxy.queries.length;
+        const draining = qn(server);
         for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(draining);
+        expect(qn(server)).toBe(draining);
         await server.resume(); await server.advance(30_000); await server.settled();
         const [resolved] = await fixture.$client`select eo.company_id, eo.is_terminal, eo.status_key, floor(extract(epoch from eo.last_resolved_at) * 1000)::float8 as resolved_ms from external_objects eo
           join external_object_mentions em on em.object_id=eo.id where em.source_issue_id=${issue.id}`;
@@ -498,9 +504,9 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(resolved!.resolved_ms).toBeGreaterThan(0);
         expect(resolved!.resolved_ms).toBeLessThanOrEqual((await server.snapshot()).now);
         expect(providerRequests).toEqual(["/repos/maintenance/example/pulls/1"]);
-        const settledQueries = server.proxy.queries.length, network = await server.snapshot();
+        const settledQueries = qn(server), network = await server.snapshot();
         for (let step = 0; step < 240; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(settledQueries);
+        expect(qn(server)).toBe(settledQueries);
         expect(providerRequests).toHaveLength(1);
         expect((await server.snapshot()).outgoingHttpRequests).toBe(network.outgoingHttpRequests);
         await writeFile(path.join(server.directory, "external-object-measurement.json"), JSON.stringify({
@@ -518,18 +524,18 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(failed!.last_error_code).toBe("github_unreachable");
         expect(failed!.next_ms).toBeGreaterThan((await server.snapshot()).now);
         await server.drain(); await server.settled();
-        const retryDrainQueries = server.proxy.queries.length;
+        const retryDrainQueries = qn(server);
         for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(retryDrainQueries);
+        expect(qn(server)).toBe(retryDrainQueries);
         expect(providerRequests.filter(url => url.endsWith("/2"))).toHaveLength(1);
         await server.resume(); await server.advance(30_000); await server.settled();
         const [retried] = await fixture.$client`select eo.is_terminal, eo.status_key, eo.last_error_code from external_objects eo
           join external_object_mentions em on em.object_id=eo.id where em.source_issue_id=${retryIssue.id}`;
         expect(retried).toMatchObject({ is_terminal: true, status_key: "merged", last_error_code: null });
         expect(providerRequests.filter(url => url.endsWith("/2"))).toHaveLength(2);
-        const retrySettled = server.proxy.queries.length;
+        const retrySettled = qn(server);
         for (let step = 0; step < 20; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length).toBe(retrySettled);
+        expect(qn(server)).toBe(retrySettled);
         await writeFile(path.join(server.directory, "retry-measurement.json"), JSON.stringify({ phase: "provider-failure-retry-across-drain",
           providerBoundary: "simulated GitHub HTTP 503 then merged", retryIssueId: retryIssue.id, failed, retried,
           drainedClockMs: 120_000, drainedQueries: 0, quietAfterRetryMs: 600_000, quietAfterRetryQueries: 0,
@@ -603,9 +609,9 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(delivery).toMatchObject({ company_id: company.id, status: "processed", attempts: 1, processed: true,
           normalized_payload: expect.objectContaining({ repository: "maintenance/example", number: 7, merged: true }) });
         expect(acknowledgements).toHaveLength(1);
-        const baseline = server.proxy.queries.length, requestCount = requests.length;
+        const baseline = qn(server), requestCount = requests.length;
         for (let step = 0; step < 4; step++) { await server.advance(30_000); await server.settled(10); }
-        expect(server.proxy.queries.length, JSON.stringify(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline); expect(requests).toHaveLength(requestCount);
+        expect(qn(server), JSON.stringify(server.proxy.queries.filter(isNotPostureSweep).slice(baseline).map(q => q.sql.slice(0, 300)))).toBe(baseline); expect(requests).toHaveLength(requestCount);
         await writeFile(path.join(server.directory, "github-measurement.json"), JSON.stringify({ phase: "ordinary-connection-activation-sealed-event",
           companyId: company.id, connectionId: connection!.id, grantId: grant!.id, delivery, requests, acknowledgements,
           quietClockMs: 120_000, quietQueries: 0, frames: server.proxy.frames,
@@ -827,7 +833,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         await fixture.$client.unsafe(`create trigger maintenance_hold_completion before update on issues for each row execute function maintenance_hold_completion()`);
         const reserved = await fixture.$client.reserve();
         await reserved`select pg_advisory_lock(913702)`;
-        const writesBefore = server.proxy.queries.length;
+        const writesBefore = qn(server);
         const completing = server.updateIssue({ id: run.linkedIssueId, status: "done" });
         void completing.catch(() => {});
         try {
@@ -883,11 +889,11 @@ describeDatabase("assembled maintenance server production wiring", () => {
         cloud: { jwks: JSON.stringify({ keys: [publicJwk] }), s3Origin: origin, standby: true } });
         const standby = await server.settled(500, 1); await server.freeze();
         expect(standby.idle.active).toBe(1);
-        const before = server.proxy.queries.length;
+        const before = qn(server);
         for (let step = 0; step < 240; step++) { await server.advance(30_000); await server.settled(10, 1); }
         const health = await fetch(`http://127.0.0.1:${server.port}/api/health`, { signal: AbortSignal.timeout(10_000) });
         expect(health.status).toBe(200); expect(await health.json()).toMatchObject({ warmStandby: true });
-        expect(server.proxy.queries.length).toBe(before);
+        expect(qn(server)).toBe(before);
         expect(storageRequests).toEqual([]);
         expect((await server.snapshot()).network.nonDatabaseConnections).toBe(0);
         const now = Math.floor((await server.snapshot()).now / 1000);
@@ -902,7 +908,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         expect(claimed.status).toBe(200); expect((await claimed.json()).warmStandby).toBeUndefined();
         await server.advance(30_000); const afterClaim = await server.settled();
         expect(afterClaim.idle.active).toBe(0);
-        expect(server.proxy.queries.length).toBeGreaterThan(before);
+        expect(qn(server)).toBeGreaterThan(before);
         const fixture = createDb(databaseUrl, { maxConnections: 1 });
         try {
           const [transfers] = await fixture.$client`select count(*)::integer as count from company_transfer_runs`;
@@ -914,7 +920,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
           cloudBoundary: "actual managed configuration, local S3 HTTP guard, generated Ed25519 trust root; no production Cloud claim",
           clockMs: 7_200_000, standbyQueries: 0,
           deferredStartupIntent: { count: 1, queue: "import-spool-cleanup", producer: "companyTransferRunService.recoverStrandedApplyingRuns",
-            reason: "Cloud standby disables both reconciliation and dispatch", releasedAfterSignedClaim: true, boundedResumeMs: 30_000, sleepEligibleWhileHeld: false }, storageRequests, beforeClaimQueries: before, afterClaimQueries: server.proxy.queries.length,
+            reason: "Cloud standby disables both reconciliation and dispatch", releasedAfterSignedClaim: true, boundedResumeMs: 30_000, sleepEligibleWhileHeld: false }, storageRequests, beforeClaimQueries: before, afterClaimQueries: qn(server),
           frames: server.proxy.frames, network: await server.snapshot() }, null, 2));
       } finally {
         await runtime?.stop();
