@@ -103,7 +103,8 @@ const support = await getEmbeddedPostgresTestSupport();
       worker = registerGitHubConnectionEventWork(db, coordinator, service, () => true);
       await worker.ready;
       async function observe(assertion: () => void) {
-        const observedAt = Date.now(), until = performance.now() + 1_000;
+        // The ack can take >1 s of real time on loaded hosts (PLA-13224); observe for up to 10 s.
+        const observedAt = Date.now(), until = performance.now() + 10_000;
         let failure: unknown;
         do {
           expect(Date.now()).toBe(observedAt);
