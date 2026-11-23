@@ -85,7 +85,7 @@ export async function readUpgradeReadiness(db: Db, input: {
     const finalization = bound && row.hasResult && remote.success && !row.pluginLeaseId
       && performance.now() < inspectionDeadline
       ? await readNativeFinalizationUpgradeReadiness(db, { companyId: row.companyId, runId: row.id,
-        controller: owner, supportedOutageMs: 300_000 }).catch(() => false) : false;
+        controller: owner, supportedOutageMs: 300_000 }).catch((e: any) => { console.error('PROBE13220C ' + String(e?.message).slice(0,500) + ' | ' + String(e?.cause?.message ?? e?.cause).slice(0,500)); return false; }) : false;
     console.error('PROBE13220B ' + JSON.stringify({ rec: row.recoverable, hasResult: row.hasResult, wsId: Boolean(workspaceId), hasMaterial: Boolean(row.material), ident: identity ? { run: identity.runId === row.id, runner: identity.runnerInstanceId === row.runnerId, sess: identity.normalizedSessionId === row.sessionId, lease: identity.environmentLeaseId === workspaceId } : null, hasRemote: row.hasRemoteWorkspace, remoteOk: remote.success, plugin: Boolean(row.pluginLeaseId), bound, finalization }));
     candidates.push({ id: row.id, recoverable: bound && (row.recoverable || finalization), retainedUnowned: row.retainedUnowned });
   }
