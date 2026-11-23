@@ -177,9 +177,10 @@ describe("post-result upgrade readiness", () => {
     } finally {
       await lock.unsafe("rollback"); lock.release(); await probeDb.$client.end();
     }
-    expect(await readUpgradeReadiness(db, { activeRunIds: new Set(fixtures.map(f => f.runId)),
-      counters: () => ({ activeRuns: 3, pendingWakes: 0, draining: false }) }))
-      .toMatchObject({ ready: true, recoverableRuns: 3, blockingRuns: 0 });
+    const rr = await readUpgradeReadiness(db, { activeRunIds: new Set(fixtures.map(f => f.runId)),
+      counters: () => ({ activeRuns: 3, pendingWakes: 0, draining: false }) });
+    expect(String((globalThis as any).__ret), "RETLABELS").toBe("zzz");
+    expect(rr).toMatchObject({ ready: true, recoverableRuns: 3, blockingRuns: 0 });
   }, 15_000);
 
   it("requires the applied decision and saved workspace before certifying committed projection", async () => {

@@ -12,7 +12,7 @@ export async function readNativeFinalizationUpgradeReadiness(db: Db, input: {
   companyId: string; runId: string; controller: NativeControllerIdentity; supportedOutageMs: number;
 }): Promise<boolean> {
   const worker = currentWorkspaceWorker();
-  if (!workspaceWorkerStopProofSupported(worker)) return (console.error('PROBE13220D ret1'), false);
+  if (!workspaceWorkerStopProofSupported(worker)) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret1'), false);
   return db.transaction(async tx => {
     await tx.execute(sql`set local statement_timeout = '2s'`);
     const [row] = await tx.select({
@@ -43,29 +43,29 @@ export async function readNativeFinalizationUpgradeReadiness(db: Db, input: {
       .innerJoin(issues, and(eq(issues.id, nativeRunFinalizations.issueId), eq(issues.companyId, heartbeatRuns.companyId)))
       .innerJoin(agents, and(eq(agents.id, heartbeatRuns.agentId), eq(agents.companyId, heartbeatRuns.companyId)))
       .where(and(eq(heartbeatRuns.id, input.runId), eq(heartbeatRuns.companyId, input.companyId))).limit(1);
-    if (!row) return (console.error('PROBE13220D ret2'), false);
+    if (!row) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret2'), false);
     const { run, coordinator, issue } = row;
     if (run.runtimeMode !== "native" || run.status !== "running" || row.adapter !== "paperclip_runner"
       || isNativeRunnerOwnershipHeld(run) || !coordinator.resultId || run.nativeIssueId !== issue.id
       || coordinator.controllerBootId !== input.controller.bootId || coordinator.controllerPid !== input.controller.pid
       || coordinator.controllerProcessStartedAt?.getTime() !== input.controller.processStartedAt.getTime()
       || coordinator.controllerGeneration < 1
-      || !["result_accepted", "workspace_finalizing", "retryable_failure", "committed"].includes(coordinator.phase)) return (console.error('PROBE13220D ret3'), false);
+      || !["result_accepted", "workspace_finalizing", "retryable_failure", "committed"].includes(coordinator.phase)) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret3'), false);
     if (coordinator.leaseOwner?.startsWith("native-finalizer:") && coordinator.leaseExpiresAt
-      && coordinator.leaseExpiresAt.getTime() > Date.now() + input.supportedOutageMs) return (console.error('PROBE13220D ret4'), false);
+      && coordinator.leaseExpiresAt.getTime() > Date.now() + input.supportedOutageMs) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret4'), false);
     const profile = run.runnerProfileJson;
     const reference = remoteWorkspaceRunReferenceSchema.safeParse(profile?.remoteWorkspace);
     if (!reference.success || profile.nativeWorkspaceSync === true
-      || !nativeWorkspaceFinalizationOwnerCanUpgrade(profile, input.controller, worker)) return (console.error('PROBE13220D ret5'), false);
+      || !nativeWorkspaceFinalizationOwnerCanUpgrade(profile, input.controller, worker)) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret5'), false);
     const remote = reference.data;
     const [workspace] = await tx.select({ id: executionWorkspaces.id, providerType: executionWorkspaces.providerType,
       metadata: sql<Record<string, unknown>>`jsonb_build_object('remoteWorkspace', ${executionWorkspaces.metadata}->'remoteWorkspace')` })
       .from(executionWorkspaces).where(and(eq(executionWorkspaces.id, remote.workspaceId),
       eq(executionWorkspaces.companyId, input.companyId))).limit(1);
-    if (!workspace || workspace.providerType !== "cloud_sandbox") return (console.error('PROBE13220D ret6'), false);
+    if (!workspace || workspace.providerType !== "cloud_sandbox") return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret6'), false);
     let authority;
-    try { authority = readRemoteWorkspaceAuthority(workspace.metadata); } catch { return (console.error('PROBE13220D ret7'), false); }
-    if (!authority) return (console.error('PROBE13220D ret8'), false);
+    try { authority = readRemoteWorkspaceAuthority(workspace.metadata); } catch { return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret7'), false); }
+    if (!authority) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret8'), false);
     const [barrier] = await tx.select({ id: workspaceOperations.id }).from(workspaceOperations).where(and(eq(workspaceOperations.companyId, input.companyId),
       eq(workspaceOperations.heartbeatRunId, run.id), eq(workspaceOperations.issueId, issue.id),
       eq(workspaceOperations.executionWorkspaceId, workspace.id), eq(workspaceOperations.phase, "workspace_finalize"),
@@ -74,10 +74,10 @@ export async function readNativeFinalizationUpgradeReadiness(db: Db, input: {
       terminalState: sql<string>`${nativeRunResults.resultJson}->'terminal'->>'runTerminalState'` }).from(nativeRunResults).where(and(eq(nativeRunResults.id, coordinator.resultId),
       eq(nativeRunResults.companyId, input.companyId), eq(nativeRunResults.runId, run.id), eq(nativeRunResults.issueId, issue.id),
       eq(nativeRunResults.schemaStatus, "accepted"))).limit(1);
-    if (!result || result.completionContractId !== run.completionContractId) return (console.error('PROBE13220D ret9'), false);
-    if (!["succeeded", "failed", "cancelled"].includes(result.terminalState)) return (console.error('PROBE13220D ret10'), false);
+    if (!result || result.completionContractId !== run.completionContractId) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret9'), false);
+    if (!["succeeded", "failed", "cancelled"].includes(result.terminalState)) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret10'), false);
     if (coordinator.phase === "committed") {
-      if (!barrier || !coordinator.decisionId || !coordinator.assessmentId) return (console.error('PROBE13220D ret11'), false);
+      if (!barrier || !coordinator.decisionId || !coordinator.assessmentId) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret11'), false);
       const [decision] = await tx.select({ id: statusDecisions.id }).from(statusDecisions).innerJoin(workAssessments,
         and(eq(workAssessments.id, statusDecisions.assessmentId), eq(workAssessments.companyId, statusDecisions.companyId),
           eq(workAssessments.issueId, statusDecisions.issueId), eq(workAssessments.runId, statusDecisions.runId)))
@@ -87,12 +87,12 @@ export async function readNativeFinalizationUpgradeReadiness(db: Db, input: {
           eq(workAssessments.contractId, result.completionContractId))).limit(1);
       return Boolean(decision);
     }
-    if (!await currentNativeWorkspaceRecoveryResult(tx as unknown as Db, { companyId: input.companyId, run, coordinator, issue })) return (console.error('PROBE13220D ret12'), false);
+    if (!await currentNativeWorkspaceRecoveryResult(tx as unknown as Db, { companyId: input.companyId, run, coordinator, issue })) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret12'), false);
     if (barrier) return true;
     const location = authority.location;
     if (!location || authority.writerRunId !== run.id || authority.epoch !== remote.epoch || location.leaseId !== remote.leaseId
       || location.providerLeaseId !== remote.providerLeaseId || location.remoteCwd !== remote.remoteCwd
-      || issue.executionWorkspaceId !== workspace.id) return (console.error('PROBE13220D ret13'), false);
+      || issue.executionWorkspaceId !== workspace.id) return ((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret13'), false);
     const [lease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases).innerJoin(environments,
       eq(environments.id, environmentLeases.environmentId)).where(and(eq(environmentLeases.id, location.leaseId),
       eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.environmentId, location.environmentId),
