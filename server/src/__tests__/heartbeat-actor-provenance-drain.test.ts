@@ -131,6 +131,7 @@ describeEmbeddedPostgres("heartbeat drains restore enqueue-time actor provenance
   async function probeRows() {
     await waitFor(async () =>
       (await db.select().from(activityLog).where(eq(activityLog.action, "test.provenance_probe"))).length > 0,
+      20_000,
     );
     return db
       .select({ source: activityLog.actorSource, keyId: activityLog.actorKeyId })
