@@ -76,7 +76,7 @@ describe("post-result upgrade readiness", () => {
       serverFingerprint: resultId, schemaStatus: "accepted", resultJson: { terminal: { runTerminalState: "succeeded" } }, canonicalSha256: "b".repeat(64) });
     await db.update(nativeRunFinalizations).set({ phase: "workspace_finalizing", resultId }).where(eq(nativeRunFinalizations.runId, runId));
     return { companyId, issueId, runId, agentId, contractId, resultId, workspaceId, environmentId, leaseId, remote, authority, controller,
-      probe: () => readUpgradeReadiness(db, { activeRunIds: new Set([runId]), counters: () => ({ activeRuns: 1, pendingWakes: 0, draining: false }) }) };
+      probe: () => { (globalThis as any).__ret = ''; return readUpgradeReadiness(db, { activeRunIds: new Set([runId]), counters: () => ({ activeRuns: 1, pendingWakes: 0, draining: false }) }); } };
   }
 
   it("certifies accepted remote work without changing its lease, result or task admission", async () => {
@@ -101,7 +101,7 @@ describe("post-result upgrade readiness", () => {
     const owner = { token: randomUUID(), controllerBootId: f.controller.bootId, hostname: os.hostname(),
       pid: f.controller.pid, processStartedAt: f.controller.processStartedAt.toISOString(), worker: currentWorkspaceWorker() };
     await db.update(heartbeatRuns).set({ runnerProfileJson: { ...profile, nativeWorkspaceFinalizationOwner: owner } }).where(eq(heartbeatRuns.id, f.runId));
-    expect((await f.probe()).ready).toBe(true);
+    { const __r = await f.probe(); expect(__r.ready, 'L' + String((globalThis as any).__ret)).toBe(true); }
     for (const physical of [null, { ...owner, token: "" }, { ...owner, worker: undefined }, { ...owner, controllerBootId: randomUUID() },
       { ...owner, hostname: "another-host" }, { ...owner, processStartedAt: new Date(0).toISOString() },
       { ...owner, worker: { ...owner.worker, deploymentId: "another-deployment" } }, { ...owner, worker: { ...owner.worker, extra: true } }]) {
@@ -116,7 +116,7 @@ describe("post-result upgrade readiness", () => {
     }
     await expect(db.update(heartbeatRuns).set({ completionContractId: null }).where(eq(heartbeatRuns.id, f.runId)))
       .rejects.toMatchObject({ cause: { code: "23503" } });
-    expect((await f.probe()).ready).toBe(true);
+    { const __r = await f.probe(); expect(__r.ready, 'L' + String((globalThis as any).__ret)).toBe(true); }
     for (const terminal of [null, {}, { runTerminalState: "active" }, { runTerminalState: "unknown" }]) {
       await db.update(nativeRunResults).set({ resultJson: { terminal } }).where(eq(nativeRunResults.id, f.resultId));
       expect((await f.probe()).ready).toBe(false);
@@ -145,7 +145,7 @@ describe("post-result upgrade readiness", () => {
     await db.update(nativeRunFinalizations).set({ leaseOwner: `native-finalizer:${randomUUID()}`, leaseExpiresAt: new Date(Date.now() + 600_000) }).where(eq(nativeRunFinalizations.runId, f.runId));
     expect((await f.probe()).ready).toBe(false);
     await db.update(nativeRunFinalizations).set({ leaseExpiresAt: new Date(Date.now() + 60_000) }).where(eq(nativeRunFinalizations.runId, f.runId));
-    expect((await f.probe()).ready).toBe(true);
+    { const __r = await f.probe(); expect(__r.ready, 'L' + String((globalThis as any).__ret)).toBe(true); }
     vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", "");
     expect((await f.probe()).ready).toBe(false);
     vi.stubEnv("PAPERCLIP_CLOUD_TENANT_SERVER_TOKEN", "fixture-token");
@@ -179,7 +179,7 @@ describe("post-result upgrade readiness", () => {
     }
     const rr = await readUpgradeReadiness(db, { activeRunIds: new Set(fixtures.map(f => f.runId)),
       counters: () => ({ activeRuns: 3, pendingWakes: 0, draining: false }) });
-    expect(String((globalThis as any).__ret), "RETLABELS").toBe("zzz");
+    
     expect(rr).toMatchObject({ ready: true, recoverableRuns: 3, blockingRuns: 0 });
   }, 15_000);
 
@@ -197,7 +197,7 @@ describe("post-result upgrade readiness", () => {
     expect((await f.probe()).ready).toBe(false);
     const [barrier] = await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
       heartbeatRunId: f.runId, executionWorkspaceId: f.workspaceId, phase: "workspace_finalize", status: "succeeded", finishedAt: new Date() }).returning();
-    expect((await f.probe()).ready).toBe(true);
+    { const __r = await f.probe(); expect(__r.ready, 'L' + String((globalThis as any).__ret)).toBe(true); }
     for (const patch of [{ applicationState: "proposed" }, { applicationState: "superseded" }]) {
       await db.update(statusDecisions).set(patch).where(eq(statusDecisions.id, decisionId));
       expect((await f.probe()).ready).toBe(false);
@@ -234,7 +234,7 @@ describe("post-result upgrade readiness", () => {
       return Response.json({ receipt: `${header}.${payload}.${sign(null, Buffer.from(`${header}.${payload}`), privateKey).toString("base64url")}` });
     });
     try {
-      expect((await f.probe()).ready).toBe(true);
+      { const __r = await f.probe(); expect(__r.ready, 'L' + String((globalThis as any).__ret)).toBe(true); }
       expect(fetch).not.toHaveBeenCalled();
       vi.stubEnv("RAILWAY_DEPLOYMENT_ID", "replacement");
       await db.update(heartbeatRuns).set({ runnerProfileJson: { ...run.runnerProfileJson,
