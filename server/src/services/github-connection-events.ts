@@ -550,7 +550,8 @@ export function githubConnectionEventService(
       return { leased: 0, processed: 0, duplicate: 0, ignored: 0, failed: 0 };
     }
     const first = identity;
-    const lease = await connector.leaseEvents({ subject: first.subject, companyId: first.companyId, eventWakeVersion: forcePolling ? 0 : 1 });
+    const lease = await connector.leaseEvents({ subject: first.subject, companyId: first.companyId, eventWakeVersion: forcePolling ? 0 : 1 }).catch((e) => { console.log("DBG2 lease-throw", String((e as any)?.stack || e)); throw e; });
+    console.log("DBG2 lease", lease ? lease.events.length : null);
     if (!lease) {
       emptyPolls += 1;
       nextPollAt = !hasConsumer || (!forcePolling && connector.eventWakeVersion?.() === 1) ? Number.POSITIVE_INFINITY
@@ -605,10 +606,12 @@ export function githubConnectionEventService(
         }
         acknowledge.push(event.id);
 
-      } catch {
+      } catch (error) {
+        console.log("DBG2 process-catch", String((error as any)?.stack || error));
         result.failed += 1;
       }
     }
+    console.log("DBG2 after-loop", JSON.stringify({ events: lease.events.length, ack: acknowledge.length, result, bindings: bindings.length, bindingIds: lease.events.map(e => e.bindingIds), mine: bindings.map(b => b.id) }));
     if (acknowledge.length > 0) {
       await connector.acknowledgeEvents({
         subject: first.subject,
