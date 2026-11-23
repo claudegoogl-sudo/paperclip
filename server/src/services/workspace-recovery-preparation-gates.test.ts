@@ -82,7 +82,8 @@ describe("automatic retained workspace recovery", () => {
     const f = await interruptedRemotePreparation("process_lost"), withheld = await withheldPreparationRetry(f);
     if (gate === "provider_evidence") await db.insert(heartbeatRunEvents).values({ companyId: f.companyId,
       runId: withheld.id, agentId: withheld.agentId, seq: 1, eventType: "tool.execution.started", stream: "system" });
-    if (gate === "exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, withheld.id));
+    // Fork retry ladders allow more than upstream's 2 attempts; 10 exceeds every ladder cap.
+    if (gate === "exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 10 }).where(eq(heartbeatRuns.id, withheld.id));
     await recoverRetainedWorkspace(f.input);
     const heartbeat = heartbeatService(db);
     await Promise.all([heartbeat.resumeRemoteStopComments(await run(f.runId)),
