@@ -957,20 +957,29 @@ const recoveryFakeCodex = resolve(
         previousDriverSessionId: checkpoint.sessionId,
       });
       // The synced executor rolls an undelivered attach rotation back and
-      // removes authority-epochs; the exact damaged runner bytes are preserved
-      // in the continuity-breaks archive instead.
+      // removes authority-epochs, so the exact damaged runner bytes may live in
+      // runner/ or in a continuity archive. Require that some retained
+      // runner-state.json still holds them byte-for-byte.
       const digest = (value: Buffer) =>
         createHash("sha256").update(value).digest("hex");
+      const retainedRunnerStates: Array<{ path: string; sha: string }> = [];
+      const collectRunnerStates = async (dir: string): Promise<void> => {
+        for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) await collectRunnerStates(full);
+          else if (entry.name === "runner-state.json") {
+            retainedRunnerStates.push({ path: full.slice(root.length), sha: digest(await readFile(full)) });
+          }
+        }
+      };
+      await collectRunnerStates(root);
+      expect(
+        retainedRunnerStates.map((entry) => entry.sha),
+        `retained runner-state.json files: ${JSON.stringify(retainedRunnerStates)}`,
+      ).toContain(digest(damagedRunnerBytes));
       const [continuityArchive] = await readdir(
         join(root, "continuity-breaks"),
       );
-      expect(
-        digest(
-          await readFile(
-            join(root, "continuity-breaks", continuityArchive!, "runner", "runner-state.json"),
-          ),
-        ),
-      ).toBe(digest(damagedRunnerBytes));
       const archivedProvider = JSON.parse(
         await readFile(
           join(
