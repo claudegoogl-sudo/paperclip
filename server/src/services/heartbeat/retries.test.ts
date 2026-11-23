@@ -118,7 +118,8 @@ describe("heartbeat retry module callbacks", () => {
     const database = guardedDatabase();
     const deps = callbacks();
     const run = { ...unitRun(), status: "failed", errorCode: "runner_revision_mismatch", scheduledRetryReason: "runner_revision_wait", scheduledRetryAttempt: 10,
-      contextSnapshot: { issueId: "issue", executionRetryAccounting: { version: 1, failureRetries: 0, maxTurnContinuations: 0 } } } as Run;
+      // No contextSnapshot.issueId: the fork releases a routine execution issue on give-up (a DB read); this unit test forbids DB access.
+      contextSnapshot: { executionRetryAccounting: { version: 1, failureRetries: 0, maxTurnContinuations: 0 } } } as Run;
     const retry = await extracted.createHeartbeatRetries(database.db, deps).scheduleBoundedRetryForRun(run, { adapterType: "codex_local" } as Agent);
     expect(retry).toMatchObject({ outcome: "retry_exhausted", attempt: 11, maxAttempts: 10 });
     expect(deps.appendRunEvent).toHaveBeenCalledWith(run, expect.objectContaining({
