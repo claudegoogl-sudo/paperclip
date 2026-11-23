@@ -389,6 +389,14 @@ export function createDb(url: string, options?: DatabaseClientOptions) {
   return createDbClient(url, resolved);
 }
 
+function urlSetsStatementTimeout(url: string): boolean {
+  try {
+    return /(^|[\s=])statement_timeout\s*=/.test(new URL(url).searchParams.get("options") ?? "");
+  } catch {
+    return false;
+  }
+}
+
 function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: object) {
   // Pool-size precedence (fork carryover over upstream 824.1): explicit
   // options win, then the upstream DATABASE_POOL_MAX variable, then the fork's
@@ -404,7 +412,11 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
   const driverConnection = (driverOptions.connection ?? {}) as Record<string, unknown>;
   const sql = postgres(connectionString, {
     ...driverOptions,
-    connection: { ...driverConnection, statement_timeout: statementTimeoutMs },
+    // A URL `options=-c statement_timeout=...` is the caller's explicit
+    // bound; the pool default must not override it as a startup parameter.
+    connection: urlSetsStatementTimeout(url)
+      ? { ...driverConnection }
+      : { ...driverConnection, statement_timeout: statementTimeoutMs },
     ...sqlOptions,
   });
   if (resolved.prepare === true) installPreparedQueries(sql);
