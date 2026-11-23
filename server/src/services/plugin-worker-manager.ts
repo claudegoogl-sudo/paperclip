@@ -5121,7 +5121,6 @@ export function createPluginWorkerManager(
       // so without this its resolved plaintext would linger for the process
       // lifetime (lazy prune only). Clear it on stop.
       clearRunSecretValues(handle.serviceRunId);
-      workers.delete(pluginId);
       retainStartupWorker(handle);
       if (workers.get(pluginId) === handle) workers.delete(pluginId);
     },
