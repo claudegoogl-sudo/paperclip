@@ -9514,7 +9514,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
-  it.each([
+  it.only.each([
     {
       mode: "clean exit",
       script: "console.log('complete')",
@@ -9550,6 +9550,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       const heartbeat = heartbeatService(db);
       await heartbeat.resumeQueuedRuns();
       const finished = await waitForRunToSettle(heartbeat, runId, 5_000);
+      if (finished?.status !== status) {
+        const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+        const parks = await db.execute(sql`select * from usage_limit_parks`);
+        const evs = await db.execute(sql`select seq, event_type, message from heartbeat_run_events where run_id = ${runId} order by seq`);
+        console.log("PROBE13243", JSON.stringify({ stage: row?.executionStage, status: row?.status, err: row?.error, ecode: row?.errorCode, pid: row?.processPid, exec: mockAdapterExecute.mock.calls.length, parks: parks.rows ?? parks, evs: evs.rows ?? evs, rp: row?.runnerProfileJson }));
+      }
       expect(finished?.status).toBe(status);
       expect(mockTerminateLocalService).not.toHaveBeenCalled();
       if (status === "succeeded") {
