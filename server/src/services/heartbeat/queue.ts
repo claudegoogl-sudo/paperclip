@@ -581,6 +581,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const issueId = readNonEmptyString(
       parseObject(run.contextSnapshot).issueId,
     );
+    console.error(`[PLA13219] gate:${stage} run=${run.id} issue=${issueId} src=${run.invocationSource}`);
     if (!issueId || run.invocationSource !== "automation") return onClear(db);
     await options.beforeChatControlRecoveryCheck?.({
       runId: run.id,

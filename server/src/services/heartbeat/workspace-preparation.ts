@@ -173,6 +173,11 @@ function readNonEmptyString(value: unknown): string | null {
 }
 
 export async function prepareHeartbeatWorkspace(db: Db, input: HeartbeatWorkspacePreparationInput) {
+  const __t0 = Date.now(); console.error(`[PLA13219] prepare:enter run=${input.run.id}`);
+  try { const __r = await prepareHeartbeatWorkspaceInner(db, input); console.error(`[PLA13219] prepare:ok run=${input.run.id} ms=${Date.now()-__t0}`); return __r; }
+  catch (e) { console.error(`[PLA13219] prepare:throw run=${input.run.id} err=${(e as Error)?.message}`); throw e; }
+}
+async function prepareHeartbeatWorkspaceInner(db: Db, input: HeartbeatWorkspacePreparationInput) {
   const sourceIssueId = input.reuse.reusableExistingExecutionWorkspace?.sourceIssueId
     ?? input.reuse.existingExecutionWorkspace?.sourceIssueId ?? input.task.issueId;
   if (input.reuse.isDotRun || resolveProviderApiPlacement(input)) return prepareHeartbeatWorkspaceLocked(db, input);
