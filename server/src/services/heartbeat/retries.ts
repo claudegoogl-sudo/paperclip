@@ -423,13 +423,21 @@ function isRetryableInteractionContinuationInfrastructureFailure(
   );
 }
 
+// A retry whose source run never reached provider work (bootstrap recovery:
+// catalog refusal, lost controller before dispatch) spent nothing, so it keeps
+// the short upstream delays instead of the fork's long transient backoff.
+export const NO_PROVIDER_WORK_RETRY_DELAYS_MS = [30_000, 60_000] as const;
+
 export function computeBoundedTransientHeartbeatRetrySchedule(
   attempt: number,
   now = new Date(),
   random: () => number = Math.random,
+  noProviderWork = false,
 ) {
   if (!Number.isInteger(attempt) || attempt <= 0) return null;
-  const baseDelayMs = BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS[attempt - 1];
+  const delays: readonly number[] = noProviderWork
+    ? NO_PROVIDER_WORK_RETRY_DELAYS_MS : BOUNDED_TRANSIENT_HEARTBEAT_RETRY_DELAYS_MS;
+  const baseDelayMs = delays[Math.min(attempt, delays.length) - 1];
   if (typeof baseDelayMs !== "number") return null;
   const sample = Math.min(1, Math.max(0, random()));
   const jitterMultiplier = 1 + (sample * 2 - 1) * 0.25;
@@ -610,6 +618,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     }
     const now = opts?.now ?? new Date();
     const preparationRecovery = parseObject(run.resultJson?.executionRecovery);
+    const noProviderWork = preparationRecovery.kind === "bootstrap" && preparationRecovery.providerWorkStarted === false;
     const interruptedPreparation = ["interrupted", "failed"].includes(run.status) &&
       preparationRecovery.kind === "bootstrap" && preparationRecovery.providerWorkStarted === false
       && (run.status === "interrupted" || await isInterruptedNativePreparation(db, run));
@@ -652,13 +661,14 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             ? (() => {
               // Later lane attempts keep the longest transient delay.
               const schedule = computeBoundedTransientHeartbeatRetrySchedule(
-                Math.min(nextAttempt, BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS), now, opts?.random);
+                Math.min(nextAttempt, BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS), now, opts?.random, noProviderWork);
               return schedule ? { ...schedule, attempt: nextAttempt } : null;
             })()
             : computeBoundedTransientHeartbeatRetrySchedule(
               nextAttempt,
               now,
               opts?.random,
+              noProviderWork,
             )
           : null;
     const transientRecovery =
