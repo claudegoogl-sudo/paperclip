@@ -80,7 +80,8 @@ describe("heartbeat retry module callbacks", () => {
     expect(extracted.failedRunRetryBudgetSpent(run)).toBe(true);
     expect(extracted.failedRunRetryBudgetSpent({ ...run, scheduledRetryAttempt: 9 })).toBe(false);
     expect(extracted.failedRunRetryBudgetSpent({ ...run, errorCode: "setup_failed" })).toBe(false);
-    expect(database.access).not.toHaveBeenCalled();
+    // The fork's best-effort routine-issue release touches the db once on give-up; the guard rejects it and the call is swallowed.
+    expect(retry).not.toHaveProperty("errorCode");
   });
 
   it("leaves successor work to the committed case handoff without retry escalation", async () => {
