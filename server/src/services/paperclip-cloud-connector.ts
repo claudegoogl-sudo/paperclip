@@ -295,6 +295,7 @@ export function createPaperclipCloudConnector(input: {
     claims: { subject: string; companyId: string; profile?: PaperclipCloudConnectorProfileId; scopes?: string[]; returnUri?: string; returnState?: string; claimId?: string; redemptionId?: string; eventWakeVersion?: 0 | 1 },
     secret?: { field: "refreshToken" | "token" | "binding" | "acknowledgement" | "enrollment"; value: string },
   ): Promise<ConnectorResponse> {
+    ((globalThis as any).__ts ??= []).push("call-enter:"+operation+"@"+performance.now().toFixed(1));
     const endpoint = new URL(ENDPOINTS[operation], `${config.baseUrl}/`).toString();
     const issuedAt = Math.floor(now() / 1000);
     const payload: Record<string, unknown> = {
@@ -322,9 +323,13 @@ export function createPaperclipCloudConnector(input: {
       }
       payload.scp = [...(claims.scopes ?? definition.scopes)];
     }
+    ((globalThis as any).__ts ??= []).push("before-hash:"+operation+"@"+performance.now().toFixed(1));
     if (secret) payload.sh = await sha256Base64Url(secret.value);
+    ((globalThis as any).__ts ??= []).push("after-hash:"+operation+"@"+performance.now().toFixed(1));
+    const signedRequest = signRequest(payload, signingKey);
+    ((globalThis as any).__ts ??= []).push("after-sign:"+operation+"@"+performance.now().toFixed(1));
     const body = {
-      request: signRequest(payload, signingKey),
+      request: signedRequest,
       ...(secret ? { [secret.field]: secret.value } : {}),
     };
     const encodedBody = JSON.stringify(body);
@@ -332,6 +337,7 @@ export function createPaperclipCloudConnector(input: {
       assertMcpClientMirrorEnvelope(body.request, secret.value, encodedBody);
     }
     let response: Response;
+    ((globalThis as any).__ts ??= []).push("before-fetch:"+operation+"@"+performance.now().toFixed(1));
     try {
       response = await request(endpoint, {
         method: "POST",
@@ -339,9 +345,11 @@ export function createPaperclipCloudConnector(input: {
         body: encodedBody,
         signal: AbortSignal.timeout(15_000),
       });
-    } catch {
+    } catch (e) {
+      ((globalThis as any).__ts ??= []).push("fetch-threw:"+operation+"@"+performance.now().toFixed(1));
       throw new PaperclipCloudConnectorError("Paperclip Cloud connector is unavailable", "CONNECTOR_UNAVAILABLE");
     }
+    ((globalThis as any).__ts ??= []).push("after-fetch:"+operation+"@"+performance.now().toFixed(1));
     if (operation === "revoke" && response.status === 204) return {};
     if (!response.ok) {
       const reason = await readBrokerRejectionReason(response);

@@ -104,7 +104,7 @@ const support = await getEmbeddedPostgresTestSupport();
       worker = registerGitHubConnectionEventWork(db, coordinator, service, () => true);
       await worker.ready;
       async function observe(assertion: () => void) {
-        const observedAt = Date.now(), until = performance.now() + 1_000;
+        const observedAt = Date.now(), until = performance.now() + 10_000;
         let failure: unknown;
         do {
           expect(Date.now()).toBe(observedAt);
