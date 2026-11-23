@@ -88,6 +88,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(wallElapsedMs).toBeGreaterThanOrEqual(90_000);
       expect(real.now - before.now).toBeGreaterThanOrEqual(89_000);
       expect(real.idle.active).toBe(0);
+      if (server.proxy.queries.length !== queryCount) console.error('PROBE13220 ' + JSON.stringify(server.proxy.queries.slice(queryCount).map((q: any) => JSON.stringify(q).slice(0, 400))));
       expect(server.proxy.queries.length).toBe(queryCount);
       expect(real.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(real.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
