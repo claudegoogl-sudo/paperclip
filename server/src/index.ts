@@ -2216,7 +2216,14 @@ async function startServerWithDatabaseTeardown(
   // Deliberately NOT inside the `heartbeatSchedulerEnabled` block above, and not
   // subject to heartbeat suppression: a security-posture check that silently
   // stops running when an unrelated scheduling flag is off is failure-open.
-  startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+  // Test-only switch, set solely by the maintenance quiet-window harness. Default
+  // (unset) keeps both loops on. Follow-up: run them on the maintenance clock.
+  const alwaysOnLoopsDisabledForTest = process.env.PAPERCLIP_TEST_DISABLE_ALWAYS_ON_LOOPS === "1";
+  if (alwaysOnLoopsDisabledForTest) {
+    logger.warn("PAPERCLIP_TEST_DISABLE_ALWAYS_ON_LOOPS=1: egress posture sweep and task_bridge renewer are DISABLED (test harness only)");
+  } else {
+    startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+  }
 
   // Same reasoning as the posture sweep above: the server-internal task_bridge
   // key auto-renewer is a continuity loop that must not silently stop when
@@ -2224,7 +2231,7 @@ async function startServerWithDatabaseTeardown(
   // server process, registers no route, and only ever mints for bindings an
   // operator explicitly opted in via the board-gated policy route
   // (default-deny: a NULL policy is never touched, even at expiry).
-  startTaskBridgeRenewalSweep(db as any);
+  if (!alwaysOnLoopsDisabledForTest) startTaskBridgeRenewalSweep(db as any);
 
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
