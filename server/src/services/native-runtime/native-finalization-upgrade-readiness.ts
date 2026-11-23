@@ -55,8 +55,9 @@ export async function readNativeFinalizationUpgradeReadiness(db: Db, input: {
       && coordinator.leaseExpiresAt.getTime() > Date.now() + input.supportedOutageMs) return (((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret4'), false);
     const profile = run.runnerProfileJson;
     const reference = remoteWorkspaceRunReferenceSchema.safeParse(profile?.remoteWorkspace);
-    if (!reference.success || profile.nativeWorkspaceSync === true
-      || !nativeWorkspaceFinalizationOwnerCanUpgrade(profile, input.controller, worker)) return (((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' ret5'), false);
+    if (!reference.success) return (((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' r5a'), false);
+    if (profile.nativeWorkspaceSync === true) return (((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' r5b'), false);
+    if (!nativeWorkspaceFinalizationOwnerCanUpgrade(profile, input.controller, worker)) return (((globalThis as any).__ret = ((globalThis as any).__ret ?? '') + ' r5c'+JSON.stringify([!!worker, Object.keys(profile?.nativeWorkspaceFinalizationOwner??{}).join(','), input.controller.bootId===(profile as any)?.nativeWorkspaceFinalizationOwner?.controllerBootId, input.controller.pid===(profile as any)?.nativeWorkspaceFinalizationOwner?.pid, String((profile as any)?.nativeWorkspaceFinalizationOwner?.hostname)===require('node:os').hostname()])+''), false);
     const remote = reference.data;
     const [workspace] = await tx.select({ id: executionWorkspaces.id, providerType: executionWorkspaces.providerType,
       metadata: sql<Record<string, unknown>>`jsonb_build_object('remoteWorkspace', ${executionWorkspaces.metadata}->'remoteWorkspace')` })
