@@ -170,7 +170,7 @@ describe("post-result upgrade readiness", () => {
       expect(await db.execute(sql`select 1 as value`)).toMatchObject([{ value: 1 }]);
       expect(await report).toMatchObject({ ready: false, activeRuns: 3, recoverableRuns: 0, blockingRuns: 3 });
       expect(performance.now() - started).toBeLessThan(5_000);
-      expect(await probeDb.execute(sql`show statement_timeout`)).toMatchObject([{ statement_timeout: "0" }]);
+      expect(await probeDb.execute(sql`show statement_timeout`)).toEqual(await db.execute(sql`show statement_timeout`)); // readiness must leave the pool default untouched (fork default is 1min, not 0)
     } finally {
       await lock.unsafe("rollback"); lock.release(); await probeDb.$client.end();
     }
