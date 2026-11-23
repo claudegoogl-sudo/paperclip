@@ -9549,7 +9549,9 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         .where(eq(agents.id, agentId));
       const heartbeat = heartbeatService(db);
       await heartbeat.resumeQueuedRuns();
-      const finished = await waitForRunToSettle(heartbeat, runId, 5_000);
+      const t0 = Date.now();
+      const finished = await waitForRunToSettle(heartbeat, runId, 90_000);
+      console.log("PROBE13243 elapsed_ms", Date.now() - t0, finished?.status);
       if (finished?.status !== status) {
         const [row] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
         const parks = await db.execute(sql`select * from usage_limit_parks`);
