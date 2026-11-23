@@ -2855,7 +2855,12 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
       }
 
       if (!retriedRun) {
-        await releaseIssueExecutionAndPromote(finalizedRun);
+        // A spent failure budget ends the automatic chain: an immediate
+        // continuation run would carry no retry accounting and restart it.
+        await releaseIssueExecutionAndPromote(
+          finalizedRun,
+          failedRunRetryBudgetSpent(run) ? { suppressImmediateRecovery: true } : undefined,
+        );
       }
 
       await appendRunEvent(finalizedRun, {
