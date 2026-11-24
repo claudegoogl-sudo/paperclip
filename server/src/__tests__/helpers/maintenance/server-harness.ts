@@ -171,7 +171,7 @@ export async function startMaintenanceServer(databaseUrl: string, options: Maint
           PAPERCLIP_SKILL_DEFAULT_CADENCE_GUARD_ORIGINS: JSON.stringify([options.githubOrigin, options.cloud?.s3Origin].filter(Boolean)),
         } : {}),
         // The fork egress-posture sweep is intended to run in production; the harness asserts exact idle query counts.
-        PAPERCLIP_EGRESS_POSTURE_SWEEP: "off",
+        PAPERCLIP_EGRESS_POSTURE_SWEEP: "off", PAPERCLIP_TASK_BRIDGE_RENEWAL_SWEEP: "off",
         PATH: process.env.PATH, TMPDIR: process.env.TMPDIR, NODE_ENV: "production",
         PAPERCLIP_HOME: directory, PAPERCLIP_CONFIG: configPath, PAPERCLIP_INSTANCE_ID: "maintenance-test",
         PAPERCLIP_RUNNER_STATE_DIR: path.join(directory, "durable-sessions"),

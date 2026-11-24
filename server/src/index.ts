@@ -217,7 +217,7 @@ import {
   egressPostureSweepEnabled,
   startEgressPostureSweep,
 } from "./services/egress-posture.js";
-import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
+import { startTaskBridgeRenewalSweep, taskBridgeRenewalSweepEnabled } from "./services/task-bridge-renewal.js";
 import {
   buildRuntimeApiCandidateUrls,
   chooseAgentApiUrl,
@@ -2227,7 +2227,8 @@ async function startServerWithDatabaseTeardown(
   // server process, registers no route, and only ever mints for bindings an
   // operator explicitly opted in via the board-gated policy route
   // (default-deny: a NULL policy is never touched, even at expiry).
-  startTaskBridgeRenewalSweep(db as any);
+  // Env-only knob (PAPERCLIP_TASK_BRIDGE_RENEWAL_SWEEP=off) for the maintenance test harness; never wire to API/DB/config.
+  if (taskBridgeRenewalSweepEnabled()) startTaskBridgeRenewalSweep(db as any);
 
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
