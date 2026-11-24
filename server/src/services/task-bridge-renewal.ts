@@ -793,14 +793,6 @@ export async function runTaskBridgeRenewalSweep(
  * binding's pass) is MANDATORY before scaling out — two sweeps racing one
  * binding could double-mint and interleave version appends.
  */
-/**
- * Test-only switch, same contract as the egress posture knob: ON unless the process environment says
- * exactly `off`. Environment only; no API route, DB row or config document may set it.
- */
-export function taskBridgeRenewalSweepEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  return env.PAPERCLIP_TASK_BRIDGE_RENEWAL_SWEEP !== "off";
-}
-
 export function startTaskBridgeRenewalSweep(
   db: Db,
   intervalMs: number = TASK_BRIDGE_RENEWAL_SWEEP_INTERVAL_MS,

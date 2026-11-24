@@ -146,6 +146,7 @@ import {
   PLUGIN_WEBHOOK_DELIVERY_PRUNE_MAX_BATCHES,
   startPluginWebhookDeliveryRetention,
 } from "./services/plugin-webhook-delivery-retention.js";
+import { forkMaintenanceTimersEnabled } from "./services/fork-maintenance-timers.js";
 import { startBoardApiKeyAuthEventRetention } from "./services/board-api-key-auth-event-retention.js";
 import { drainHttpRequestWork } from "./middleware/idle-admission.js";
 import { initializeCloudRuntimeConfig } from "./services/cloud-runtime-config.js";
@@ -214,10 +215,9 @@ import { reapOrphanedMcpProcessesOnStartup } from "./services/mcp-orphan-reaper.
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import {
   EGRESS_POSTURE_SWEEP_INTERVAL_MS,
-  egressPostureSweepEnabled,
   startEgressPostureSweep,
 } from "./services/egress-posture.js";
-import { startTaskBridgeRenewalSweep, taskBridgeRenewalSweepEnabled } from "./services/task-bridge-renewal.js";
+import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
 import {
   buildRuntimeApiCandidateUrls,
   chooseAgentApiUrl,
@@ -2217,9 +2217,9 @@ async function startServerWithDatabaseTeardown(
   // Deliberately NOT inside the `heartbeatSchedulerEnabled` block above, and not
   // subject to heartbeat suppression: a security-posture check that silently
   // stops running when an unrelated scheduling flag is off is failure-open.
-  // Env-only knob (PAPERCLIP_EGRESS_POSTURE_SWEEP=off), used by the maintenance test harness to keep
+  // Env-only knob (PAPERCLIP_FORK_MAINTENANCE_TIMERS=off), used by the maintenance test harness to keep
   // its exact idle-query counts. Never wire it to an API, DB or config source.
-  if (egressPostureSweepEnabled()) startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+  if (forkMaintenanceTimersEnabled()) startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
 
   // Same reasoning as the posture sweep above: the server-internal task_bridge
   // key auto-renewer is a continuity loop that must not silently stop when
@@ -2227,8 +2227,8 @@ async function startServerWithDatabaseTeardown(
   // server process, registers no route, and only ever mints for bindings an
   // operator explicitly opted in via the board-gated policy route
   // (default-deny: a NULL policy is never touched, even at expiry).
-  // Env-only knob (PAPERCLIP_TASK_BRIDGE_RENEWAL_SWEEP=off) for the maintenance test harness; never wire to API/DB/config.
-  if (taskBridgeRenewalSweepEnabled()) startTaskBridgeRenewalSweep(db as any);
+  // Env-only knob (PAPERCLIP_FORK_MAINTENANCE_TIMERS=off) for the maintenance test harness; never wire to API/DB/config.
+  if (forkMaintenanceTimersEnabled()) startTaskBridgeRenewalSweep(db as any);
 
   if (config.databaseBackupEnabled) {
     const backupIntervalMs = config.databaseBackupIntervalMinutes * 60 * 1000;
@@ -2254,7 +2254,7 @@ async function startServerWithDatabaseTeardown(
   }
 
   // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
-  if (config.heartbeatSchedulerEnabled && config.runHistoryRetentionEnabled) {
+  if (forkMaintenanceTimersEnabled() && config.heartbeatSchedulerEnabled && config.runHistoryRetentionEnabled) {
     logger.info(
       {
         retentionDays: config.runHistoryRetentionDays,
@@ -2272,7 +2272,7 @@ async function startServerWithDatabaseTeardown(
   }
 
   // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
-  if (config.heartbeatSchedulerEnabled && config.pluginWebhookDeliveryRetentionEnabled) {
+  if (forkMaintenanceTimersEnabled() && config.heartbeatSchedulerEnabled && config.pluginWebhookDeliveryRetentionEnabled) {
     logger.info(
       {
         successRetentionDays: config.pluginWebhookDeliverySuccessRetentionDays,
@@ -2294,7 +2294,7 @@ async function startServerWithDatabaseTeardown(
   }
 
   // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
-  if (config.heartbeatSchedulerEnabled && config.boardApiKeyAuthEventRetentionEnabled) {
+  if (forkMaintenanceTimersEnabled() && config.heartbeatSchedulerEnabled && config.boardApiKeyAuthEventRetentionEnabled) {
     logger.info(
       {
         retentionDays: config.boardApiKeyAuthEventRetentionDays,
