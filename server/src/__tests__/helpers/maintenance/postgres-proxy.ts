@@ -102,6 +102,10 @@ export async function startMaintenancePostgresProxy(databaseUrl: string, capture
     get pending() { return [...observers].reduce((sum, observer) => sum + observer.pending, 0); },
     get starting() { return [...observers].filter(observer => !observer.ready).length; },
     async stop() {
+      { // PROBE-PLA-13220 (temporary)
+        const g = new Map<string, number>(); for (const q of queries) { const k = q.sql.replace(/\s+/g, " ").slice(0, 160); g.set(k, (g.get(k) ?? 0) + 1); }
+        console.error("PROBE13220 " + JSON.stringify([...g].sort((a, b) => b[1] - a[1]), null, 0));
+      }
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     },
