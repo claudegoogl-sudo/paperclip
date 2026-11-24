@@ -362,6 +362,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       }
       const after = await server.snapshot();
       expect(after.now - start).toBe(2 * 60 * 60_000);
+      expect(server.proxy.queries.slice(baseline).map(q => q.sql.slice(0,300)).join(' ||| ')).toBe('');
       expect(server.proxy.queries.length).toBe(baseline);
       expect(after.outgoingHttpRequests).toBe(0);
       expect(after.network.nonDatabaseConnections).toBe(0);
