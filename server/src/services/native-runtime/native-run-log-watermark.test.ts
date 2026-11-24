@@ -271,7 +271,8 @@ describe.skipIf(!support.supported)("native run log source watermarks", () => {
       expect(entry.payload.parts).toEqual(event.payload.parts);
       expect(entry.payload.image.source.data).toBe("[omitted base64 image data: 70000 chars]");
       expect(entry.payload.api_key).toBe("***REDACTED***");
-      expect(entry.payload.header).toBe("Authorization: ***REDACTED***");
+      expect(entry.payload.header).toBe("Authorization: Bearer ***REDACTED***");
+      expect(JSON.stringify(entry.payload)).not.toContain(canary);
     }
   });
 
