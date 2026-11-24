@@ -5770,21 +5770,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     it("explains the block with a working Retry once automatic retries are used up", async () => {
       const { companyId, agentId, issueId } = await seedQueuedIssueRunFixture();
-      const lease = failLeaseAcquisition(3);
+      const lease = failLeaseAcquisition(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS + 1);
       try {
         const heartbeat = heartbeatService(db);
         await heartbeat.resumeQueuedRuns();
         await heartbeat.drainActiveRunExecutions();
-        await promoteLatestScheduledRetry(heartbeat, agentId);
-        await promoteLatestScheduledRetry(heartbeat, agentId);
+        // The fork ladder allows 4 attempts, so promote every retry (original run + 4 retries) until the budget is spent.
+        for (let attempt = 1; attempt <= BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS; attempt += 1) {
+          await promoteLatestScheduledRetry(heartbeat, agentId);
+        }
 
         const exhausted = await runsFor(agentId);
         expect(exhausted.map(run => [run.status, run.errorCode])).toEqual([
-          ["failed", "environment_provider_unavailable"],
-          ["failed", "environment_provider_unavailable"],
-          ["failed", "environment_provider_unavailable"],
+          ...Array.from({ length: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS + 1 },
+            () => ["failed", "environment_provider_unavailable"]),
         ]);
-        expect(lease.acquisitions.refused).toBe(3);
+        expect(lease.acquisitions.refused).toBe(BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS + 1);
         expect(mockAdapterExecute).not.toHaveBeenCalled();
 
         const blocked = await waitForValue(async () => {
@@ -5795,7 +5796,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         // The blocked task names its cause, its next action, and a Retry.
         const presentation = await taskInterruptionPresentation(db, blocked!);
         expect(presentation).toMatchObject({ state: "failed", responsibility: "system", canRetry: true,
-          observedRunId: exhausted[2]!.id,
+          observedRunId: exhausted[exhausted.length - 1]!.id,
           providerFailure: { httpStatus: 502, phase: "startup", retryability: "transient" } });
         expect(presentation?.providerFailure?.message).toContain("temporarily unavailable");
         const notices = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));

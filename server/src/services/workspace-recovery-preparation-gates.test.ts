@@ -1,3 +1,4 @@
+import { BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS } from "./heartbeat/retries.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { subscribeDatabaseWork } from "@paperclipai/db/work-signals";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
@@ -62,7 +63,7 @@ describe("automatic retained workspace recovery", () => {
     if (gate === "wrong_snapshot") await db.update(heartbeatRuns).set({ runnerProfileJson: { ...source.runnerProfileJson,
       remoteWorkspace: { ...(source.runnerProfileJson!.remoteWorkspace as Record<string, unknown>), snapshotId: randomUUID() },
     } }).where(eq(heartbeatRuns.id, f.runId));
-    if (gate === "retry_exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, f.runId));
+    if (gate === "retry_exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS }).where(eq(heartbeatRuns.id, f.runId));
     if (gate === "human_reblock") await db.update(issues).set({ statusVersion: 3 }).where(eq(issues.id, f.issueId));
     if (gate === "paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, source.agentId));
     if (gate === "reassigned") await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "board" }).where(eq(issues.id, f.issueId));
@@ -82,7 +83,7 @@ describe("automatic retained workspace recovery", () => {
     const f = await interruptedRemotePreparation("process_lost"), withheld = await withheldPreparationRetry(f);
     if (gate === "provider_evidence") await db.insert(heartbeatRunEvents).values({ companyId: f.companyId,
       runId: withheld.id, agentId: withheld.agentId, seq: 1, eventType: "tool.execution.started", stream: "system" });
-    if (gate === "exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, withheld.id));
+    if (gate === "exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS }).where(eq(heartbeatRuns.id, withheld.id));
     await recoverRetainedWorkspace(f.input);
     const heartbeat = heartbeatService(db);
     await Promise.all([heartbeat.resumeRemoteStopComments(await run(f.runId)),
@@ -189,7 +190,7 @@ describe("automatic retained workspace recovery", () => {
         await db.update(environmentLeases).set({ metadata: { ...lease.metadata, remoteExecutionTermination: null } })
           .where(eq(environmentLeases.id, f.lease.id));
       }
-      if (gate === "retry_exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: 2 }).where(eq(heartbeatRuns.id, f.runId));
+      if (gate === "retry_exhausted") await db.update(heartbeatRuns).set({ scheduledRetryAttempt: BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS }).where(eq(heartbeatRuns.id, f.runId));
       if (gate === "human_reblock") await db.update(issues).set({ statusVersion: 3 }).where(eq(issues.id, f.issueId));
       if (gate === "paused") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, source.agentId));
       if (gate === "reassigned") await db.update(issues).set({ assigneeAgentId: null, assigneeUserId: "board" }).where(eq(issues.id, f.issueId));

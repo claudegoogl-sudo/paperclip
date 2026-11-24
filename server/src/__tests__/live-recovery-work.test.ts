@@ -284,6 +284,14 @@ describe("residual recovery production matrix", () => {
     expect((await db.select().from(heartbeatRuns).where(sql`${heartbeatRuns.id} <> ${run.id}`)).every(row => row.status === "failed")).toBe(true);
     await quiet();
   });
+  // The fork retry ladder waits 2 minutes before the first retry, so these tests let the backoff elapse
+  // (as it would in real time) instead of waiting for it; the retry still has to be created and run.
+  async function promoteRetry() {
+    const due = new Date();
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: due }).where(eq(heartbeatRuns.status, "scheduled_retry"));
+    await heartbeat.promoteDueScheduledRetries(due);
+    await heartbeat.resumeQueuedRuns();
+  }
   it("preserves a fresh foreign controller until exact expiry and admits one process retry across two owners", async () => {
     const f = await fixture(), expiry = new Date(Date.now() + 3_000);
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id, status: "running",
@@ -298,6 +306,7 @@ describe("residual recovery production matrix", () => {
     await vi.waitFor(async () => {
       const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
       expect(retries).toHaveLength(1); retryId = retries[0].id;
+      await promoteRetry();
       await heartbeat.drainActiveRunExecutions(); await other.drainActiveRunExecutions();
       expect((await getRun(retryId)).status).toBe("succeeded");
       expect((await getRun(retryId)).stdoutExcerpt).toContain("live-recovery-proof");
@@ -320,6 +329,7 @@ describe("residual recovery production matrix", () => {
     await vi.waitFor(async () => {
       const retries = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, run.id));
       expect(retries).toHaveLength(1);
+      await promoteRetry();
       await heartbeat.drainActiveRunExecutions();
       expect((await getRun(retries[0].id)).status).toBe("succeeded");
     }, { timeout: 45_000 });
