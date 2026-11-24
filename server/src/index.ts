@@ -2220,7 +2220,7 @@ async function startServerWithDatabaseTeardown(
   // (unset) keeps both loops on. Follow-up: run them on the maintenance clock.
   const alwaysOnLoopsDisabledForTest = process.env.PAPERCLIP_TEST_DISABLE_ALWAYS_ON_LOOPS === "1";
   if (alwaysOnLoopsDisabledForTest) {
-    logger.warn("PAPERCLIP_TEST_DISABLE_ALWAYS_ON_LOOPS=1: egress posture sweep and task_bridge renewer are DISABLED (test harness only)");
+    logger.warn("PAPERCLIP_TEST_DISABLE_ALWAYS_ON_LOOPS=1: egress posture sweep, task_bridge renewer and fork retention sweeps are DISABLED (test harness only)");
   } else {
     startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
   }
@@ -2257,7 +2257,7 @@ async function startServerWithDatabaseTeardown(
   }
 
   // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
-  if (config.heartbeatSchedulerEnabled && config.runHistoryRetentionEnabled) {
+  if (config.heartbeatSchedulerEnabled && !alwaysOnLoopsDisabledForTest && config.runHistoryRetentionEnabled) {
     logger.info(
       {
         retentionDays: config.runHistoryRetentionDays,
@@ -2275,7 +2275,7 @@ async function startServerWithDatabaseTeardown(
   }
 
   // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
-  if (config.heartbeatSchedulerEnabled && config.pluginWebhookDeliveryRetentionEnabled) {
+  if (config.heartbeatSchedulerEnabled && !alwaysOnLoopsDisabledForTest && config.pluginWebhookDeliveryRetentionEnabled) {
     logger.info(
       {
         successRetentionDays: config.pluginWebhookDeliverySuccessRetentionDays,
@@ -2297,7 +2297,7 @@ async function startServerWithDatabaseTeardown(
   }
 
   // Quiet boot contract: fork retention sweeps stay off when heartbeat scheduling is disabled.
-  if (config.heartbeatSchedulerEnabled && config.boardApiKeyAuthEventRetentionEnabled) {
+  if (config.heartbeatSchedulerEnabled && !alwaysOnLoopsDisabledForTest && config.boardApiKeyAuthEventRetentionEnabled) {
     logger.info(
       {
         retentionDays: config.boardApiKeyAuthEventRetentionDays,
