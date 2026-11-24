@@ -414,9 +414,9 @@ function createDbClient(url: string, resolved: DatabaseClientOptions, owner?: ob
     ...driverOptions,
     // A URL `options=-c statement_timeout=...` is the caller's explicit
     // bound; the pool default must not override it as a startup parameter.
-    connection: urlSetsStatementTimeout(url)
+    connection: (urlSetsStatementTimeout(url)
       ? { ...driverConnection }
-      : { ...driverConnection, statement_timeout: statementTimeoutMs },
+      : { ...driverConnection, statement_timeout: statementTimeoutMs }) as NonNullable<typeof driverOptions.connection>,
     ...sqlOptions,
   });
   if (resolved.prepare === true) installPreparedQueries(sql);
