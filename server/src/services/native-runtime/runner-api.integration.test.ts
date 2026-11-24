@@ -260,9 +260,13 @@ else if(m.id!==undefined) send({id:m.id,result:{}});
         operationId: "POST /api/companies/{companyId}/routines", body: {
           title: "Native run owned routine", assigneeAgentId: fixture.agentId, status: "paused",
           ...(fallback === "unrelated parent" ? { parentIssueId: fixture.blockerId } : {}),
-          actorResponsibleUserId: ownerUserId, responsibleUserId: ownerUserId, createdByUserId: ownerUserId,
         },
       } };
+      // The fork's createRoutineSchema is strict: client-supplied attribution keys are rejected, never honoured.
+      const spoofed = await fixture.authority.execute({ ...call, callId: "spoofed-routine", arguments: {
+        ...call.arguments, body: { ...(call.arguments.body as object), responsibleUserId: ownerUserId, createdByUserId: ownerUserId },
+      } });
+      expect(spoofed).toMatchObject({ ok: false, status: 400 });
       const created = await fixture.authority.execute(call);
       expect(created).toMatchObject({ ok: true, status: 201 });
       expect(await new PaperclipRunnerToolAuthority(server.db, fixture).execute(call)).toEqual(created);
