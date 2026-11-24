@@ -88,6 +88,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       expect(wallElapsedMs).toBeGreaterThanOrEqual(90_000);
       expect(real.now - before.now).toBeGreaterThanOrEqual(89_000);
       expect(real.idle.active).toBe(0);
+      { const g = new Map<string, number>(); for (const q of server.proxy.queries.slice(queryCount)) { const k = q.sql.replace(/\s+/g, " ").slice(0, 300); g.set(k, (g.get(k) ?? 0) + 1); } console.error("PROBE13220DELTA " + JSON.stringify([...g])); } // PROBE13220
       expect(server.proxy.queries.length).toBe(queryCount);
       expect(real.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(real.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
@@ -103,6 +104,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
       const after = await server.snapshot();
       expect(after.now - real.now).toBe(2 * 60 * 60_000);
       expect(after.idle.active).toBe(0);
+      { const g = new Map<string, number>(); for (const q of server.proxy.queries.slice(queryCount)) { const k = q.sql.replace(/\s+/g, " ").slice(0, 300); g.set(k, (g.get(k) ?? 0) + 1); } console.error("PROBE13220DELTA " + JSON.stringify([...g])); } // PROBE13220
       expect(server.proxy.queries.length).toBe(queryCount);
       expect(after.outgoingHttpRequests).toBe(before.outgoingHttpRequests);
       expect(after.network.nonDatabaseConnections).toBe(before.network.nonDatabaseConnections);
@@ -887,6 +889,7 @@ describeDatabase("assembled maintenance server production wiring", () => {
         for (let step = 0; step < 240; step++) { await server.advance(30_000); await server.settled(10, 1); }
         const health = await fetch(`http://127.0.0.1:${server.port}/api/health`, { signal: AbortSignal.timeout(10_000) });
         expect(health.status).toBe(200); expect(await health.json()).toMatchObject({ warmStandby: true });
+      { const g = new Map<string, number>(); for (const q of server.proxy.queries.slice(before)) { const k = q.sql.replace(/\s+/g, " ").slice(0, 300); g.set(k, (g.get(k) ?? 0) + 1); } console.error("PROBE13220DELTA " + JSON.stringify([...g])); } // PROBE13220
         expect(server.proxy.queries.length).toBe(before);
         expect(storageRequests).toEqual([]);
         expect((await server.snapshot()).network.nonDatabaseConnections).toBe(0);
