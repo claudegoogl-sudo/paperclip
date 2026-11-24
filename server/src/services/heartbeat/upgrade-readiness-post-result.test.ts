@@ -162,7 +162,8 @@ describe("post-result upgrade readiness", () => {
     // Fork default session timeout is 1min; this test proves the probe's own SQL budget, so disable it.
     vi.stubEnv("PAPERCLIP_DB_STATEMENT_TIMEOUT_MS", "0");
     const probeDb = createDb(database.connectionString, { maxConnections: 1 });
-    vi.unstubAllEnvs();
+    // Drop only the timeout stub: unstubAllEnvs() would also wipe the suite-level cloud/railway stubs later tests need.
+    delete process.env.PAPERCLIP_DB_STATEMENT_TIMEOUT_MS;
     const lock = await db.$client.reserve();
     try {
       await lock.unsafe("begin");
