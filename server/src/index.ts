@@ -214,6 +214,7 @@ import { reapOrphanedMcpProcessesOnStartup } from "./services/mcp-orphan-reaper.
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
 import {
   EGRESS_POSTURE_SWEEP_INTERVAL_MS,
+  egressPostureSweepEnabled,
   startEgressPostureSweep,
 } from "./services/egress-posture.js";
 import { startTaskBridgeRenewalSweep } from "./services/task-bridge-renewal.js";
@@ -2216,7 +2217,9 @@ async function startServerWithDatabaseTeardown(
   // Deliberately NOT inside the `heartbeatSchedulerEnabled` block above, and not
   // subject to heartbeat suppression: a security-posture check that silently
   // stops running when an unrelated scheduling flag is off is failure-open.
-  startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
+  // Env-only knob (PAPERCLIP_EGRESS_POSTURE_SWEEP=off), used by the maintenance test harness to keep
+  // its exact idle-query counts. Never wire it to an API, DB or config source.
+  if (egressPostureSweepEnabled()) startEgressPostureSweep(db as any, EGRESS_POSTURE_SWEEP_INTERVAL_MS);
 
   // Same reasoning as the posture sweep above: the server-internal task_bridge
   // key auto-renewer is a continuity loop that must not silently stop when

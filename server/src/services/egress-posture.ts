@@ -225,6 +225,15 @@ export async function sweepDenyAllEgressBindings(
   return { scanned: candidates.length, announced: emitted };
 }
 
+/**
+ * Test-only switch. The sweep is a security posture check, so it is ON unless the process
+ * environment says exactly `off`. It is read from the environment only: no API route, DB row
+ * or config document may set it, so no tenant or operator surface can silence the check.
+ */
+export function egressPostureSweepEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.PAPERCLIP_EGRESS_POSTURE_SWEEP !== "off";
+}
+
 export function startEgressPostureSweep(db: Db, intervalMs: number): NodeJS.Timeout {
   const run = () => {
     void sweepDenyAllEgressBindings(db)
