@@ -276,7 +276,7 @@ postgresTests("upgrade readiness persisted execution evidence", () => {
       expect(performance.now() - started).toBeGreaterThanOrEqual(1_800);
       expect(performance.now() - started).toBeLessThan(5_000);
       // maxConnections=1 means this cannot pass if the cancelled transaction keeps its connection.
-      expect(await probeDb.execute(sql`show statement_timeout`)).toMatchObject([{ statement_timeout: "0" }]);
+      expect(await probeDb.execute(sql`show statement_timeout`)).toEqual(await db.execute(sql`show statement_timeout`)); // pool default untouched (fork default 1min, not 0)
       expect(await probeDb.execute(sql`select 1 as value`)).toMatchObject([{ value: 1 }]);
     } finally {
       await lock.unsafe("rollback"); lock.release(); await probeDb.$client.end();
