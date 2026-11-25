@@ -284,6 +284,7 @@ vi.mock("../realtime/live-events-ws.js", () => ({
 }));
 
 vi.mock("../services/index.js", () => ({
+  createManagedEnvironmentRecovery: vi.fn(() => ({ stop: vi.fn(async () => undefined) })),
   backfillLegacyToolOAuthTokens: vi.fn(async () => ({
     scannedConnections: 0,
     migratedConnections: 0,

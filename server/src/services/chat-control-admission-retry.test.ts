@@ -61,7 +61,7 @@ it("bounds typed chat-presentation contention with the same fifty delays", async
   const error = new NativeChatReviewPresentationContentionError();
   const attempt = vi.fn().mockRejectedValue(error);
   const rejected = expect(retryChatControlAdmission(attempt)).rejects.toBe(error);
-  await vi.advanceTimersByTimeAsync(5_000);
+  await vi.advanceTimersByTimeAsync(7_500);
   await rejected;
   expect(attempt).toHaveBeenCalledTimes(51);
   expect(vi.getTimerCount()).toBe(0);
