@@ -956,6 +956,7 @@ const recoveryFakeCodex = resolve(
         ),
         previousDriverSessionId: checkpoint.sessionId,
       });
+      console.error("DBG13431 resume root", root, JSON.stringify(await readdir(root).catch(String)), JSON.stringify(continuity));
       const [epoch] = await readdir(join(root, "authority-epochs"));
       const digest = (value: Buffer) =>
         createHash("sha256").update(value).digest("hex");

@@ -661,7 +661,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
-  afterEach(async () => {
+  afterEach(async (ctx) => {
+    if (ctx.task.result?.state === "fail") {
+      try {
+        const rows = await db.select().from(heartbeatRuns);
+        const evs = await db.select().from(heartbeatRunEvents);
+        console.error("DBG13431", ctx.task.name, JSON.stringify({
+          runs: rows.map(r => ({ id: r.id, st: r.status, ec: r.errorCode, er: String(r.error ?? "").slice(0, 300), rm: r.runtimeMode, rj: JSON.stringify(r.resultJson ?? null).slice(0, 500), cs: JSON.stringify(r.contextSnapshot ?? null).slice(0, 300), retryOf: r.retryOfRunId })),
+          events: evs.slice(-25).map(e => ({ t: e.eventType, m: String(e.message ?? "").slice(0, 200), p: JSON.stringify(e.payload ?? null).slice(0, 200) })),
+        }));
+      } catch (e) { console.error("DBG13431 failed", String(e)); }
+    }
     vi.clearAllMocks();
     // A recovery policy can stop before adapter dispatch; do not leak an
     // unused one-shot failure into the next test's otherwise healthy run.
