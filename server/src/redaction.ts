@@ -1,21 +1,14 @@
 import { redactCommandText } from "@paperclipai/adapter-utils";
-import { redactRegisteredSecretValues } from "./run-secret-registry.js";
-import { GITHUB_FINE_GRAINED_PAT_RE } from "./secret-patterns.js";
 import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclipai/adapter-utils/command-redaction";
 
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
 const SECRET_FIELD_NAME_START = String.raw`(?<![A-Za-z0-9_-])`;
 
-// Fork behavior: unanchored substring match (passwordHash, tokenHash, secretId, apiKeyId stay redacted).
-// Count-shaped audit fields are exempted separately via isAuditCountField.
-const SECRET_PAYLOAD_KEY_RE = new RegExp(SECRET_FIELD_NAME_PATTERN, "i");
+const SECRET_PAYLOAD_KEY_RE = new RegExp(`^(?:${SECRET_FIELD_NAME_PATTERN})(?:_plain|_ref)?$`, "i");
 // Authorization reasons are policy decision codes, not credentials. They must
 // remain visible in audit receipts even though the field name contains
 // "authorization". JWT-shaped values are still caught by the value guard below.
-// authorizationAt is an audit timestamp, not a credential.
-// authorizingUserId is a user id (audit attribution), not a credential.
-// boardApiKeyId is a key row UUID used to correlate create/revoke audit rows; never key material.
-const AUDIT_REASON_PAYLOAD_KEY_RE = /^(?:authorizationReason|authorizationAt|authorizing(?:User|Person)Id|boardApiKeyId)$/;
+const AUDIT_REASON_PAYLOAD_KEY_RE = /^authorizationReason$/;
 const AUDIT_SURFACE_PAYLOAD_KEY_RE = /^surface$/;
 /**
  * Cleanup counts on a connection-removal receipt (PAP-17119). Their names name
@@ -42,14 +35,7 @@ const AUDIT_COUNT_PAYLOAD_KEYS = new Set([
   "postTokens",
 ]);
 
-// Gateway audit list of header NAMES (never values) that carried credentials.
-// Passes only as an array of plain HTTP header-name tokens.
-const HEADER_NAME_TOKEN_RE = /^[A-Za-z0-9-]{1,128}$/;
-
 function isAuditCountField(key: string, value: unknown): boolean {
-  if (key === "credentialHeaderNames") {
-    return Array.isArray(value) && value.every((v) => typeof v === "string" && HEADER_NAME_TOKEN_RE.test(v));
-  }
   return (
     AUDIT_COUNT_PAYLOAD_KEYS.has(key) &&
     typeof value === "number" &&
@@ -59,16 +45,9 @@ function isAuditCountField(key: string, value: unknown): boolean {
 const COMMAND_PAYLOAD_KEY_RE =
   /(^command$|^cmd$|command[-_]?line|resolved[-_]?command|PAPERCLIP_RESOLVED_COMMAND)/i;
 const COMMAND_ARGS_PAYLOAD_KEY_RE = /^(commandArgs|command_?args|argv)$/i;
-const JWT_VALUE_RE =
-  /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)?$/;
 // Public protocol discriminators are retained verbatim. A dotted identifier
 // alone is not a credential; JWT detection requires an encoded JSON header.
 const PAPERCLIP_SCHEMA_FIELDS = new Set(["schema", "runtimeSchema"]);
-// Receipt schema ids are public text wherever they appear (not only in schema fields).
-const PUBLIC_RECEIPT_TEXT_IDS = new Set([
-  "paperclip.semantic_tool_receipt.v1",
-  "paperclip.semantic_tool_receipt.v2",
-]);
 export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.artifact.generated.v1",
   "paperclip.artifact.viewed.v1",
@@ -108,8 +87,6 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.model.verification.v1",
   "paperclip.native-cancellation.v1",
   "paperclip.native-execution-input.v1",
-  "paperclip.semantic_tool_receipt.v1",
-  "paperclip.semantic_tool_receipt.v2",
   "paperclip.native-execution-input.v2",
   "paperclip.native-execution-input.v3",
   "paperclip.native-execution-input.v4",
@@ -396,17 +373,6 @@ const CLI_SECRET_FLAG_RE = new RegExp(
   String.raw`^-{1,2}${SECRET_FIELD_NAME_PATTERN}$`,
   "i",
 );
-// Dotted semver values (e.g. "0.2.24") match the three-segment JWT shape.
-// Skip the JWT value check for these plugin-version keys only; key-name
-// redaction still applies.
-const VERSION_STRING_KEYS = new Set(["fromVersion", "toVersion"]);
-// Lifecycle phase names (e.g. "task.run.measured") are dotted lowercase identifiers, not JWTs.
-// Public PRP envelope discriminator; exact value only, under key "type" only.
-const PRP_EVENT_ENVELOPE_TYPE = "paperclip.prp.event";
-const PHASE_NAME_MAX_LENGTH = 64;
-const PHASE_NAME_SHAPE_RE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*){1,3}$/;
-const PHASE_NAME_VALUE_RE = { test: (v: string) => v.length <= PHASE_NAME_MAX_LENGTH && PHASE_NAME_SHAPE_RE.test(v) };
-const SEMVER_VALUE_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
   String.raw`((?:"|')?${SECRET_FIELD_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
     "`" +
@@ -436,24 +402,8 @@ const SECRET_TEXT_HINTS = [
   "ghu_",
   "ghs_",
   "ghr_",
-  // SECURITY-CRITICAL: Fine-grained PAT prefix. The classic `gh[pousr]_` covered above does not
-  // subsume it, so without this hint a lone `github_pat_…` short-circuits the
-  // gate below unredacted.
-  "github_pat_",
 ] as const;
 export const REDACTED_EVENT_VALUE = "***REDACTED***";
-
-// Global copy of the shared fine-grained PAT matcher (secret-patterns.ts is the
-// single source of truth). The shared patterns are authored without `g`; the
-// free-form text path replaces every occurrence, so a global copy is needed
-// here.
-const GITHUB_FINE_GRAINED_PAT_TEXT_RE = new RegExp(GITHUB_FINE_GRAINED_PAT_RE.source, "g");
-/**
- * Marker for value-exact redaction of a host-registered secret (e.g. a
- * `vault.read` plaintext). Distinct from {@link REDACTED_EVENT_VALUE} so a
- * value-exact hit is attributable in a persisted record.
- */
-export const REDACTED_VAULT_VALUE = "***REDACTED:vault***";
 
 function maybeContainsSecretText(input: string) {
   const lower = input.toLowerCase();
@@ -682,15 +632,6 @@ function authorizationCredentialRange(
 
   const scheme = /^(?:Bearer|Basic)\b/i.exec(input.slice(valueStart));
   if (!scheme) return null;
-  // An earlier scheme-preserving pass (the command-text Authorization shape)
-  // may already have replaced the credential with the redaction marker; do not
-  // re-match the marker and consume the scheme a second time.
-  {
-    const afterScheme = input.slice(
-      inlineWhitespaceEnd(input, valueStart + scheme[0].length),
-    );
-    if (afterScheme.startsWith(REDACTED_EVENT_VALUE)) return null;
-  }
   let credentialStart = inlineWhitespaceEnd(
     input,
     valueStart + scheme[0].length,
@@ -723,28 +664,6 @@ function authorizationCredentialRange(
       // consume them through the next structural or whitespace boundary.
       while (end < input.length && !/[\s,;}\]]/.test(input[end])) end += 1;
     }
-    // A quote that lands exactly ON the boundary is a closing delimiter
-    // (e.g. the JSON string quote around a diagnostic message), not part of
-    // the credential. Keep both the quote and the scheme word so the
-    // surrounding serialized document stays parseable; a bare unquoted
-    // credential (no boundary quote) consumes the scheme like the command
-    // text shape does not.
-    const boundaryQuote =
-      end > credentialStart &&
-      (input[end - 1] === '"' || input[end - 1] === "'") &&
-      (end >= input.length || /[\s,;}\]]/.test(input[end]));
-    if (boundaryQuote) end -= 1;
-    // `Bearer` keeps its scheme word (the command-text Authorization shape
-    // preserves it, and re-scrubbing a replaced marker must not eat the
-    // scheme twice); `Basic` consumes it, matching the diagnostic contract
-    // for bare Basic credentials.
-    const preserveScheme =
-      boundaryQuote || scheme[0].toLowerCase() === "bearer";
-    return {
-      start: preserveScheme ? credentialStart : valueStart,
-      end,
-      replacement: REDACTED_EVENT_VALUE,
-    };
   }
   return { start: valueStart, end, replacement: REDACTED_EVENT_VALUE };
 }
@@ -789,8 +708,6 @@ function redactStandaloneBearerCredentials(input: string): string {
     ) {
       continue;
     }
-
-    if (input.startsWith(REDACTED_EVENT_VALUE, credentialStart)) continue;
 
     let end: number;
     let replacement = REDACTED_EVENT_VALUE;
@@ -838,23 +755,19 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
-/**
- * SECURITY-CRITICAL: redactor applied to plain string leaves reached via
- * {@link sanitizeRecord}. The exported record path only value-exact scrubs
- * leaves (preserving its long-standing semantics); the structural path used by
- * {@link redactSensitiveText} applies the full free-form pipeline so serializing
- * a JSON document through redaction never weakens coverage.
- */
-type LeafTextRedactor = (text: string) => string;
-
-const valueExactLeafRedactor: LeafTextRedactor = (text) =>
-  redactRegisteredSecretValues(text, REDACTED_VAULT_VALUE);
-
-const freeFormLeafRedactor: LeafTextRedactor = (text) => redactSensitiveText(text);
-
-function sanitizeValue(value: unknown, leaf: LeafTextRedactor): unknown {
+function sanitizeValue(value: unknown): unknown {
   if (value === null || value === undefined) return value;
-  if (Array.isArray(value)) return value.map((entry) => sanitizeValue(entry, leaf));
+  // Adapter diagnostics are provider-controlled text. Secret-bearing header or
+  // command fragments can appear under otherwise innocuous keys such as
+  // `message`, `reason`, or inside arrays, so apply the text scanner at every
+  // string leaf after validated protocol discriminators have had a chance to
+  // opt in above in sanitizeRecord.
+  if (typeof value === "string") {
+    return looksLikeCredentialJwt(value) && !isPublicExecutorToolSelector(value)
+      ? REDACTED_EVENT_VALUE
+      : redactSensitiveText(value);
+  }
+  if (Array.isArray(value)) return value.map(sanitizeValue);
   if (isSecretRefBinding(value)) {
     const version = safeSecretVersion(value.version);
     return {
@@ -889,20 +802,10 @@ function sanitizeValue(value: unknown, leaf: LeafTextRedactor): unknown {
         : {}),
     };
   }
-  if (isPlainBinding(value)) return { type: "plain", value: sanitizeValue(value.value, leaf) };
-  // String leaves (e.g. a tool result's `data.value`) get value-exact scrubbing
-  // for any host-registered secret through the leaf redactor; a JWT-shaped
-  // value is always redacted outright.
-  if (typeof value === "string") {
-    return (JWT_VALUE_RE.test(value) || looksLikeCredentialJwt(value)) &&
-      !isPublicExecutorToolSelector(value) &&
-      !PUBLIC_RECEIPT_TEXT_IDS.has(value)
-      ? REDACTED_EVENT_VALUE
-      : leaf(value);
-  }
-
+  if (isPlainBinding(value))
+    return { type: "plain", value: sanitizeValue(value.value) };
   if (!isPlainObject(value)) return value;
-  return sanitizeRecordWithLeaf(value, leaf);
+  return sanitizeRecord(value);
 }
 
 const SECRET_REFERENCE_ID_RE =
@@ -956,14 +859,14 @@ function isPlainBinding(
   return value.type === "plain" && "value" in value;
 }
 
-function sanitizeCommandArgs(args: unknown[], leaf: LeafTextRedactor): unknown[] {
+function sanitizeCommandArgs(args: unknown[]): unknown[] {
   let redactNext = false;
   return args.map((arg) => {
     if (redactNext) {
       redactNext = false;
       return REDACTED_EVENT_VALUE;
     }
-    if (typeof arg !== "string") return sanitizeValue(arg, leaf);
+    if (typeof arg !== "string") return sanitizeValue(arg);
     if (CLI_SECRET_FLAG_RE.test(arg.trim())) {
       redactNext = true;
       return arg;
@@ -1000,24 +903,17 @@ function isPaperclipSchemaDiscriminator(
   );
 }
 
-function sanitizeRecordWithLeaf(
+export function sanitizeRecord(
   record: Record<string, unknown>,
-  leaf: LeafTextRedactor,
-
 ): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(record)) {
-    // The pre-structural text pipeline scrubbed secret bytes anywhere in the
-    // serialized line — key positions included. Apply the same leaf redactor
-    // to keys so structural redaction cannot smuggle a secret through as a
-    // key. Key-matching REs below still test the ORIGINAL key.
-    const redactedKey = leaf(key) as string;
     if (COMMAND_ARGS_PAYLOAD_KEY_RE.test(key) && Array.isArray(value)) {
-      redacted[redactedKey] = sanitizeCommandArgs(value, leaf);
+      redacted[key] = sanitizeCommandArgs(value);
       continue;
     }
     if (COMMAND_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
-      redacted[redactedKey] = redactSensitiveText(value);
+      redacted[key] = redactSensitiveText(value);
       continue;
     }
     if (
@@ -1026,75 +922,50 @@ function sanitizeRecordWithLeaf(
       !isAuditCountField(key, value)
     ) {
       if (isSecretRefBinding(value)) {
-        redacted[redactedKey] = sanitizeValue(value, leaf);
+        redacted[key] = sanitizeValue(value);
         continue;
       }
       if (isUserSecretRefBinding(value)) {
-        redacted[redactedKey] = sanitizeValue(value, leaf);
+        redacted[key] = sanitizeValue(value);
         continue;
       }
       if (isPlainBinding(value)) {
-        redacted[redactedKey] = { type: "plain", value: REDACTED_EVENT_VALUE };
+        redacted[key] = { type: "plain", value: REDACTED_EVENT_VALUE };
         continue;
       }
-      redacted[redactedKey] = REDACTED_EVENT_VALUE;
+      redacted[key] = REDACTED_EVENT_VALUE;
       continue;
     }
     // Preserve public protocol identities before scanning diagnostic values.
     if (isKnownPrpEventDiscriminator(record, key, value)) {
-      redacted[redactedKey] = value;
+      redacted[key] = value;
       continue;
     }
     if (isPaperclipSchemaDiscriminator(key, value)) {
-      redacted[redactedKey] = value;
+      redacted[key] = value;
       continue;
     }
     if (AUDIT_SURFACE_PAYLOAD_KEY_RE.test(key) && typeof value === "string") {
-      redacted[redactedKey] = redactSensitiveText(value);
-      continue;
-    }
-    if (typeof value === "string" && VERSION_STRING_KEYS.has(key) && SEMVER_VALUE_RE.test(value)) {
-      // Plugin versions stay visible; the leaf redactor still scrubs host-registered secrets.
-      redacted[redactedKey] = leaf(value);
+      redacted[key] = redactSensitiveText(value);
       continue;
     }
     if (
       typeof value === "string" &&
-      (JWT_VALUE_RE.test(value) || looksLikeCredentialJwt(value)) &&
+      looksLikeCredentialJwt(value) &&
       !isPublicExecutorToolSelector(value) &&
-      !PUBLIC_RECEIPT_TEXT_IDS.has(value) &&
-      !isPaperclipSchemaDiscriminator(key, value) &&
-      !(key === "phase" && PHASE_NAME_VALUE_RE.test(value)) &&
-      !(key === "type" && value === PRP_EVENT_ENVELOPE_TYPE)
+      !isPaperclipSchemaDiscriminator(key, value)
     ) {
-      redacted[redactedKey] = REDACTED_EVENT_VALUE;
-
+      redacted[key] = REDACTED_EVENT_VALUE;
       continue;
     }
-    if (
-      (key === "phase" && typeof value === "string" && PHASE_NAME_VALUE_RE.test(value)) ||
-      (key === "type" && value === PRP_EVENT_ENVELOPE_TYPE)
-    ) {
-      redacted[redactedKey] = leaf(value);
-      continue;
-    }
-    redacted[redactedKey] = sanitizeValue(value, leaf);
+    redacted[key] = sanitizeValue(value);
   }
   return redacted;
 }
 
-export function sanitizeRecord(record: Record<string, unknown>): Record<string, unknown> {
-  // Upstream v2026.916.0 semantics: adapter diagnostics are provider-controlled
-  // text, so every string leaf goes through the free-form text scanner (a
-  // secret-bearing header fragment under `message`/`reason`/array entries is
-  // redacted, not just host-registered secret values). The fork's exact-value
-  // leaf remains available for vault binding surfaces that already guarantee
-  // their values.
-  return sanitizeRecordWithLeaf(record, freeFormLeafRedactor);
-}
-
-export function redactEventPayload(payload: Record<string, unknown> | null): Record<string, unknown> | null {
-
+export function redactEventPayload(
+  payload: Record<string, unknown> | null,
+): Record<string, unknown> | null {
   if (!payload) return null;
   if (!isPlainObject(payload)) return payload;
   const sanitized = sanitizeRecord(payload);
@@ -1116,10 +987,7 @@ export function redactEventPayload(payload: Record<string, unknown> | null): Rec
 
 function redactAgentEnvBinding(value: unknown): unknown {
   if (isSecretRefBinding(value) || isUserSecretRefBinding(value)) {
-    // Fork redaction set: sanitizeValue walks bindings with a leaf text
-    // redactor; env binding values are vault material, so use the exact-value
-    // leaf (same as the env redaction path below).
-    return sanitizeValue(value, valueExactLeafRedactor);
+    return sanitizeValue(value);
   }
   if (typeof value === "string" || isPlainBinding(value)) {
     return { type: "plain", value: REDACTED_EVENT_VALUE };
@@ -1146,102 +1014,15 @@ export function redactAgentAdapterConfig(
   return { ...(redactEventPayload(rest) ?? {}), env: redactedEnv };
 }
 
-// ── Structural (serialized-JSON) redaction ─────────────────────────────────
-//
-// redactSensitiveText also runs over text that is itself a serialized JSON
-// document (run-log chunks are JSON.stringify'd agent events). Running the
-// free-form regexes over SERIALIZED JSON corrupts it: a secret adjacent to a
-// JSON escape (e.g. `Bearer <secret>\"`) lets a quote-adjacent value class
-// consume the backslash and re-emit a bare quote, so the persisted line no
-// longer parses and dashboard transcripts render raw JSON blobs.
-//
-// JSON-parseable input is therefore redacted STRUCTURALLY — parse, redact the
-// object graph, re-serialize — which preserves document integrity by
-// construction. String leaves still get the SAME free-form pipeline, applied to
-// their DECODED value (where quote-adjacent regexes behave correctly), so this
-// path is coverage-equivalent-or-stronger than the text pipeline it replaces
-// for JSON inputs.
-//
-// Re-entrancy budget: string leaves re-enter redactSensitiveText (a leaf may
-// itself hold serialized JSON). A module-level counter bounds the total
-// structural depth of one call tree so adversarially nested inputs cannot
-// exhaust the stack; redaction is synchronous, so the counter cannot interleave.
-// Past the budget the free-form pipeline applies unchanged.
-const MAX_STRUCTURAL_REDACTION_DEPTH = 8;
-let structuralRedactionDepth = 0;
-
-function tryParseJson(input: string): unknown {
-  // JSON.parse never returns undefined on success, so undefined reliably means
-  // "not JSON" here.
-  try {
-    return JSON.parse(input);
-  } catch {
-    return undefined;
-  }
-}
-
-function sanitizeJsonValue(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(sanitizeJsonValue);
-  if (isPlainObject(value)) return sanitizeRecordWithLeaf(value, freeFormLeafRedactor);
-  if (typeof value === "string") return freeFormLeafRedactor(value);
-  return value;
-}
-
 export function redactSensitiveText(input: string): string {
-  if (structuralRedactionDepth < MAX_STRUCTURAL_REDACTION_DEPTH) {
-    const parsed = tryParseJson(input);
-    // Bare JSON scalars (numbers, booleans, null) carry no secret structure.
-    // Re-serializing would rewrite numeric text such as "0.0010000" to "0.001".
-    if (parsed !== undefined && (typeof parsed === "object" || typeof parsed === "string") && !(parsed === null)) {
-      structuralRedactionDepth += 1;
-      try {
-        // Preserve any leading/trailing whitespace (notably the trailing
-        // newline of an NDJSON event line) around the structural
-        // re-serialization. Run-log consumers join records on newline
-        // boundaries, so dropping it merges adjacent JSON lines into one
-        // unparseable blob. Only the surrounding
-        // whitespace is touched; the sanitized JSON body is unchanged.
-        const whitespaceMatch = input.match(/^(\s*)[\s\S]*?(\s*)$/);
-        const leading = whitespaceMatch?.[1] ?? "";
-        const trailing = whitespaceMatch?.[2] ?? "";
-        const sanitizedJson = JSON.stringify(sanitizeJsonValue(parsed));
-        return leading + sanitizedJson + trailing;
-      } catch {
-        // SECURITY-CRITICAL: any structural-walk failure (e.g. a pathologically
-        // nested document that JSON.parse accepts but overflows the recursive
-        // walker's stack) falls back to the free-form pipeline. Redaction is
-        // never skipped — only the mode changes.
-        return redactFreeFormText(input);
-      } finally {
-        structuralRedactionDepth -= 1;
-      }
-    }
-  }
-  return redactFreeFormText(input);
-}
-
-function redactFreeFormText(input: string): string {
-  // SECURITY-CRITICAL: Value-exact scrub runs FIRST and unconditionally: a high-entropy registered
-  // secret may carry no secret-ish hint, so it would survive the
-  // maybeContainsSecretText short-circuit below (Control 1).
-  const valueScrubbed = redactRegisteredSecretValues(input, REDACTED_VAULT_VALUE);
-  if (!maybeContainsSecretText(valueScrubbed)) return valueScrubbed;
-  // The shared adapter-utils GitHub matcher is `\bgh[pousr]_…` and does not
-  // cover the fine-grained `github_pat_` shape, so scrub it here with the
-  // canonical secret-patterns matcher after the command-text pass.
-  // Order matters for the two Authorization/Bearer scrubbers: the
-  // scheme-preserving command-text shapes (`Authorization: Bearer <value>`
-  // with the value running to a quote or whitespace) run FIRST so a JSON
-  // closing quote after the credential survives intact; the quote-tail
-  // scrubbers then consume the malformed shapes the command regex cannot
-  // express (credentials glued to raw or escaped closing quotes).
+  if (!maybeContainsSecretText(input)) return input;
   return redactCommandText(
-    redactStandaloneBearerCredentials(redactAuthorizationCredentials(valueScrubbed))
+    redactStandaloneBearerCredentials(redactAuthorizationCredentials(input))
       .replace(JSON_SECRET_FIELD_TEXT_RE, `$1${REDACTED_EVENT_VALUE}$2`)
       .replace(
         ESCAPED_JSON_SECRET_FIELD_TEXT_RE,
         `$1${REDACTED_EVENT_VALUE}$2`,
       ),
     REDACTED_EVENT_VALUE,
-  ).replace(GITHUB_FINE_GRAINED_PAT_TEXT_RE, REDACTED_EVENT_VALUE);
+  );
 }
