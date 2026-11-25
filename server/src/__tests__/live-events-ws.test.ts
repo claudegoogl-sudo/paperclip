@@ -77,12 +77,18 @@ function createDbState(input: {
   return { db, activity };
 }
 
-vi.mock("../middleware/logger.js", () => ({
-  logger: {
+// The sync pulled `services/git-credentials` into this import graph; its
+// transitive modules create child loggers at import time.
+vi.mock("../middleware/logger.js", () => {
+  const logger: Record<string, unknown> = {
     warn: vi.fn(),
     error: vi.fn(),
-  },
-}));
+    info: vi.fn(),
+    debug: vi.fn(),
+  };
+  logger.child = vi.fn(() => logger);
+  return { logger };
+});
 
 class FakeUpgradeSocket extends EventEmitter {
   destroyed = false;

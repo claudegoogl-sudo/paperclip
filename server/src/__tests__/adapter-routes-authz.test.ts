@@ -79,6 +79,16 @@ vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => ({ listCompanyIds: mocks.listCompanyIds }),
 }));
 
+// The routes persist the disabled set through the DB-backed adapter settings
+// service; route-level authz tests drive the same in-memory mocks instead.
+vi.mock("../services/adapter-settings.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/adapter-settings.js")>()),
+  adapterSettingsService: () => ({
+    getDisabledTypes: async () => mocks.getDisabledAdapterTypes(),
+    setDisabled: async (type: string, disabled: boolean) => mocks.setAdapterDisabled(type, disabled),
+  }),
+}));
+
 function registerRouteMocks() {
   vi.doMock("node:child_process", () => ({
     execFile: mocks.execFile,
@@ -108,6 +118,14 @@ function registerRouteMocks() {
 
   vi.doMock("../services/instance-settings.js", () => ({
     instanceSettingsService: () => ({ listCompanyIds: mocks.listCompanyIds }),
+  }));
+
+  vi.doMock("../services/adapter-settings.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../services/adapter-settings.js")>()),
+    adapterSettingsService: () => ({
+      getDisabledTypes: async () => mocks.getDisabledAdapterTypes(),
+      setDisabled: async (type: string, disabled: boolean) => mocks.setAdapterDisabled(type, disabled),
+    }),
   }));
 }
 

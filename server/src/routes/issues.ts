@@ -20555,6 +20555,8 @@ export function issueRoutes(
           bodySnippet: comment.body.slice(0, 120),
           identifier: currentIssue.identifier,
           issueTitle: currentIssue.title,
+          // Fork behavior lost in the v2026.1117.0 merge: the comment activity records how many attachments were bound.
+          ...(commentAttachmentIds.length > 0 ? { attachmentCount: commentAttachmentIds.length } : {}),
           authorizationReason: commentAuthorizationReason,
           ...(isDirectParentReportDecision(commentAccessDecision)
             ? { directParentReportGrant: true }

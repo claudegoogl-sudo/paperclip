@@ -82,7 +82,8 @@ describe("Coordinator tasks using the proposed table", () => {
     await mount(url);
     expect(host.querySelector("[data-selected-view]")?.textContent).toBe(view);
     expect([...host.querySelectorAll("[data-task-id]")].map(row => row.getAttribute("data-task-id"))).toEqual(ids);
-    expect(host.querySelector("output")?.textContent).toBe(`?view=${view}`);
+    // The default view is written to the URL by an effect after the first paint.
+    await vi.waitFor(() => expect(host.querySelector("output")?.textContent).toBe(`?view=${view}`));
   });
   it.each(taskListViews)("remembers $label when leaving Tasks and returning without a view URL", async ({ value, label }) => {
     await mount("/issues");

@@ -742,10 +742,18 @@ describe("plugin task side-panel declarations", () => {
   const slot = { type: "detailTab", id: "view", displayName: "Live view", exportName: "LiveView", entityTypes: ["agent"], taskSidePanel: { availabilityPath: "/agents/:entityId/view/availability" } };
   const route = { routeKey: "view.availability", method: "GET", path: slot.taskSidePanel.availabilityPath, auth: "board", capability: "api.routes.register", companyResolution: { from: "agent", param: "entityId" } };
   const manifest = { id: "example.live-view", apiVersion: 1, version: "1.0.0", displayName: "Live view", description: "Live view", author: "Tests", categories: ["ui"], capabilities: ["ui.detailTab.register", "api.routes.register"], entrypoints: { worker: "worker.js", ui: "ui.js" }, ui: { slots: [slot] }, apiRoutes: [route] };
-  it("accepts an optional panel backed by an authorized plugin-local agent route", () => {
+  it("rejects a taskSidePanel detailTab manifest under the fork v1 floor", () => {
+    expect(pluginManifestV1Schema.safeParse(manifest).success).toBe(false);
+    expect(pluginUiSlotDeclarationSchema.safeParse(slot).success).toBe(false);
+  });
+  // Fork v1 slot floor rejects `detailTab` (see "gated by fork v1 floor" above), so the
+  // upstream acceptance cases cannot pass until the floor is widened (product decision).
+  it.skip("accepts an optional panel backed by an authorized plugin-local agent route", () => {
     expect(pluginManifestV1Schema.parse(manifest).ui?.slots?.[0]?.taskSidePanel).toEqual(slot.taskSidePanel);
   });
-  it("accepts an explicit UI-independent activity mapping and preserves legacy declarations", () => {
+  // Fork v1 slot floor rejects `detailTab` (see "gated by fork v1 floor" above), so the
+  // upstream acceptance cases cannot pass until the floor is widened (product decision).
+  it.skip("accepts an explicit UI-independent activity mapping and preserves legacy declarations", () => {
     const activation = { namespace: "example.runtime", activityKey: "desktop.used" };
     expect(pluginUiSlotDeclarationSchema.parse({ ...slot, taskSidePanel: { ...slot.taskSidePanel, activation } }).taskSidePanel?.activation).toEqual(activation);
     expect(pluginUiSlotDeclarationSchema.parse(slot).taskSidePanel?.activation).toBeUndefined();
@@ -756,7 +764,9 @@ describe("plugin task side-panel declarations", () => {
       expect(pluginUiSlotDeclarationSchema.safeParse({ ...slot, taskSidePanel: { ...slot.taskSidePanel, activation } }).success).toBe(false);
     }
   });
-  it("accepts a GET availability route when a POST at the same path is declared first", () => {
+  // Fork v1 slot floor rejects `detailTab` (see "gated by fork v1 floor" above), so the
+  // upstream acceptance cases cannot pass until the floor is widened (product decision).
+  it.skip("accepts a GET availability route when a POST at the same path is declared first", () => {
     expect(pluginManifestV1Schema.safeParse({ ...manifest, apiRoutes: [{ ...route, routeKey: "view.update", method: "POST" }, route] }).success).toBe(true);
   });
   it.each(["https://example.test/:entityId", "//example/:entityId", "/../:entityId", "/agents/:entityId?redirect=elsewhere", "/agents/:agentId/view"])("rejects unsafe or unsupported path %s", availabilityPath => {
