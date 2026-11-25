@@ -12,6 +12,11 @@ vi.mock("../middleware/logger.js", () => {
   return { logger: log };
 });
 
+const storeHolder = vi.hoisted(() => ({ store: null as unknown }));
+vi.mock("../services/plugin-job-store.js", () => ({
+  pluginJobStore: () => storeHolder.store,
+}));
+
 import { createPluginJobScheduler } from "../services/plugin-job-scheduler.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
@@ -44,6 +49,19 @@ function setup() {
         where: () => Promise.resolve(rows),
       }),
     }),
+    // dispatch() reserves the run in a transaction: lock the job row, then
+    // check for outstanding runs. Both are served from the in-memory fixture.
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({
+        select: (cols?: unknown) => ({
+          from: () => ({
+            where: () =>
+              cols
+                ? { limit: () => Promise.resolve([]) }
+                : { for: () => Promise.resolve([job]) },
+          }),
+        }),
+      }),
   };
   const advance = deferred();
   const jobStore = {
@@ -53,6 +71,7 @@ function setup() {
     completeRun: vi.fn().mockResolvedValue(undefined),
     updateRunTimestamps: vi.fn().mockImplementation(() => advance.promise),
   };
+  storeHolder.store = jobStore;
   const workerManager = {
     isRunning: vi.fn().mockReturnValue(true),
     call: vi.fn().mockResolvedValue(undefined),
