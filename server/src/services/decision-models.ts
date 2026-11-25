@@ -7,7 +7,7 @@ import {
 } from "@paperclipai/db";
 import {
   DECISION_MODELS, decisionProviderForConnection, decisionRequestSchema, updateDecisionModelSchema,
-  centsToUnits, unitsToCents, type DecisionAvailability, type DecisionConnectionChoice, type DecisionHistoryEntry,
+  centsToUnits, unitsToCents, normalizeCents, type DecisionAvailability, type DecisionConnectionChoice, type DecisionHistoryEntry,
   type DecisionModelSettings, type DecisionProvider, type DecisionRequest, type DecisionResult, type DecisionUnavailableReason, type UpdateDecisionModel,
 } from "@paperclipai/shared";
 import { HttpError, forbidden, unprocessable } from "../errors.js";
@@ -195,7 +195,7 @@ export function decisionModelService(db: Db, options: { provider?: typeof runDec
           if (existing.costStatus !== "unpriced") await logActivity(tx, { companyId: invocation.companyId,
             actorType: "system", actorId: "cost_accounting", responsibleUserIdOverride: invocation.responsibleUserId,
             action: "accounting.late_receipt_observed", entityType: "cost_event", entityId: existing.id,
-            details: { effectiveCostCents: existing.costCents, ...receipt },
+            details: { ...receipt, ...(receipt.costCents == null ? {} : { costCents: normalizeCents(receipt.costCents) }), effectiveCostCents: normalizeCents(existing.costCents) },
           }, publications);
         }
         event = existing;

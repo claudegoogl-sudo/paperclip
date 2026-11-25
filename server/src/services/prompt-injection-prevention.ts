@@ -4,7 +4,7 @@ import { and, eq, lt, sql } from "drizzle-orm";
 import { agents, budgetReservations, companies, companyPromptInjectionPrevention,
   promptInjectionInvocations, companySecrets, heartbeatRuns, runIdentityContexts, issues, projects, costEvents, type Db } from "@paperclipai/db";
 import { PROMPT_INJECTION_DEFAULT_MODEL, PROMPT_INJECTION_POLICY_VERSION, decisionProviderForConnection,
-  updatePromptInjectionPreventionSchema, centsToUnits, unitsToCents,
+  updatePromptInjectionPreventionSchema, centsToUnits, unitsToCents, normalizeCents,
   type PromptInjectionPreventionSettings, type UpdatePromptInjectionPrevention, type PromptInjectionModelOutcome,
   type PromptInjectionFallbackReason, type PromptInjectionTestResult, type DecisionUsage } from "@paperclipai/shared";
 import { HttpError, forbidden } from "../errors.js";
@@ -156,7 +156,7 @@ export function promptInjectionPreventionService(db: Db, options: {
           if (existing.costStatus !== "unpriced") await logActivity(tx, { companyId: invocation.companyId,
             actorType: "system", actorId: "cost_accounting", responsibleUserIdOverride: invocation.responsibleUserId,
             action: "accounting.late_receipt_observed", entityType: "cost_event", entityId: existing.id,
-            details: { effectiveCostCents: existing.costCents, ...receipt },
+            details: { ...receipt, ...(receipt.costCents == null ? {} : { costCents: normalizeCents(receipt.costCents) }), effectiveCostCents: normalizeCents(existing.costCents) },
           }, publications);
         }
         event = existing;

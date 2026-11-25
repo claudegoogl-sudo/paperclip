@@ -40,6 +40,7 @@ import {
   aiConnectionCatalogSlug,
   aiConnectionMetadataSchema,
   centsToUnits,
+  normalizeCents,
   unitsToCents,
   updateFastResponseSchema,
   FAST_RESPONSE_DEADLINE_MS,
@@ -637,7 +638,7 @@ export function fastResponseService(
             if (existing.costStatus !== "unpriced") await logActivity(tx, { companyId: request.companyId,
               actorType: "system", actorId: "cost_accounting", responsibleUserIdOverride: request.responsibleUserId,
               action: "accounting.late_receipt_observed", entityType: "cost_event", entityId: existing.id,
-              details: { effectiveCostCents: existing.costCents, ...receipt },
+              details: { ...receipt, ...(receipt.costCents == null ? {} : { costCents: normalizeCents(receipt.costCents) }), effectiveCostCents: normalizeCents(existing.costCents) },
             }, publications);
           }
           event = existing;

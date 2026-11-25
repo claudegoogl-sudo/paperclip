@@ -1,3 +1,4 @@
+import { failedRunRetryBudgetSpent } from "../../../services/heartbeat/retries.js";
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import {
@@ -634,10 +635,12 @@ async function runReleaseRecoveryTail(
       isWorkspaceValidationFailedRun: isWorkspaceValidationFailedRun(run),
       isConfigurationIncompleteFailedRun:
         isConfigurationIncompleteFailedRun(run),
+      // A process-loss run that spent the durable failure budget gets no
+      // immediate successor either: the budget is the single retry authority.
       automaticRecoveryAlreadyFailed: didAutomaticRecoveryFail(
         run,
         expectedRetryReason,
-      ),
+      ) || (run.errorCode === "process_lost" && failedRunRetryBudgetSpent(run)),
       sourceRequiresExplicitRecovery,
     },
     shared: {
