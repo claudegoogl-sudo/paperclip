@@ -252,6 +252,10 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   instanceUserRoles: {},
 }));
 
+vi.mock("../services/delivery-work-notifications.js", async () => ({
+  ...await vi.importActual<typeof import("../services/delivery-work-notifications.js")>("../services/delivery-work-notifications.js"),
+  subscribeDeliveryWork: vi.fn(() => () => {}),
+}));
 vi.mock("../runtime-api.js", async (importOriginal) => ({ ...(await importOriginal<Record<string, unknown>>()), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:3100" }));
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
