@@ -22,7 +22,7 @@ import { beginLegacyShutdownWorkspaceSettlement } from "../services/legacy-shutd
 import { renewLegacyControllerLease, legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import { idleWorkSnapshot } from "../services/task-admission.js";
 import { createHeartbeatRunOutput } from "../services/heartbeat/run-output.js";
-import { recoveryService } from "../services/recovery/service.js";
+import { ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS, recoveryService } from "../services/recovery/service.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { persistActivity } from "../services/activity-log.js";
 import { accountRunCost } from "../services/run-cost-accounting.js";
@@ -758,14 +758,14 @@ describe("residual recovery production matrix", () => {
     const [run] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agent.id,
       status: "running", runtimeMode: "legacy", contextSnapshot: { issueId: f.issue.id },
       responsibleUserId: f.actorId, startedAt: old, processStartedAt: old, updatedAt: old,
-      controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(now.getTime() + 60 * 60_000) }).returning();
+      controllerBootId: randomUUID(), controllerLeaseExpiresAt: new Date(now.getTime() + 3 * ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS) }).returning();
     const output = createHeartbeatRunOutput(db, { run, runId: run.id, issueId: f.issue.id,
       runLogStore: { begin: async () => ({ store: "local_file", logRef: "fixture-output.ndjson" }), append: async (_handle, event) => Buffer.byteLength(event.chunk) },
       identityRedactor: { chunk: (_stream, chunk) => chunk, redact: value => value }, secretKeys: new Set(),
       appendRunEvent: async (_run, event) => { await appendHeartbeatRunEvent(db, { companyId: f.companyId, agentId: f.agent.id, runId: run.id, ...event }); },
       getCurrentUserRedactionOptions: async () => ({ enabled: false }) });
     await (await output.begin(run)).onLog("stdout", "fresh actual output");
-    const progressed = await getRun(run.id), snoozedUntil = new Date(progressed.lastOutputAt!.getTime() + 5 * 60_000 + 2_000);
+    const progressed = await getRun(run.id), snoozedUntil = new Date(progressed.lastOutputAt!.getTime() + ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 2_000);
     expect(progressed.lastOutputSeq).toBe(1); expect(progressed.lastOutputAt!.getTime()).toBeGreaterThan(old.getTime());
     await issueService(db).update(f.issue.id, { status: "done" });
     await persistActivity(db, { companyId: f.companyId, actorType: "agent", actorId: f.agent.id, agentId: f.agent.id,
@@ -793,9 +793,9 @@ describe("residual recovery production matrix", () => {
     await quiet();
   });
   it("reaches a silent run behind more than 100 suppressed live runs and leaves only real controller deadlines", async () => {
-    const f = await fixture(), now = new Date(), old = new Date(now.getTime() - 20 * 60_000);
+    const f = await fixture(), now = new Date(), old = new Date(now.getTime() - ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS - 20 * 60_000);
     await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issue.id));
-    const expiry = new Date(now.getTime() + 60 * 60_000);
+    const expiry = new Date(now.getTime() + 3 * ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS);
     const suppressed = await db.insert(heartbeatRuns).values(Array.from({ length: 105 }, () => ({ companyId: f.companyId,
       agentId: f.agent.id, status: "running", runtimeMode: "legacy", contextSnapshot: { issueId: f.issue.id },
       startedAt: old, updatedAt: old, controllerBootId: randomUUID(), controllerLeaseExpiresAt: expiry }))).returning();
