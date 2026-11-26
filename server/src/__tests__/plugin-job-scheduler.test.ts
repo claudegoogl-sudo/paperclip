@@ -53,6 +53,7 @@ function setup() {
     // check for outstanding runs. Both are served from the in-memory fixture.
     transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
       fn({
+        execute: async () => undefined,
         select: (cols?: unknown) => ({
           from: () => ({
             where: () =>
