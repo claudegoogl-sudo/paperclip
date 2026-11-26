@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../middleware/logger.js", () => {
   const noop = () => {};
@@ -12,7 +12,14 @@ vi.mock("../middleware/logger.js", () => {
   return { logger: log };
 });
 
+const storeHolder = vi.hoisted(() => ({ store: null as unknown }));
+vi.mock("../services/plugin-job-store.js", () => ({
+  pluginJobStore: () => storeHolder.store,
+}));
+
 import { createPluginJobScheduler } from "../services/plugin-job-scheduler.js";
+import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
+import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
 
 function deferred() {
   let resolve!: () => void;
@@ -42,6 +49,20 @@ function setup() {
         where: () => Promise.resolve(rows),
       }),
     }),
+    // dispatch() reserves the run in a transaction: lock the job row, then
+    // check for outstanding runs. Both are served from the in-memory fixture.
+    transaction: async (fn: (tx: unknown) => Promise<unknown>) =>
+      fn({
+        execute: async () => undefined,
+        select: (cols?: unknown) => ({
+          from: () => ({
+            where: () =>
+              cols
+                ? { limit: () => Promise.resolve([]) }
+                : { for: () => Promise.resolve([job]) },
+          }),
+        }),
+      }),
   };
   const advance = deferred();
   const jobStore = {
@@ -51,6 +72,7 @@ function setup() {
     completeRun: vi.fn().mockResolvedValue(undefined),
     updateRunTimestamps: vi.fn().mockImplementation(() => advance.promise),
   };
+  storeHolder.store = jobStore;
   const workerManager = {
     isRunning: vi.fn().mockReturnValue(true),
     call: vi.fn().mockResolvedValue(undefined),
@@ -71,9 +93,32 @@ function setup() {
   };
 }
 
+// The scheduler only accepts work after start(): the upstream push-driven
+// scheduler is armed through a delivery-work coordinator. Start it with no due
+// rows so the initial reconciliation run is a no-op, then expose the due job.
+async function startScheduler(
+  ctx: ReturnType<typeof setup>,
+  stoppers: Array<() => Promise<void>>,
+) {
+  const due = ctx.job;
+  ctx.setRows([]);
+  const owner = installDatabaseWorkSignals({ execute: vi.fn(async () => []), transaction: vi.fn() });
+  const coordinator = createDeliveryWorkCoordinator({ owner, canRun: () => true, onError: () => {} });
+  await ctx.scheduler.start(coordinator);
+  stoppers.push(() => ctx.scheduler.stop(), () => coordinator.stop());
+  ctx.setRows([due]);
+}
+
 describe("plugin job scheduler overlap prevention", () => {
+  const stoppers: Array<() => Promise<void>> = [];
+  afterEach(async () => {
+    for (const stop of stoppers.splice(0)) await stop();
+  });
+
   it("keeps a scheduled job active until its schedule pointer is advanced", async () => {
-    const { job, advance, jobStore, scheduler, setRows } = setup();
+    const ctx = setup();
+    const { job, advance, jobStore, scheduler, setRows } = ctx;
+    await startScheduler(ctx, stoppers);
 
     const tickPromise = scheduler.tick();
     await vi.waitFor(() => expect(jobStore.updateRunTimestamps).toHaveBeenCalledTimes(1));
@@ -95,7 +140,9 @@ describe("plugin job scheduler overlap prevention", () => {
   });
 
   it("releases the job when advancing the schedule pointer fails", async () => {
-    const { job, jobStore, scheduler, setRows } = setup();
+    const ctx = setup();
+    const { job, jobStore, scheduler, setRows } = ctx;
+    await startScheduler(ctx, stoppers);
     jobStore.updateRunTimestamps.mockRejectedValue(new Error("db down"));
 
     await scheduler.tick();

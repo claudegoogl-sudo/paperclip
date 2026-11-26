@@ -99,7 +99,7 @@ describeEmbeddedPostgres("heartbeat list", () => {
       if (originalDescriptor) {
         Object.defineProperty(heartbeatRuns, "processGroupId", originalDescriptor);
       } else {
-        delete (heartbeatRuns as Record<string, unknown>).processGroupId;
+        delete (heartbeatRuns as unknown as Record<string, unknown>).processGroupId;
       }
     }
   });

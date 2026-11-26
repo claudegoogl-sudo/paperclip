@@ -31,6 +31,12 @@ const fullRoutinePayload = {
 };
 
 describe("routine validators", () => {
+  it("accepts non-UUID person IDs for responsibility, but rejects clearing it", () => {
+    expect(updateRoutineSchema.parse({ responsibleUserId: "person-123" })).toEqual({ responsibleUserId: "person-123" });
+    expect(updateRoutineSchema.safeParse({ responsibleUserId: null }).success).toBe(false);
+    expect(updateRoutineSchema.safeParse({ responsibleUserId: " " }).success).toBe(false);
+    expect(updateRoutineSchema.parse({ title: "Title" })).not.toHaveProperty("responsibleUserId");
+  });
   it.each(["bearer", "app_webhook", "fireflies_hmac"])("accepts versioned routine revision snapshots with %s trigger metadata", (signingMode) => {
     const parsed = routineRevisionSnapshotV1Schema.parse({
       version: 1,

@@ -19,12 +19,13 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
 import { Router } from "express";
-import type { Db } from "@paperclipai/db";
+import { companies, type Db } from "@paperclipai/db";
+import { adapterSettingsService } from "../services/adapter-settings.js";
+import { logActivity, publishActivity, type ActivityPublication } from "../services/activity-log.js";
 import {
   listServerAdapters,
   findServerAdapter,
   findActiveServerAdapter,
-  listEnabledServerAdapters,
   registerServerAdapter,
   resolveExternalAdapterRegistration,
   unregisterServerAdapter,
@@ -38,8 +39,6 @@ import {
   removeAdapterPlugin,
   getAdapterPluginByType,
   getAdapterPluginsDir,
-  getDisabledAdapterTypes,
-  setAdapterDisabled,
 } from "../services/adapter-plugin-store.js";
 import type { AdapterPluginRecord } from "../services/adapter-plugin-store.js";
 import type { ServerAdapterModule, AdapterConfigSchema } from "../adapters/types.js";
@@ -49,32 +48,19 @@ import type {
 } from "@paperclipai/adapter-utils";
 import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
-import { badRequest, forbidden } from "../errors.js";
+import { badRequest, forbidden, HttpError } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
+import { assertExternalAdapterCodeAllowed } from "../services/adapter-code-policy.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
-import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin } from "./authz.js";
 import { logInstanceActivity } from "./instance-activity.js";
+import { assertBoardOrgAccess, assertCompanyAccess, assertInstanceAdmin, getActorInfo } from "./authz.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
 import { agentRunnerAvailability, type RunnerTarget } from "../services/agent-runner-selection.js";
 import type { AgentRunnerAvailability } from "@paperclipai/shared";
+import { resolveAntigravityCandidateAdmission } from "../services/native-runtime/acpx-qualification.js";
 
 const execFileAsync = promisify(execFile);
-
-/**
- * Floor: on cloud-managed instances adapter code is bundled into the platform
- * image; fetching and loading external adapter packages at runtime stays off
- * for every actor, including instance admins. Adapter code executes in the
- * server process, so a runtime install would let an instance admin read the
- * platform trust anchors from the process environment (mirrors the
- * bundled-only plugin install floor in plugin-install-guard.ts).
- */
-function assertAdapterCodeInstallAllowed() {
-  if (isCloudManagedInstance()) {
-    throw forbidden("Adapter installation is platform-managed on cloud-managed instances", {
-      code: "adapter_install_platform_managed",
-    });
-  }
-}
+let warnedMalformedAntigravityAdmission = false;
 
 /**
  * Floor: when the hosting operator hides the Adapters settings surface
@@ -129,6 +115,7 @@ interface AdapterCapabilities {
 }
 
 interface AdapterInfo extends AgentRunnerAvailability {
+  candidateHarnesses?: Array<{ agent: "antigravity"; model: string }>;
   type: string;
   label: string;
   source: "builtin" | "external";
@@ -208,7 +195,7 @@ function buildAdapterInfo(adapter: ServerAdapterModule, externalRecord: AdapterP
     loaded: true, // If it's in the registry, it's loaded
     disabled: disabledSet.has(adapter.type),
     capabilities: buildAdapterCapabilities(adapter),
-    ...agentRunnerAvailability(adapter.type, target),
+    ...agentRunnerAvailability(adapter.type, target, [...disabledSet]),
     ...(adapter.acp ? { acp: adapter.acp } : {}),
     overriddenBuiltin: externalRecord ? BUILTIN_ADAPTER_TYPES.has(adapter.type) : undefined,
     overridePaused: BUILTIN_ADAPTER_TYPES.has(adapter.type) ? isOverridePaused(adapter.type) : undefined,
@@ -264,13 +251,14 @@ function registerWithSessionManagement(adapter: ServerAdapterModule): void {
 // ---------------------------------------------------------------------------
 
 export function adapterRoutes(options: {
-  db: Db;
+  db?: Db;
   getNativeRunnerEnabled?: () => Promise<boolean>;
   getOpenAiDotEnabled?: () => Promise<boolean>;
   resolveRunnerTarget?: (companyId: string, environmentId?: string) => Promise<RunnerTarget>;
-}) {
+} = {}) {
   const { db } = options;
   const router = Router();
+  const settings = adapterSettingsService(options.db);
 
   /**
    * GET /api/adapters
@@ -296,7 +284,17 @@ export function adapterRoutes(options: {
     if (typeof companyId === "string") {
       assertCompanyAccess(_req, companyId);
       if (!options.resolveRunnerTarget) throw badRequest("Scoped adapter discovery is unavailable.");
-      target = await options.resolveRunnerTarget(companyId, typeof environmentId === "string" ? environmentId : undefined);
+      try {
+        target = await options.resolveRunnerTarget(companyId, typeof environmentId === "string" ? environmentId : undefined);
+      } catch (error) {
+        // API controllers do not need a Computer. Keep their catalog visible
+        // when only the implicit managed Computer is unavailable. This target
+        // grants no local execution support to any workspace harness.
+        if (environmentId !== undefined || !(error instanceof HttpError) || error.status !== 422
+          || (error.details as { code?: unknown } | undefined)?.code !== "managed_sandbox_unavailable") throw error;
+        target = { driver: "unavailable", ...((error.details as { executionMode?: unknown }).executionMode === "kubernetes"
+          ? { executionMode: "kubernetes" as const } : {}) };
+      }
     }
     await waitForExternalAdapters();
 
@@ -304,13 +302,30 @@ export function adapterRoutes(options: {
     const externalRecords = new Map(
       listAdapterPlugins().map((r) => [r.type, r]),
     );
-    const disabledSet = new Set(getDisabledAdapterTypes());
+    const disabledSet = new Set(await settings.getDisabledTypes());
     // One shared implementation, with independent provider rollouts. Explicit
     // adapter-admin disabling still applies to both choices.
 
-    const result: AdapterInfo[] = registeredAdapters.map((adapter) =>
-      buildAdapterInfo(adapter, externalRecords.get(adapter.type), disabledSet, target),
-    ).sort((a, b) => a.type.localeCompare(b.type));
+    let candidate: ReturnType<typeof resolveAntigravityCandidateAdmission>;
+    if (typeof companyId === "string" && target?.driver === "local") {
+      // An expired optional preview must not hide the ordinary adapter catalog.
+      // Execution and model discovery still perform strict admission checks.
+      try { candidate = resolveAntigravityCandidateAdmission({ companyId }); }
+      catch (error) {
+        candidate = undefined;
+        // Expiry is ordinary catalog state. Invalid trusted startup JSON needs
+        // one operator diagnostic, without logging its payload or error.
+        if (!warnedMalformedAntigravityAdmission && error instanceof Error && error.message === "Invalid Antigravity candidate admission") {
+          warnedMalformedAntigravityAdmission = true;
+          logger.warn({ code: "ANTIGRAVITY_CANDIDATE_ADMISSION_INVALID" }, "Invalid Google Antigravity preview authorization");
+        }
+      }
+    }
+    const result: AdapterInfo[] = registeredAdapters.map((adapter) => ({
+      ...buildAdapterInfo(adapter, externalRecords.get(adapter.type), disabledSet, target),
+      ...(candidate && adapter.type === "paperclip_runner" && !disabledSet.has(adapter.type) && !externalRecords.has(adapter.type)
+        ? { candidateHarnesses: [{ agent: "antigravity" as const, model: candidate.model }] } : {}),
+    })).sort((a, b) => a.type.localeCompare(b.type));
 
     res.json(result);
   });
@@ -327,7 +342,7 @@ export function adapterRoutes(options: {
    */
   router.post("/adapters/install", async (req, res) => {
     assertInstanceAdmin(req);
-    assertAdapterCodeInstallAllowed();
+    assertExternalAdapterCodeAllowed();
     assertAdapterManagementVisible();
 
     const { packageName, isLocalPath = false, version } = (req.body ?? {}) as AdapterInstallRequest;
@@ -442,7 +457,7 @@ export function adapterRoutes(options: {
 
       // Audit: runtime install executes third-party code in this process, so
       // the actor and resolved package identity are recorded even on success.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.installed",
         entityType: "adapter",
         entityId: adapterModule.type,
@@ -468,7 +483,7 @@ export function adapterRoutes(options: {
       // Audit: a failed install is still an attempted code execution — the
       // responder needs the attempt and its failure reason even when the
       // mutation never landed.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.installed",
         entityType: "adapter",
         entityId: canonicalName,
@@ -503,7 +518,7 @@ export function adapterRoutes(options: {
     }
 
     const externalRecord = getAdapterPluginByType(adapterType);
-    const disabledSet = new Set(getDisabledAdapterTypes());
+    const disabledSet = new Set(await settings.getDisabledTypes());
     res.json(buildAdapterInfo(adapter, externalRecord, disabledSet));
   });
 
@@ -535,13 +550,34 @@ export function adapterRoutes(options: {
       return;
     }
 
-    const changed = setAdapterDisabled(adapterType, disabled);
+    const publications: ActivityPublication[] = [];
+    const changed = await settings.setDisabled(adapterType, disabled, async (tx, current) => {
+      const actor = getActorInfo(req);
+      const companyIds = await tx.select({ id: companies.id }).from(companies);
+      for (const company of companyIds) {
+        await logActivity(tx as Db, {
+          companyId: company.id,
+          ...actor,
+          action: "instance.adapter.updated",
+          entityType: "instance_settings",
+          entityId: "adapter-settings:v1",
+          details: { adapterType, disabled, revision: current.revision },
+        }, publications);
+      }
+    });
+    for (const publication of publications) {
+      try {
+        publishActivity(publication);
+      } catch (error) {
+        logger.error({ err: error, companyId: publication.companyId }, "failed to publish adapter settings activity");
+      }
+    }
 
     if (changed) {
       logger.info({ type: adapterType, disabled }, "Adapter enabled/disabled");
     }
 
-    await logInstanceActivity(db, req, {
+    if (db) await logInstanceActivity(db, req, {
       action: "instance.adapter.disabled",
       entityType: "adapter",
       entityId: adapterType,
@@ -561,6 +597,7 @@ export function adapterRoutes(options: {
    */
   router.patch("/adapters/:type/override", async (req, res) => {
     assertInstanceAdmin(req);
+    assertExternalAdapterCodeAllowed();
 
     assertAdapterManagementVisible();
 
@@ -581,7 +618,7 @@ export function adapterRoutes(options: {
 
     logger.info({ type: adapterType, paused, changed }, "Adapter override toggle");
 
-    await logInstanceActivity(db, req, {
+    if (db) await logInstanceActivity(db, req, {
       action: "instance.adapter.overridden",
       entityType: "adapter",
       entityId: adapterType,
@@ -598,6 +635,7 @@ export function adapterRoutes(options: {
    */
   router.delete("/adapters/:type", async (req, res) => {
     assertInstanceAdmin(req);
+    assertExternalAdapterCodeAllowed();
     assertAdapterManagementVisible();
 
     const adapterType = req.params.type;
@@ -662,7 +700,7 @@ export function adapterRoutes(options: {
 
     logger.info({ type: adapterType }, "External adapter unregistered and removed");
 
-    await logInstanceActivity(db, req, {
+    if (db) await logInstanceActivity(db, req, {
       action: "instance.adapter.uninstalled",
       entityType: "adapter",
       entityId: adapterType,
@@ -682,6 +720,7 @@ export function adapterRoutes(options: {
    */
   router.post("/adapters/:type/reload", async (req, res) => {
     assertInstanceAdmin(req);
+    assertExternalAdapterCodeAllowed();
     assertAdapterManagementVisible();
 
     const type = req.params.type;
@@ -719,7 +758,7 @@ export function adapterRoutes(options: {
 
       logger.info({ type, version: newVersion }, "External adapter reloaded at runtime");
 
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reloaded",
         entityType: "adapter",
         entityId: type,
@@ -732,7 +771,7 @@ export function adapterRoutes(options: {
       logger.error({ err, type }, "Failed to reload external adapter");
 
       // Audit: a failed reload is an attempted runtime code swap — record it.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reloaded",
         entityType: "adapter",
         entityId: type,
@@ -757,7 +796,7 @@ export function adapterRoutes(options: {
   // package name, but without the risk of losing the store record.
   router.post("/adapters/:type/reinstall", async (req, res) => {
     assertInstanceAdmin(req);
-    assertAdapterCodeInstallAllowed();
+    assertExternalAdapterCodeAllowed();
     assertAdapterManagementVisible();
 
     const type = req.params.type;
@@ -811,7 +850,7 @@ export function adapterRoutes(options: {
 
       logger.info({ type, version: newVersion }, "Adapter reinstalled from npm");
 
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reinstalled",
         entityType: "adapter",
         entityId: type,
@@ -824,7 +863,7 @@ export function adapterRoutes(options: {
       logger.error({ err, type }, "Failed to reinstall adapter");
 
       // Audit: a failed reinstall is a re-attempted code execution — record it.
-      await logInstanceActivity(db, req, {
+      if (db) await logInstanceActivity(db, req, {
         action: "instance.adapter.reinstalled",
         entityType: "adapter",
         entityId: type,

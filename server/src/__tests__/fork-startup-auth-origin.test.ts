@@ -132,6 +132,9 @@ const {
   };
   const executionWorkspaceServiceFactoryMock = vi.fn(() => executionWorkspaceServiceMock);
   const externalObjectsServiceMock = {
+    registerRefreshWork: vi.fn(() => ({ ready: Promise.resolve(), wake: vi.fn(), stop: vi.fn(),
+      reconciliationSnapshot: () => ({ revision: "startup-external:1", reconciled: true }) })),
+    readIdleSchedule: vi.fn(async () => null),
     refreshDueObjectsForActiveCompanies: vi.fn(async () => ({ companies: 0, checked: 0, refreshed: 0 })),
   };
   const externalObjectsServiceFactoryMock = vi.fn(() => externalObjectsServiceMock);
@@ -249,6 +252,11 @@ vi.mock("@paperclipai/db", async (importOriginal) => ({
   instanceUserRoles: {},
 }));
 
+vi.mock("../services/delivery-work-notifications.js", async () => ({
+  ...await vi.importActual<typeof import("../services/delivery-work-notifications.js")>("../services/delivery-work-notifications.js"),
+  subscribeDeliveryWork: vi.fn(() => () => {}),
+}));
+vi.mock("../runtime-api.js", async (importOriginal) => ({ ...(await importOriginal<Record<string, unknown>>()), resolveLocalRuntimeApiUrl: () => "http://127.0.0.1:3100" }));
 vi.mock("../app.js", () => ({
   createApp: createAppMock,
 }));
@@ -283,6 +291,7 @@ vi.mock("../realtime/live-events-ws.js", () => ({
 }));
 
 vi.mock("../services/index.js", () => ({
+  createManagedEnvironmentRecovery: vi.fn(() => ({ stop: vi.fn(async () => undefined) })),
   backfillLegacyToolOAuthTokens: vi.fn(async () => ({
     scannedConnections: 0,
     migratedConnections: 0,
@@ -383,6 +392,7 @@ vi.mock("../services/connection-intent-delivery.js", () => ({
 }));
 
 vi.mock("../services/question-response-delivery.js", () => ({
+  registerQuestionResponseDeliveryWork: vi.fn(() => ({ ready: Promise.resolve(), stop: vi.fn(), unregister: vi.fn() })),
   questionResponseDeliveryService: vi.fn(() => ({
     hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({

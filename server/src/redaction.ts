@@ -4,6 +4,7 @@ import { GITHUB_FINE_GRAINED_PAT_RE } from "./secret-patterns.js";
 import { isPublicExecutorToolSelector, looksLikeCredentialJwt } from "@paperclipai/adapter-utils/command-redaction";
 
 const SECRET_FIELD_NAME_PATTERN = String.raw`[A-Za-z0-9_-]*(?:api[-_]?key|access[-_]?token|auth(?:_?token)?|token|authorization(?:[-_]?code)?|bearer|secrets?|passwd|passwords?|credentials?|jwt|private[-_]?key|cookie|connectionstring|browser[-_]?code|login[-_]?url)(?:[-_]?(?:value|header|prod(?:uction)?|dev(?:elopment)?|test|staging|primary|secondary))*`;
+const SECRET_FIELD_NAME_START = String.raw`(?<![A-Za-z0-9_-])`;
 
 // Fork behavior: unanchored substring match (passwordHash, tokenHash, secretId, apiKeyId stay redacted).
 // Count-shaped audit fields are exempted separately via isAuditCountField.
@@ -116,6 +117,7 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.native-execution-input.v7",
   "paperclip.native-execution-input.v8",
   "paperclip.native-execution-input.v9",
+  "paperclip.native-execution-input.v10",
   "paperclip.native-finalization.v1",
   "paperclip.native-finalization.v2",
   "paperclip.native-harness-backup-stamp.v1",
@@ -164,6 +166,7 @@ export const PAPERCLIP_PUBLIC_SCHEMA_IDS = new Set([
   "paperclip.runner.conformance.fixture.v1",
   "paperclip.runner.conformance.output.v1",
   "paperclip.runner.durable.control-plane-state.v1",
+  "paperclip.runner.durable.control-plane-state.v2",
   "paperclip.runner.durable.diagnostics.v1",
   "paperclip.runner.durable.state.v1",
   "paperclip.runner.durable.trace.v1",
@@ -241,11 +244,13 @@ export const PRP_V1_EVENT_TYPES = new Set([
   "workspace.diff.recorded",
   "workspace.file.referenced",
   "auth.credentials.updated",
+  "runtime.activity.recorded",
   "harness.starting",
   "harness.ready",
   "harness.exited",
   "harness.diagnostic",
   "plan.updated",
+  "plan.proposed",
   "tool.execution.started",
   "tool.execution.progressed",
   "tool.execution.completed",
@@ -352,6 +357,7 @@ const NATIVE_RUN_SPAN_NAMES = new Set([
   "native.result.finalize",
   "native.session.execute",
   "provider.session.continuity_break",
+  "provider.session.load",
   "provider.session.resume",
   "provider.time_to_first_agent_event",
   "provider.turn.queue",
@@ -370,6 +376,7 @@ const NATIVE_RUN_SPAN_NAMES = new Set([
   "runner.artifact.discover",
   "runner.artifact.prepare",
   "runner.prp.authenticate",
+  "runner.process.launch",
   "runner.prp.route.register",
   "runner.runtime.stage",
   "runner.session.bootstrap",
@@ -393,15 +400,21 @@ const CLI_SECRET_FLAG_RE = new RegExp(
 // Skip the JWT value check for these plugin-version keys only; key-name
 // redaction still applies.
 const VERSION_STRING_KEYS = new Set(["fromVersion", "toVersion"]);
+// Lifecycle phase names (e.g. "task.run.measured") are dotted lowercase identifiers, not JWTs.
+// Public PRP envelope discriminator; exact value only, under key "type" only.
+const PRP_EVENT_ENVELOPE_TYPE = "paperclip.prp.event";
+const PHASE_NAME_MAX_LENGTH = 64;
+const PHASE_NAME_SHAPE_RE = /^[a-z][a-z_]*(?:\.[a-z][a-z_]*){1,3}$/;
+const PHASE_NAME_VALUE_RE = { test: (v: string) => v.length <= PHASE_NAME_MAX_LENGTH && PHASE_NAME_SHAPE_RE.test(v) };
 const SEMVER_VALUE_RE = /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/;
 const JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:"|')?${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
+  String.raw`((?:"|')?${SECRET_FIELD_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:"|')?\s*:\s*(?:"|'))[^"'` +
     "`" +
     String.raw`\r\n]+((?:"|'))`,
   "gi",
 );
 const ESCAPED_JSON_SECRET_FIELD_TEXT_RE = new RegExp(
-  String.raw`((?:\\")?${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
+  String.raw`((?:\\")?${SECRET_FIELD_NAME_START}${SECRET_FIELD_NAME_PATTERN}(?:\\")?\s*:\s*(?:\\"))[^\\\r\n]+((?:\\"))`,
   "gi",
 );
 const SECRET_TEXT_HINTS = [
@@ -739,7 +752,7 @@ function authorizationCredentialRange(
 function redactAuthorizationCredentials(input: string): string {
   // Include compound diagnostic labels such as proxyAuthorization while the
   // value parser still requires a Basic/Bearer scheme before redacting.
-  const authorizationWord = /\b[A-Za-z0-9_-]*Authorization[A-Za-z0-9_-]*\b/gi;
+  const authorizationWord = /(?<![A-Za-z0-9_-])[A-Za-z0-9_-]*Authorization[A-Za-z0-9_-]*\b/gi;
   const parts: string[] = [];
   let copiedThrough = 0;
   let match: RegExpExecArray | null;
@@ -1050,10 +1063,19 @@ function sanitizeRecordWithLeaf(
       (JWT_VALUE_RE.test(value) || looksLikeCredentialJwt(value)) &&
       !isPublicExecutorToolSelector(value) &&
       !PUBLIC_RECEIPT_TEXT_IDS.has(value) &&
-      !isPaperclipSchemaDiscriminator(key, value)
+      !isPaperclipSchemaDiscriminator(key, value) &&
+      !(key === "phase" && PHASE_NAME_VALUE_RE.test(value)) &&
+      !(key === "type" && value === PRP_EVENT_ENVELOPE_TYPE)
     ) {
       redacted[redactedKey] = REDACTED_EVENT_VALUE;
 
+      continue;
+    }
+    if (
+      (key === "phase" && typeof value === "string" && PHASE_NAME_VALUE_RE.test(value)) ||
+      (key === "type" && value === PRP_EVENT_ENVELOPE_TYPE)
+    ) {
+      redacted[redactedKey] = leaf(value);
       continue;
     }
     redacted[redactedKey] = sanitizeValue(value, leaf);
@@ -1180,7 +1202,8 @@ export function redactSensitiveText(input: string): string {
         const whitespaceMatch = input.match(/^(\s*)[\s\S]*?(\s*)$/);
         const leading = whitespaceMatch?.[1] ?? "";
         const trailing = whitespaceMatch?.[2] ?? "";
-        return leading + JSON.stringify(sanitizeJsonValue(parsed)) + trailing;
+        const sanitizedJson = JSON.stringify(sanitizeJsonValue(parsed));
+        return leading + sanitizedJson + trailing;
       } catch {
         // SECURITY-CRITICAL: any structural-walk failure (e.g. a pathologically
         // nested document that JSON.parse accepts but overflows the recursive

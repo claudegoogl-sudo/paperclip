@@ -354,6 +354,19 @@ describe("agent auth middleware", () => {
     expect(res.body.error).toContain(error);
   });
 
+  it.each(["key", "jwt"])("rejects unfinished setup authentication with a %s", async kind => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const token = kind === "jwt" ? createLocalAgentJwt(agentId, companyId, "codex_local", randomUUID(), "user-1")! : "pcp_setup-test-token";
+    const { db } = createDbState({
+      agent: { id: agentId, companyId, status: "paused", lifecycleHolds: ["setup"] },
+      ...(kind === "key" ? { agentKey: { id: randomUUID(), agentId, companyId, keyHash: hashToken(token), responsibleUserId: "user-1" } } : {}),
+    });
+    const res = await request(createApp(db, "local_trusted")).get("/actor").set("Authorization", `Bearer ${token}`);
+    expect(res.status).toBe(401);
+    expect(res.body.error).toContain("setup is incomplete");
+  });
+
   it("rejects an agent JWT when the agent record belongs to another company", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

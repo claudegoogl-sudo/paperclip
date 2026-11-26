@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { chmodSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, expect, it, vi } from "vitest";
 const hooks = vi.hoisted(() => ({ mkdir: undefined as undefined | ((path: string) => void), rename: undefined as undefined | ((source: string, destination: string) => void), open: undefined as undefined | ((path: string) => void), read: undefined as undefined | ((path: string, bytes: number) => void) }));
 vi.mock("node:fs/promises", async (original) => {
   const fs = await original<typeof import("node:fs/promises")>();
@@ -15,6 +15,10 @@ vi.mock("node:fs/promises", async (original) => {
 vi.mock("../vendor/paperclip-runner/index.js", async () => await import("../../../packages/paperclip-runner/src/drivers/acpx/qualified-profiles.js"));
 import { QUALIFIED_ACPX_PROFILES } from "../../../packages/paperclip-runner/src/drivers/acpx/qualified-profiles.js";
 import { createRemotePiCompanionManifest, importRemotePiCompanion, inventoryRemoteCompanion, resolveRemotePiCompanion, selectRemotePiCompanion } from "../services/native-runtime/remote-pi-companion.js";
+// Fixtures assume a 022 umask; the importer rejects group/other-writable entries, so pin it for CI runners with 002.
+let previousUmask = 0o022;
+beforeAll(() => { previousUmask = process.umask(0o022); });
+afterAll(() => { process.umask(previousUmask); });
 const roots: string[] = [];
 afterEach(() => { hooks.mkdir = undefined; hooks.rename = undefined; hooks.open = undefined; hooks.read = undefined; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); vi.restoreAllMocks(); });
 const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");

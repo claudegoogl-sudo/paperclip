@@ -88,6 +88,7 @@ export type CreateRoutine = z.infer<typeof createRoutineSchema>;
 // never fires.
 export const updateRoutineSchema = objectWithoutDefaults(createRoutineSchema).partial().extend({
   baseRevisionId: z.string().guid().optional().nullable(),
+  responsibleUserId: z.string().trim().min(1).optional(),
 }).strict();
 export type UpdateRoutine = z.infer<typeof updateRoutineSchema>;
 

@@ -1,0 +1,6 @@
+{
+  "inputSha256": "5e2b012b50bb8b198384da4f5427c27acd948af405f89cde15bfa48bb10c0ad4",
+  "outputSha256": "fd575ce2ddc5f439de209d84baf15e6268125d94708f2b228d54717ee21ae954",
+  "patchSha256": "024c83574cedd67700979c11a36eb89a135fe22f90ac9890c28aaa059418e0a6",
+  "basis": "Generated with the trusted master lockfile refresh. Review this offline correction and its hashes with the dependency changes."
+}

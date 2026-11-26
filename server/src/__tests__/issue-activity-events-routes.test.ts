@@ -182,7 +182,7 @@ function makeIssue() {
     createdByUserId: "local-board",
     identifier: "PAP-580",
     title: "Activity event issue",
-    description: null,
+    description: null as string | null,
     priority: "medium",
     executionPolicy: null,
     executionState: null,

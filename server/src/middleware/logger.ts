@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import pino from "pino";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 import { HTTP_LOG_REDACT_PATHS } from "./http-log-redaction.js";
@@ -12,6 +13,7 @@ import {
   isPrivateAgentCommentaryHttpRequest,
   isPrivateAgentObservabilityHttpRequest,
   isPrivateMuseHttpRequest,
+  isPrivateDotPrincipalHttpRequest,
   shouldSilenceHttpSuccessLog,
 } from "./http-log-policy.js";
 import { redactSecretsForLog, redactSecretsDeepForLog } from "../secret-patterns.js";
@@ -57,7 +59,13 @@ function resolveServerLogDir(): string {
   const envOverride = process.env.PAPERCLIP_LOG_DIR?.trim();
   if (envOverride) return resolveHomeAwarePath(envOverride);
 
-  const fileLogDir = readConfigFile()?.logging.logDir?.trim();
+  let fileLogDir: string | undefined;
+  try {
+    fileLogDir = readConfigFile()?.logging.logDir?.trim();
+  } catch {
+    // Config snapshot not initialised yet (early import, tests): use the default log dir.
+    fileLogDir = undefined;
+  }
   if (fileLogDir) return resolveHomeAwarePath(fileLogDir);
 
   return resolveDefaultLogsDir();
@@ -139,6 +147,7 @@ function requestLogUrl(req: {
   originalUrl?: unknown;
   url?: unknown;
 }) {
+  if(isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req)))return "/mcp/runner/oauth/cloud-principal";
   if(isPrivateMuseHttpRequest(requestClassificationUrl(req)))return "/api/muse/:protocol";
   if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) return "/api/companies/:companyId/observability";
   return isPrivateWebhook(req)
@@ -153,6 +162,11 @@ function requestLogUrl(req: {
  * use the shared `logger`. Combines upstream's private-webhook closed
  * projections with the fork's secret-pattern redaction.
  */
+function abortedRequestMessage(req: IncomingMessage, res: ServerResponse) {
+  if (!req.readableAborted && res.writableFinished) return null;
+  return `${req.method} ${requestLogUrl(req)} — request aborted${res.headersSent ? " during response" : " before response"}`;
+}
+
 export function createHttpLogger(baseLogger: pino.Logger) {
   return pinoHttp({
     logger: baseLogger,
@@ -178,6 +192,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
         if (isPrivateAgentObservabilityHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
           return { id: req.id, method: req.method, url: "/api/companies/:companyId/observability" };
         }
+        if(isPrivateDotPrincipalHttpRequest(typeof req.url === "string" ? req.url : undefined))return {id:req.id,method:req.method,url:"/mcp/runner/oauth/cloud-principal"};
         if(isPrivateMuseHttpRequest(typeof req.url === "string" ? req.url : undefined))return {id:req.id,method:req.method,url:"/api/muse/:protocol"};
         if (isPrivateAgentCommentaryHttpRequest(typeof req.url === "string" ? req.url : undefined)) {
           return { id: req.id, method: req.method, url: stripSecretBearingUrlParts(req.url as string) };
@@ -210,20 +225,23 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       ) {
         // A provider error may also be reflected in response headers. Keep the
         // same content-free contract on both sides of a webhook request.
-        return res.raw?.req && (isPrivateWebhook(res.raw.req) || isPrivateMuseHttpRequest(requestClassificationUrl(res.raw.req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(res.raw.req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(res.raw.req)))
+        return res.raw?.req && (isPrivateWebhook(res.raw.req) || isPrivateMuseHttpRequest(requestClassificationUrl(res.raw.req)) || isPrivateDotPrincipalHttpRequest(requestClassificationUrl(res.raw.req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(res.raw.req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(res.raw.req)))
           ? { statusCode: res.statusCode }
           : res;
       },
     },
   customLogLevel(_req, res, err) {
+    if (err || (res as any).err || res.statusCode >= 500) return "error";
+    if (_req.readableAborted || !res.writableFinished) return "warn";
     if (shouldSilenceHttpSuccessLog(_req.method, _req.url, res.statusCode)) {
       return "silent";
     }
-    if (err || res.statusCode >= 500) return "error";
     if (res.statusCode >= 400) return "warn";
     return "info";
   },
   customSuccessMessage(req, res) {
+    const abortedSuccess = abortedRequestMessage(req, res);
+    if (abortedSuccess) return redactSecretsForLog(abortedSuccess);
     // The request line keeps the webhook placeholder for private webhook
     // routes and drops secret-bearing URL parts otherwise; the fork's
     // pattern redaction wraps both (a workspace login handoff ticket is a
@@ -231,6 +249,8 @@ export function createHttpLogger(baseLogger: pino.Logger) {
     return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode}`);
   },
   customErrorMessage(req, res, err) {
+    const abortedMessage = abortedRequestMessage(req, res);
+    if (abortedMessage) return redactSecretsForLog(abortedMessage);
     if (isSecretSensitiveHttpRequest(req.method, requestClassificationUrl(req))) {
       return redactSecretsForLog(`${req.method} ${requestLogUrl(req)} ${res.statusCode} — request failed`);
     }
@@ -244,6 +264,9 @@ export function createHttpLogger(baseLogger: pino.Logger) {
   customErrorObject(req, _res, _err, value) {
     if (isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req))) {
       return { ...value, err: { type: "Error", message: "Agent observability request failed" } };
+    }
+    if (isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req))) {
+      return { ...value, err: { type: "Error", message: "Dot principal request failed" } };
     }
     if (isPrivateMuseHttpRequest(requestClassificationUrl(req))) {
       return { ...value, err: { type: "Error", message: "External agent request failed" } };
@@ -265,7 +288,7 @@ export function createHttpLogger(baseLogger: pino.Logger) {
       const ctx = (res as any).__errorContext;
       return { reqBody: "[REDACTED]", ...(ctx ? { errorContext: { name: "Error" } } : {}) };
     }
-    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
+    if (res.statusCode >= 400 && (isPrivateWebhook(req) || isPrivateDotPrincipalHttpRequest(requestClassificationUrl(req)) || isPrivateAgentCommentaryHttpRequest(requestClassificationUrl(req)) || isPrivateMuseHttpRequest(requestClassificationUrl(req)) || isPrivateAgentObservabilityHttpRequest(requestClassificationUrl(req)))) {
       // Omit, rather than recursively redact, the entire provider payload —
       // before/after parsing, with or without error context.
       return {

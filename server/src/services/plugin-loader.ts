@@ -1,3 +1,5 @@
+import { resolveBundledPluginRuntimeLoader } from "./bundled-plugin-runtime.js";
+import { finishServiceShutdown } from "../shutdown.js";
 /**
  * PluginLoader — discovery, installation, and runtime activation of plugins.
  *
@@ -31,7 +33,7 @@ import { execFile } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { promisify } from "node:util";
+import { isDeepStrictEqual, promisify } from "node:util";
 import type { Db } from "@paperclipai/db";
 import { PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import type {
@@ -53,6 +55,7 @@ import type { PluginLifecycleManager } from "./plugin-lifecycle.js";
 import { pluginDatabaseService } from "./plugin-database.js";
 import { resolveBundledCatalogRoot } from "./bundled-plugins.js";
 import { collectSecretRefPaths } from "./json-schema-secret-refs.js";
+import { managedPluginWorkerEnvGrant } from "./managed-plugin-worker-env.js";
 
 const execFileAsync = promisify(execFile);
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -198,6 +201,7 @@ const SANDBOX_PROVIDER_CREDENTIAL_ENV_PASSTHROUGH: Record<
   string,
   { driverKey: string; envVars: readonly string[] }
 > = {
+  "@paperclipai/plugin-boxd": { driverKey: "boxd", envVars: ["BOXD_API_KEY"] },
   "@paperclipai/plugin-createos": { driverKey: "createos", envVars: ["CREATEOS_API_KEY"] },
   "@paperclipai/plugin-daytona": { driverKey: "daytona", envVars: ["DAYTONA_API_KEY"] },
   "@paperclipai/plugin-e2b": { driverKey: "e2b", envVars: ["E2B_API_KEY"] },
@@ -214,6 +218,7 @@ export function buildPluginWorkerEnv(input: {
   packagePath?: string | null;
   /** Test seam; defaults to the repo plugin tree and the bundled catalog root. */
   trustedLocalPluginRoots?: readonly string[];
+  grantedEnvVars?: readonly string[];
   instanceInfo: { deploymentMode?: string | null; deploymentExposure?: string | null };
   processEnv?: NodeJS.ProcessEnv;
 }): Record<string, string> {
@@ -222,6 +227,10 @@ export function buildPluginWorkerEnv(input: {
     PAPERCLIP_DEPLOYMENT_MODE: input.instanceInfo.deploymentMode ?? "",
     PAPERCLIP_DEPLOYMENT_EXPOSURE: input.instanceInfo.deploymentExposure ?? "",
   };
+  for (const key of input.grantedEnvVars ?? []) {
+    const value = processEnv[key];
+    if (value && value.trim().length > 0) env[key] = value;
+  }
   const canRegisterEnvironmentDrivers = Array.isArray(input.manifest.capabilities)
     && input.manifest.capabilities.includes("environment.drivers.register");
   if (!canRegisterEnvironmentDrivers) return env;
@@ -337,6 +346,8 @@ function getDeclaredPageRoutePaths(manifest: PaperclipPluginManifestV1): string[
  * Options for the plugin loader service.
  */
 export interface PluginLoaderOptions {
+  resolvePackageRoot?: (plugin: PluginRecord) => string;
+  prebuiltOnly?: boolean;
   /** Image-owned deployment policy, checked before importing code and starting workers. */
   assertPackageActivation?: (input: {
     pluginKey?: string;
@@ -1768,6 +1779,8 @@ export function pluginLoader(
     escalationGateway,
     assertPackageActivation,
     installCapabilityAllowlist = [],
+    resolvePackageRoot,
+    prebuiltOnly = false,
   } = options;
   const installCapabilityAllowSet = new Set(installCapabilityAllowlist);
 
@@ -1823,6 +1836,7 @@ export function pluginLoader(
     installOptions: PluginInstallOptions,
   ): Promise<DiscoveredPlugin> {
     const { packageName, localPath, version, installDir } = installOptions;
+    if (prebuiltOnly && !localPath) throw new Error("Managed plugins must come from the current image catalog");
 
     if (!packageName && !localPath) {
       throw new Error("Either packageName or localPath must be provided");
@@ -1898,7 +1912,7 @@ export function pluginLoader(
     const pkgJson = await readPackageJson(resolvedPackagePath);
     if (!pkgJson) throw new Error(`Missing package.json at ${resolvedPackagePath}`);
 
-    if (localPath) {
+    if (localPath && !prebuiltOnly) {
       await ensureLocalPluginBuilt(resolvedPackagePath, pkgJson);
     }
 
@@ -2626,6 +2640,7 @@ export function pluginLoader(
             packagePath: discovered.source === "local-filesystem" ? discovered.packagePath : undefined,
           },
           manifest,
+          { idempotent: prebuiltOnly },
         );
 
         if (!installed) {
@@ -2698,7 +2713,7 @@ export function pluginLoader(
         // For local-path installs, fall back to the stored packagePath so
         // `upgradePlugin` can re-read the manifest from disk without needing
         // the caller to re-supply the path every time.
-        localPath = plugin.packagePath ?? undefined,
+        localPath = resolvePackageRoot ? resolvePackageRoot(plugin) : plugin.packagePath ?? undefined,
         version,
       } = upgradeOptions;
 
@@ -3065,6 +3080,7 @@ export function pluginLoader(
     // -----------------------------------------------------------------------
 
     async cleanupInstallArtifacts(plugin: PluginRecord): Promise<void> {
+      if (prebuiltOnly) return;
       const managedTargets = new Set<string>();
       const managedNodeModulesDir = resolveManagedInstallPackageDir(localPluginDir, plugin.packageName);
       const directManagedDir = path.join(localPluginDir, plugin.packageName);
@@ -3330,11 +3346,7 @@ export function pluginLoader(
 
       const { workerManager, jobScheduler } = runtimeServices;
 
-      // 1. Stop the job scheduler tick loop
-      jobScheduler.stop();
-
-      // 2. Stop all worker processes
-      await workerManager.stopAll();
+      await finishServiceShutdown(() => jobScheduler.stop(), () => workerManager.stopAll());
 
       log.info("plugin-loader: all plugins shut down");
     },
@@ -3451,12 +3463,14 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       // 1. Resolve worker entrypoint
       // ------------------------------------------------------------------
-      const packageRoot = resolvePluginPackageRoot(activePlugin, localPluginDir);
+      const packageRoot = resolvePackageRoot ? resolvePackageRoot(activePlugin) : resolvePluginPackageRoot(activePlugin, localPluginDir);
       assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath });
       activePlugin = await refreshPluginManifestFromPackage(activePlugin, packageRoot);
       manifest = activePlugin.manifestJson;
       assertPackageActivation?.({ pluginKey, packageRoot, installedPackagePath: activePlugin.packagePath, manifest });
-      const workerEntrypoint = resolveWorkerEntrypoint(activePlugin, localPluginDir);
+      const workerEntrypoint = resolvePackageRoot
+        ? path.resolve(packageRoot, manifest.entrypoints.worker)
+        : resolveWorkerEntrypoint(activePlugin, localPluginDir);
 
       // ------------------------------------------------------------------
       // 2. Apply restricted database migrations before worker startup
@@ -3523,8 +3537,9 @@ export function pluginLoader(
         env: buildPluginWorkerEnv({
           manifest,
           packageName: activePlugin.packageName,
-          packagePath: activePlugin.packagePath,
+          packagePath: resolvePackageRoot ? packageRoot : activePlugin.packagePath,
           instanceInfo,
+          grantedEnvVars: managedPluginWorkerEnvGrant(activePlugin.pluginKey),
         }),
         // Authorize the worker to act on each configured company from its
         // proactive loops/timers (LOOA-629). Seeded here so it is in place
@@ -3534,10 +3549,9 @@ export function pluginLoader(
         proactiveCompanyScopes: configRows.map((row) => row.companyId),
       };
 
-      // Repo-local plugin installs can resolve workspace TS sources at runtime
-      // (for example @paperclipai/shared exports). Run those workers through
-      // the tsx loader so first-party example plugins work in development.
-      if (activePlugin.packagePath && existsSync(DEV_TSX_LOADER_PATH)) {
+      if (prebuiltOnly) {
+        workerOptions.execArgv = ["--import", resolveBundledPluginRuntimeLoader()];
+      } else if (activePlugin.packagePath && existsSync(DEV_TSX_LOADER_PATH)) {
         workerOptions.execArgv = ["--import", DEV_TSX_LOADER_PATH];
       }
 
@@ -3574,9 +3588,9 @@ export function pluginLoader(
       // 6. Sync job declarations and register with scheduler
       // ------------------------------------------------------------------
       const jobDeclarations = manifest.jobs ?? [];
+      await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
+      await jobScheduler.registerPlugin(pluginId);
       if (jobDeclarations.length > 0) {
-        await jobStore.syncJobDeclarations(pluginId, jobDeclarations);
-        await jobScheduler.registerPlugin(pluginId);
         registered.jobs = jobDeclarations.length;
 
         log.info(
