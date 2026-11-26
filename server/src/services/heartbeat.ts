@@ -4065,7 +4065,9 @@ export function heartbeatService(
     const needsRelease = new Set(leasesToRelease.map(lease => lease.runId));
     for (const run of runs) {
       // Lease cleanup retries stay independent of the history window.
-      if (!needsRelease.has(run.id) && !runMayHaveLiveProcess(run)) continue;
+      if (!needsRelease.has(run.id) && !runMayHaveLiveProcess(run) &&
+          !liveRunExecutions.has(run.id) && !adapterExecutionControls.has(run.id) &&
+          !processRunCancellationSettlements.has(run.id)) continue;
       if (!AGENT_STOP_TERMINAL_RUN_STATUSES.includes(run.status) || liveRunExecutions.has(run.id) ||
           adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id) ||
           (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date())) return false;
