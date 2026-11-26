@@ -302,7 +302,10 @@ describe.skipIf(!support.supported)("native run log source watermarks", () => {
     const event = { ...f.event(1), payload: { header: "Authorization: Bearer fixture-old-bearer-canary" } };
     await f.persist(event, 2);
     const store = f.store(), handle = await store.begin(f.binding);
-    const chunk = compactRunLogChunk(formatNativeRunLogEvent(event));
+    // The fork's structural redactor keeps the envelope valid JSON, so build the
+    // old privacy-mangled shape explicitly: the redaction ate the closing quote.
+    const chunk = compactRunLogChunk(formatNativeRunLogEvent(event))
+      .replace(/"Authorization: Bearer [^"]*"/, '"Authorization: Bearer [redacted]');
     expect(() => JSON.parse(chunk)).toThrow();
     await store.append(handle, { stream: "stdout", ts: "immutable-old-privacy-format", seq: 1, sourceCursor: 2, chunk });
     await store.finalize(handle);

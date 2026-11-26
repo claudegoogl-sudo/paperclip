@@ -83858,6 +83858,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await retirePublicationFixture(service, endpoint.id);
         }
       },
+      // Fork redaction walks 100k-char bodies; the 15s default is too tight on shared CI hosts.
+      120_000,
     );
 
     it.each(["slack", "github", "microsoft-teams"] as const)(
@@ -83902,6 +83904,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await retirePublicationFixture(service, endpoint.id);
         }
       },
+      // Fork redaction walks 100k-char bodies; the 15s default is too tight on shared CI hosts.
+      120_000,
     );
 
     it.each(["discord", "telegram"] as const)(
@@ -84033,6 +84037,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           await retirePublicationFixture(restarted ?? service, endpoint.id);
         }
       },
+      // Fork redaction walks 100k-char bodies; the 15s default is too tight on shared CI hosts.
+      120_000,
     );
 
     it("preserves an accepted native Slack response whose rendered mentions exceed the Markdown cap", async () => {
