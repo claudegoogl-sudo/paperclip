@@ -392,6 +392,7 @@ vi.mock("../services/connection-intent-delivery.js", () => ({
 }));
 
 vi.mock("../services/question-response-delivery.js", () => ({
+  registerQuestionResponseDeliveryWork: vi.fn(() => ({ ready: Promise.resolve(), stop: vi.fn(), unregister: vi.fn() })),
   questionResponseDeliveryService: vi.fn(() => ({
     hasPending: vi.fn(async () => false),
     sweepPending: vi.fn(async () => ({
