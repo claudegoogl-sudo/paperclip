@@ -303,7 +303,7 @@ describe.skipIf(!support.supported)("native run log source watermarks", () => {
     await f.persist(event, 2);
     const store = f.store(), handle = await store.begin(f.binding);
     // Fork redaction keeps the Bearer scheme, so the current chunk is valid JSON; model the old mangled format explicitly.
-    const chunk = compactRunLogChunk(formatNativeRunLogEvent(event)).replace(/\[REDACTED\]/, "[REDACTED").replace(/"\}\s*$/, "");
+    const chunk = compactRunLogChunk(formatNativeRunLogEvent(event)).trimEnd().slice(0, -1);
     expect(() => JSON.parse(chunk)).toThrow();
     await store.append(handle, { stream: "stdout", ts: "immutable-old-privacy-format", seq: 1, sourceCursor: 2, chunk });
     await store.finalize(handle);
