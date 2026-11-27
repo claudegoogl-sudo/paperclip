@@ -958,14 +958,23 @@ const recoveryFakeCodex = resolve(
       });
       const digest = (value: Buffer) =>
         createHash("sha256").update(value).digest("hex");
-      // Upstream rolls back an undelivered attach rotation: the archived epoch
-      // is moved back to runner/ and authority-epochs/ is removed. Either way
-      // the exact damaged bytes must survive unmodified.
-      const epochs = await readdir(join(root, "authority-epochs")).catch(() => [] as string[]);
-      const preservedRunnerState = epochs.length > 0
-        ? join(root, "authority-epochs", epochs[0]!, "runner-state.json")
-        : join(root, "runner", "runner-state.json");
-      expect(digest(await readFile(preservedRunnerState))).toBe(digest(damagedRunnerBytes));
+      // The retained damaged runner-state must survive byte-for-byte. Upstream
+      // now archives the whole continuity state (including authority-epochs/)
+      // under continuity-breaks/<token>/, so look in every place it may live.
+      const runnerStateCandidates: string[] = [];
+      const collectRunnerStates = async (dir: string, depth: number): Promise<void> => {
+        if (depth > 5) return;
+        for (const entry of await readdir(dir, { withFileTypes: true }).catch(() => [])) {
+          const full = join(dir, entry.name);
+          if (entry.isDirectory()) await collectRunnerStates(full, depth + 1);
+          else if (entry.name === "runner-state.json") runnerStateCandidates.push(full);
+        }
+      };
+      await collectRunnerStates(root, 0);
+      const preservedDigests = await Promise.all(
+        runnerStateCandidates.map(async (file) => digest(await readFile(file))),
+      );
+      expect(preservedDigests, `runner-state candidates: ${JSON.stringify(runnerStateCandidates.map((f) => f.slice(root.length)))}`).toContain(digest(damagedRunnerBytes));
       const [continuityArchive] = await readdir(
         join(root, "continuity-breaks"),
       );
