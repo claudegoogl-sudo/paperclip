@@ -989,3 +989,16 @@ describe("redaction of long letter/digit runs", () => {
     }
   });
 });
+
+describe("scalar JSON text stays byte-exact", () => {
+  it("does not re-serialize numeric or boolean text", () => {
+    for (const text of ["0.0050000", "0.0010000", "1e3", "100.00", "true", "false"]) {
+      expect(redactSensitiveText(text)).toBe(text);
+    }
+  });
+  it("still redacts secrets in keyed JSON text and objects", () => {
+    expect(redactSensitiveText('{"token":"abcdefghijkl"}')).not.toContain("abcdefghijkl");
+    expect(redactSensitiveText("Bearer abcdefghijkl")).not.toContain("abcdefghijkl");
+    expect(redactEventPayload({ apiKey: "123456789012" })).toEqual({ apiKey: "***REDACTED***" });
+  });
+});
