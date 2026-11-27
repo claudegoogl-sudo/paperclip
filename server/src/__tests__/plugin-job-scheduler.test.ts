@@ -131,7 +131,8 @@ describe("plugin job scheduler overlap prevention", () => {
     advance.resolve();
     await tickPromise;
 
-    expect(scheduler.diagnostics().activeJobIds).toEqual([]);
+    // tick() only dispatches; settlement completes asynchronously.
+    await vi.waitFor(() => expect(scheduler.diagnostics().activeJobIds).toEqual([]));
     jobStore.createRun.mockResolvedValueOnce({ id: "run-2" });
     await expect(scheduler.triggerJob(job.id)).resolves.toEqual({
       runId: "run-2",
@@ -147,8 +148,13 @@ describe("plugin job scheduler overlap prevention", () => {
 
     await scheduler.tick();
 
-    expect(scheduler.diagnostics().activeJobIds).toEqual([]);
+    // tick() only dispatches; the failed settlement releases the active slot
+    // but is retained for retry, so the job stays blocked until persisted.
+    await vi.waitFor(() => expect(scheduler.diagnostics().activeJobIds).toEqual([]));
     setRows([]);
+    await expect(scheduler.triggerJob(job.id)).rejects.toThrow(/already running/);
+    jobStore.updateRunTimestamps.mockResolvedValue(undefined);
+    await scheduler.tick();
     jobStore.createRun.mockResolvedValueOnce({ id: "run-3" });
     await expect(scheduler.triggerJob(job.id)).resolves.toMatchObject({ runId: "run-3" });
   });
