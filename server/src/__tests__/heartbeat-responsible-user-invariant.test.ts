@@ -59,7 +59,10 @@ async function waitForRun(db: ReturnType<typeof createDb>, runId: string) {
     if (run && run.status !== "queued" && run.status !== "running") return run;
     await new Promise((resolve) => setTimeout(resolve, 50));
   }
-  return db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+  const last = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+  const evs = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId));
+  console.log("DIAG13563", JSON.stringify({ status: last?.status, error: last?.error, errorCode: last?.errorCode, ctx: last?.contextSnapshot, events: evs.map((e) => [e.eventType, e.message]) }));
+  return last;
 }
 
 async function deleteHeartbeatRunsAfterEvents(db: ReturnType<typeof createDb>) {
