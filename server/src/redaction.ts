@@ -1190,7 +1190,11 @@ function sanitizeJsonValue(value: unknown): unknown {
 export function redactSensitiveText(input: string): string {
   if (structuralRedactionDepth < MAX_STRUCTURAL_REDACTION_DEPTH) {
     const parsed = tryParseJson(input);
-    if (parsed !== undefined) {
+    // A bare JSON number/boolean/null carries no structure to redact, and
+    // re-serializing it would canonicalize the text ("0.0010000" -> "0.001"),
+    // corrupting fixed-scale decimal strings such as money amounts. Those fall
+    // through to the free-form pipeline, which leaves them byte-identical.
+    if (parsed !== undefined && typeof parsed !== "number" && typeof parsed !== "boolean" && parsed !== null) {
       structuralRedactionDepth += 1;
       try {
         // Preserve any leading/trailing whitespace (notably the trailing

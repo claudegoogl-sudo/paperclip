@@ -989,3 +989,10 @@ describe("redaction of long letter/digit runs", () => {
     }
   });
 });
+
+describe("bare JSON scalars in string leaves", () => {
+  it("keeps fixed-scale decimal strings byte-identical", () => {
+    expect(redactSensitiveText("0.0010000")).toBe("0.0010000");
+    expect(sanitizeRecord({ costCents: "0.0050000", flag: "true" })).toEqual({ costCents: "0.0050000", flag: "true" });
+  });
+});
