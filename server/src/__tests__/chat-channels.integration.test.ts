@@ -83009,7 +83009,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     });
   });
 
-  describe("Teams current file authority and composed Board transfer", () => {
+  // Heavy durable-part fixtures exceed the global 15s budget on a loaded runner.
+  describe("Teams current file authority and composed Board transfer", { timeout: 120_000 }, () => {
     // Actual installed inbound parser + real admission, intent, transfer,
     // projection and callback service. Runtime sends/PUT and the authenticated
     // App hook ingress are controlled here; this is not tenant/JWT/live proof.
@@ -83709,7 +83710,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     );
   });
 
-  describe("Lossless long Board publications", () => {
+  // Heavy durable-part fixtures exceed the global 15s budget on a loaded runner.
+  describe("Lossless long Board publications", { timeout: 120_000 }, () => {
     async function longFixture(
       provider: "slack" | "github" | "microsoft-teams",
     ) {
