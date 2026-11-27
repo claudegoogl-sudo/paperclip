@@ -635,7 +635,7 @@ describe("claude remote execution", () => {
         ...createPromptContextFixture(),
         paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" },
       },
-      onLog: async () => {},
+      onLog: async (_s: string, t: string) => { if (t.includes("prompt bundle")) throw new Error("DBGPIN " + t); },
     });
 
     expect(result.exitCode).toBe(0);
