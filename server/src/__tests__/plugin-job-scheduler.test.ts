@@ -46,7 +46,7 @@ function setup() {
   const db = {
     select: () => ({
       from: () => ({
-        where: () => Promise.resolve(rows),
+        where: () => Object.assign(Promise.resolve(rows), { limit: () => Promise.resolve([]) }),
       }),
     }),
     // dispatch() reserves the run in a transaction: lock the job row, then
