@@ -16706,10 +16706,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const initial = await windows();
         expect(initial).toHaveLength(5);
         expect(new Set(initial.map(row => row.companyId)).size).toBe(2);
-        await vi.waitFor(async () => {
+        // Advance fake time one pass interval at a time and wait for that pass to land, so slow hosts
+        // cannot push the fake clock past the 60s recovery interval before the batches finish.
+        let count = initial.length;
+        const startedAt = performance.now();
+        while (count < 106 && performance.now() - startedAt < 120_000) {
           await vi.advanceTimersByTimeAsync(1000);
-          expect(await windows()).toHaveLength(106);
-        }, { timeout: 10_000 });
+          const stopAt = performance.now() + 10_000;
+          let next = count;
+          while (next === count && performance.now() < stopAt) {
+            await new Promise<void>(resolve => setImmediate(resolve));
+            next = (await windows()).length;
+          }
+          if (next === count) break;
+          count = next;
+        }
+        expect(count).toBe(106);
         expect(first.requests).toEqual([]); expect(second.requests).toEqual([]); expect(errors).toEqual([]);
       } finally { await coordinator.stop(); vi.useRealTimers(); }
     });
